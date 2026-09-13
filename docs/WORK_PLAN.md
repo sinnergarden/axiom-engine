@@ -16,7 +16,26 @@ Fixed R0: bbb1a21d55a78642d22ea284c457272a18a017c2.
    coverage/design/test evidence and read-only reviewer prompt. DoD: remote SHA
    equality, exact diff and deliverables checked; no merge; no RC admission claim.
 
-Current: stages 1–3 complete for construction; stage 4 publishing PR. Stage 5
-will verify remote SHA/diff/source coverage and deliver the fixed read-only reviewer
-prompt. No independent reviewer approval is claimed.
-No large Data build is part of this task. No detached jobs.
+Original construction stages 1–5 were completed at
+`7924c95820b8a9f52790649fe4c4d5579e5a7723`, published as PR #1. Independent review
+subsequently returned REQUEST_CHANGES for F1 and F2; that review remains the
+current independent disposition pending the user's arranged re-review.
+
+## F1/F2 repair plan (same branch / PR)
+
+1. Verify fixed reviewed SHA/current worktree and define four execution scopes;
+   repair the existing dependency walk and shared std. DoD: no formula/policy/
+   membership change, full intermediate dependency checks and stable tiny std.
+2. Preserve original reviewer probes verbatim; add necessary-history/reference,
+   intermediate-reject, scale/ddof/constant/missing and batch/daily controls.
+   DoD: Luna runs original suite plus all added regressions and original probes.
+3. Commit/push the current PR and update its description. DoD: all repair code,
+   contract clarification, test and evidence changes are visible in PR #1.
+4. Verify final local/remote/PR SHA and clean state; deliver findings mapping,
+   test results, remaining UNKNOWN status. DoD: fixed-head repair handoff ready
+   for user-arranged independent review; no merge or PR2.
+
+This document defines the repair stages and DoD. Implementation/regression
+evidence is in docs/REPAIR_F1_F2.md; final publication and stage-completion status
+are recorded in the external fixed-SHA repair handoff linked from the PR.
+No Data build or detached jobs. Financial RC remains BLOCKED.

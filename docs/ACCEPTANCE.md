@@ -1,6 +1,7 @@
 # PR1 conformance evidence
 
-Latest construction validation: 16 unittest methods passed. Command:
+Latest construction validation after F1/F2 repair: 32 unittest methods passed
+(16 original, 6 preserved reviewer probes, 10 repair controls). Command:
 
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v
@@ -8,9 +9,10 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 Executed by GPT-5.6 Luna; full output is `reports/conformance.log`. These are
 construction tests with independent numerical expectations, not an independent
-reviewer approval. The user requested a read-only reviewer handoff after PR
-creation. Review/merge disposition belongs to that independent review and the
-architecture conversation.
+reviewer approval. The independent review of 7924c958 returned REQUEST_CHANGES for F1/F2.
+See [repair mapping](REPAIR_F1_F2.md) and reports/reviewer-probes-repair.log for
+new evidence. Independent re-review and final disposition remain with the user
+and architecture conversation.
 
 | Requested acceptance | Executable evidence in tests/test_conformance.py |
 |---|---|

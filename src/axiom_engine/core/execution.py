@@ -123,8 +123,6 @@ def _inputs(p, facts, context):
         actual = {k[0]: r['industry'] for k, r in refs.items() if k[1] == day and r['member']}
         require(day in p['reference_members'] and actual == p['reference_members'][day],
                 'INCOMPLETE_REFERENCE: members/industry differ from frozen plan')
-    if p['history_policy'] == 'full':
-        _validate_history_closure(p, outputs, by_security, refs)
     events = {name: {} for name in p['event_schema']}
     require(type(f['events']) is list, 'Events must be an array')
     seen_ids = set()
@@ -144,34 +142,44 @@ def _inputs(p, facts, context):
     return c, history, outputs, rows, by_security, refs, events
 
 
-def _validate_history_closure(p, outputs, by_security, refs):
-    """Walk only actual output dependencies, including past CS contributors."""
+def _required_cells(p, outputs, by_security, refs):
+    """Per-node evaluation scope on the original history, including CS inputs.
+
+    This extends the history admission walk; it does not reorder or crop rows.
+    Partial warmup follows the same dependencies but permits absent predecessors.
+    """
     nodes = {n['name']: n for n in p['nodes']}
     positions = {k: i for keys in by_security.values() for i, k in enumerate(keys)}
     pending = [(o['node'], k) for o in p['outputs'] for k in outputs]
     seen = set()
+    needed = {name: set() for name in nodes}
     while pending:
         name, key = pending.pop()
         if (name, key) in seen: continue
         seen.add((name, key))
         if name not in nodes: continue
+        needed[name].add(key)
         n = nodes[name]; op = n['op']; q = n['params']
         dependencies = [key]
         if op in ('shift', 'pct_change', 'rolling'):
             i = positions[key]; history = by_security[key[0]]
             if op in ('shift', 'pct_change'):
-                require(i >= q['periods'], 'INSUFFICIENT_HISTORY: lag dependency')
-                dependencies = [history[i-q['periods']]]
+                require(p['history_policy'] == 'partial' or i >= q['periods'],
+                        'INSUFFICIENT_HISTORY: lag dependency')
+                dependencies = [history[i-q['periods']]] if i >= q['periods'] else []
                 if op == 'pct_change': dependencies.append(key)
             else:
                 end = i + int(q['inclusive_current']); start = end-q['window']
-                require(start >= 0, 'INSUFFICIENT_HISTORY: full rolling dependency')
-                dependencies = history[start:end]
+                require(p['history_policy'] == 'partial' or start >= 0,
+                        'INSUFFICIENT_HISTORY: full rolling dependency')
+                dependencies = history[max(0, start):end]
         elif op in CS:
             dependencies += [k for k, r in refs.items() if k[1] == key[1] and r['member'] and
-                             (q['group'] == 'session' or r['industry'] == refs[key]['industry'])]
+                             (q['group'] == 'session' or
+                              r['industry'] is not None and r['industry'] == refs[key]['industry'])]
         for parent in n['inputs']:
             pending.extend((parent, k) for k in dependencies)
+    return needed
 
 
 def _divide(a, b, policy):
@@ -188,8 +196,9 @@ def _rank(x, vals):
 
 def _std(vals, ddof):
     if len(vals) <= ddof: return None
-    mean = math.fsum(vals) / len(vals)
-    return math.sqrt(math.fsum((v - mean)**2 for v in vals) / (len(vals) - ddof))
+    # statistics retains exact ratios until its scaled square root: no float
+    # intermediate squared deviations to underflow for representable small std.
+    return statistics.pstdev(vals) if ddof == 0 else statistics.stdev(vals)
 
 
 def _quantile(vals, q):
@@ -264,10 +273,12 @@ def _cross_section(op, source, keys, refs, q):
         groups.setdefault((key[1], group), []).append(key)
     out = {}
     for (_, group), group_keys in groups.items():
-        eligible = [k for k in group_keys if refs[k]['member'] and group is not None]
+        reference_keys = [k for k, r in refs.items() if k[1] == group_keys[0][1] and
+                          (q['group'] == 'session' or r['industry'] == group)]
+        eligible = [k for k in reference_keys if refs[k]['member'] and group is not None]
         deps = [source[k] for k in eligible]
         # Membership and classification are dependencies even when they exclude a row.
-        refs_cells = [_Cell(None, refs[k]['available_at'], (refs[k]['source'],)) for k in group_keys]
+        refs_cells = [_Cell(None, refs[k]['available_at'], (refs[k]['source'],)) for k in reference_keys]
         vals = [c.value for c in deps]
         absent = any(v is None for v in vals)
         require(not absent or q['missing'] != 'reject', 'MISSING_REFERENCE_VALUE')
@@ -308,27 +319,33 @@ def execute_feature_plan(plan, facts, context):
     """
     p = validate_plan(plan, execution=True)
     c, keys, outputs, rows, by_security, refs, events = _inputs(p, facts, context)
+    needed = _required_cells(p, outputs, by_security, refs)
+    positions = {k: i for security_keys in by_security.values() for i, k in enumerate(security_keys)}
     env = {col['name']: {k: rows[k][i] for k in keys} for i, col in enumerate(p['input_schema'])}
     for n in p['nodes']:
         op, q, args = n['op'], n['params'], n['inputs']
+        node_keys = sorted(needed[n['name']])
+        if not node_keys:
+            continue
         if op in CS:
-            out = _cross_section(op, env[args[0]], keys, refs, q)
+            out = _cross_section(op, env[args[0]], node_keys, refs, q)
         elif op in ('shift', 'pct_change', 'rolling'):
             out = {}
-            for security_keys in by_security.values():
-                source = [env[args[0]][k] for k in security_keys]
-                for i, key in enumerate(security_keys):
-                    if op in ('shift', 'pct_change'):
-                        j = i - q['periods']
-                        prev = source[j] if j >= 0 else _Cell(None, None, (), (), 'INSUFFICIENT_HISTORY')
-                        if op == 'shift': out[key] = prev
-                        else:
-                            v = _divide(source[i].value, prev.value, q['zero'])
-                            out[key] = _merge(None if v is None else v-1, [source[i], prev])
+            source = env.get(args[0], {})
+            for key in node_keys:
+                i = positions[key]
+                security_keys = by_security[key[0]]
+                if op in ('shift', 'pct_change'):
+                    j = i - q['periods']
+                    prev = source[security_keys[j]] if j >= 0 else _Cell(None, None, (), (), 'INSUFFICIENT_HISTORY')
+                    if op == 'shift': out[key] = prev
                     else:
-                        end = i + int(q['inclusive_current'])
-                        start = max(0, end - q['window'])
-                        out[key] = _rolling(source[start:end], q)
+                        v = _divide(source[key].value, prev.value, q['zero'])
+                        out[key] = _merge(None if v is None else v-1, [source[key], prev])
+                else:
+                    end = i + int(q['inclusive_current'])
+                    start = max(0, end - q['window'])
+                    out[key] = _rolling([source[k] for k in security_keys[start:end]], q)
         elif op == 'asof':
             columns = p['event_schema'][q['stream']]
             ix = next(i for i, col in enumerate(columns) if col['name'] == q['field'])
@@ -337,7 +354,7 @@ def execute_feature_plan(plan, facts, context):
                     periods = [event[1] for event in stream]
                     require(periods == sorted(periods), 'REPORT_PERIOD_REGRESSION: Data stream violates frozen policy')
             out = {}
-            for key in keys:
+            for key in node_keys:
                 candidates = []
                 for event_date, _, cells in events[q['stream']].get(key[0], []):
                     cell = cells[ix]
@@ -348,7 +365,7 @@ def execute_feature_plan(plan, facts, context):
                         candidates.append(cell)
                 out[key] = candidates[-1] if candidates else _Cell(None, None, (), (), 'NO_VISIBLE_EVENT')
         else:
-            out = {k: _element(op, [env[a][k] for a in args], q) for k in keys}
+            out = {k: _element(op, [env[a][k] for a in args], q) for k in node_keys}
         for key, cell in out.items():
             check_value(cell.value, n['column'])
             if n['column']['dtype'] == 'float64' and cell.value is not None:

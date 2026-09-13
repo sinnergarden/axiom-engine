@@ -14,8 +14,24 @@ test_sessions_vs_observations_and_missing_cells (test_conformance.Conformance.te
 test_single_output_full_reference_and_industry (test_conformance.Conformance.test_single_output_full_reference_and_industry) ... ok
 test_unknown_transport_admission_and_versions (test_conformance.Conformance.test_unknown_transport_admission_and_versions) ... ok
 test_window_endpoints_reductions_ddof_missing (test_conformance.Conformance.test_window_endpoints_reductions_ddof_missing) ... ok
+test_control_late_fact_cannot_be_filled_valid (test_review_probes.ReviewProbes.test_control_late_fact_cannot_be_filled_valid) ... ok
+test_control_same_cross_section_plan_with_skip (test_review_probes.ReviewProbes.test_control_same_cross_section_plan_with_skip) ... ok
+test_f1_cross_section_reject_sees_only_needed_lag_cells (test_review_probes.ReviewProbes.test_f1_cross_section_reject_sees_only_needed_lag_cells) ... ok
+test_f1_shift_required_column_with_complete_history (test_review_probes.ReviewProbes.test_f1_shift_required_column_with_complete_history) ... ok
+test_numeric_small_cs_scale_is_not_constant (test_review_probes.ReviewProbes.test_numeric_small_cs_scale_is_not_constant) ... ok
+test_numeric_small_std_is_not_zero (test_review_probes.ReviewProbes.test_numeric_small_std_is_not_zero) ... ok
+test_historical_cs_dependencies_expand_before_shift (test_review_repairs.RepairControls.test_historical_cs_dependencies_expand_before_shift) ... ok
+test_industry_scope_preserves_full_group_not_unrelated_group (test_review_repairs.RepairControls.test_industry_scope_preserves_full_group_not_unrelated_group) ... ok
+test_intermediate_reject_cannot_be_hidden_by_final_fill (test_review_repairs.RepairControls.test_intermediate_reject_cannot_be_hidden_by_final_fill) ... ok
+test_needed_lag_null_and_history_row_still_reject (test_review_repairs.RepairControls.test_needed_lag_null_and_history_row_still_reject) ... ok
+test_reject_pipeline_and_tiny_std_batch_daily_equivalence (test_review_repairs.RepairControls.test_reject_pipeline_and_tiny_std_batch_daily_equivalence) ... ok
+test_rolling_then_shift_keeps_the_intermediate_window (test_review_repairs.RepairControls.test_rolling_then_shift_keeps_the_intermediate_window) ... ok
+test_scaled_std_and_zscore_both_ddof (test_review_repairs.RepairControls.test_scaled_std_and_zscore_both_ddof) ... ok
+test_scoped_elementwise_rejection_and_partial_warmup (test_review_repairs.RepairControls.test_scoped_elementwise_rejection_and_partial_warmup) ... ok
+test_subset_retains_reference_values_and_reject_policy (test_review_repairs.RepairControls.test_subset_retains_reference_values_and_reject_policy) ... ok
+test_tiny_constants_epsilon_clip_and_missing_policies (test_review_repairs.RepairControls.test_tiny_constants_epsilon_clip_and_missing_policies) ... ok
 
 ----------------------------------------------------------------------
-Ran 16 tests in 0.234s
+Ran 32 tests in 0.276s
 
 OK

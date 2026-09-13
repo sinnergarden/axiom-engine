@@ -62,7 +62,7 @@ matching units, preserving transforms keep units and rank/zscore are dimensionle
 Research explicitly declares compound units for multiplication/division; this ABI
 does not infer dimensional algebra from arbitrary unit strings.
 
-## Three distinct scopes and history
+## History, requested outputs, node dependencies and reference statistics
 
 Context contains the explicit ordered calendar, a cutoff for **every** session,
 expected history keys, requested output keys and the reference membership and
@@ -70,7 +70,26 @@ industry rows with their own source/time evidence. No backtest/shadow/real mode.
 Daily rows must exactly cover declared history; duplicate/missing rows fail even
 when a value-fill operator exists. Every reference member and industry must match
 the plan's complete frozen mapping for that date; deleting an entire security
-cannot silently shrink the reference universe. Output filtering occurs last.
+cannot silently shrink the reference universe. Requested output projection occurs last. Four sets are distinct:
+
+1. Input history keys are the complete supplied, validated row schedule.
+2. Requested output keys select the final FeatureFrame rows.
+3. Each node's required keys are derived backwards from those outputs through
+   the existing finite lag/window/elementwise dependencies.
+4. A required CS node reads its entire frozen same-date/group reference set,
+   even if only one member's output is required.
+
+The existing dependency walk now supplies per-node evaluation scopes as well as
+full-history admission. Execution remains in the declared sequential node order.
+Shift/rolling index into the original full history; no rows are removed before
+window/lag calculation. Node missing/domain/constant rejection and result-schema
+checks apply at every required intermediate cell, not only final projections.
+Unneeded leading warmup cells are not evaluated and cannot fail missing=reject.
+A needed null, missing predecessor or missing reference contributor still follows
+the frozen policy. Partial history permits absent predecessors but does not waive
+reject policies when those warmup results are actually required. Raw FactBatch
+schema, key completeness, source bindings, time and full reference-mask validation
+still apply to the supplied input envelope. No policy or membership is rewritten.
 
 `observation_domain=sessions` requires contiguous slices of the supplied exchange
 calendar per security. `observations` orders all explicitly declared observations
@@ -124,7 +143,12 @@ production belongs to Data; event ordering is not revision authority.
   ddof and ties all required. mean/sum/std/min/max/median/rank supported. `skip`
   ignores legal nulls in counts/statistics; `propagate` emits null when any window
   value is null. Percentile rank ranks the endpoint among nonnull values, average
-  ties. Rank of a null endpoint remains null. Std supports ddof0/1.
+  ties. Rank of a null endpoint remains null. Std supports ddof0/1. Both rolling std and CS zscore use the shared stable
+  standard-library pstdev/stdev implementation, which retains exact ratios through
+  variance accumulation and a scaled square root. Representable tiny standard
+  deviations do not become zero through intermediate binary64 squaring. The
+  existing insufficient-count, epsilon, constant, missing and clip rules remain
+  unchanged.
 - pct_change: positive periods, explicit fill_method=none, zero=missing/reject.
 - arithmetic: add/sub/mul/divide/abs/log1p, comparisons, Boolean and/or/not,
   conditional where, Boolean-to-float, is_missing, fill and clip. Zero division
