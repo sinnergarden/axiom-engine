@@ -1,0 +1,194 @@
+[
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Original consumed Data/View/units/history closure not established",
+    "required_evidence": "Fixed public Data/View refs covering actual fields, keys, lookback and label ends",
+    "unknown_id": "DATA_CLOSURE"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Saved models used current_constituents_snapshot; no historical PIT qualification",
+    "required_evidence": "Revision-specific financial/holder evidence and historical membership/industry admission",
+    "unknown_id": "PIT_BASELINE"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Original label bytes and producer/price/calendar lineage need complete validation",
+    "required_evidence": "Original label producer, dense session mapping, price factor/action and delisting coverage",
+    "unknown_id": "LABEL_LINEAGE"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Pinned serving metadata has no allowed historical OOS interval",
+    "required_evidence": "Explicit model/fold/sample-key lineage and matured fit/validation/allowed dates",
+    "unknown_id": "OOS_LINEAGE"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "E0 compatible frozen Feature/Inference/Signal package has not been implemented",
+    "required_evidence": "Independent E0 conformance and frozen package/ABI refs",
+    "unknown_id": "CORE_ABI"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for holder_num_chg_qoq",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:holder_num_chg_qoq:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for holder_num_chg_2q",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:holder_num_chg_2q:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for avg_shares_per_holder_chg_qoq",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:avg_shares_per_holder_chg_qoq:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for top10_holder_ratio_chg_qoq",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:top10_holder_ratio_chg_qoq:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for holder_concentration_score",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:holder_concentration_score:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for holder_squeeze_score",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:holder_squeeze_score:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for holder_price_confirm_score",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:holder_price_confirm_score:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for holder_num_stale_days",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:holder_num_stale_days:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for top10_holder_stale_days",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:top10_holder_stale_days:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for top10_holder_ratio",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:top10_holder_ratio:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for ttm_revenue_yoy",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:ttm_revenue_yoy:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for single_q_revenue_yoy",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:single_q_revenue_yoy:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for is_profitable_ttm",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:is_profitable_ttm:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Exact window_sessions not proven for gross_margin_delta_yoy",
+    "required_evidence": "Validate source dependency closure and actual sample calendar",
+    "unknown_id": "FEATURE:gross_margin_delta_yoy:window_sessions"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Pinned serving config does not establish periodic20-session retrain schedule",
+    "required_evidence": "Explicit approved retrain schedule; do not import rolling experiment step",
+    "unknown_id": "SERVING_RETRAIN"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Metadata has evaluation_train_end=2025-12-05 but no evaluation_train_start",
+    "required_evidence": "Original purged evaluation sample-key manifest with exact bounds",
+    "unknown_id": "EVAL_TRAIN_60"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Metadata has evaluation_train_end=2024-12-10 but no evaluation_train_start",
+    "required_evidence": "Original purged evaluation sample-key manifest with exact bounds",
+    "unknown_id": "EVAL_TRAIN_180"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Original concurrency budget not recorded",
+    "required_evidence": "Explicit run resource plan",
+    "unknown_id": "CONCURRENCY"
+  },
+  {
+    "contract_type": "Unknown",
+    "contract_version": "1",
+    "metadata": {},
+    "reason": "Original memory budget not recorded",
+    "required_evidence": "Explicit run memory limit",
+    "unknown_id": "MEMORY_BUDGET"
+  }
+]

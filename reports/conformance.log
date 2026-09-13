@@ -1,0 +1,21 @@
+test_756_lag_full_history_and_nested_closure (test_conformance.Conformance.test_756_lag_full_history_and_nested_closure) ... ok
+test_arithmetic_boolean_and_legal_missing (test_conformance.Conformance.test_arithmetic_boolean_and_legal_missing) ... ok
+test_batch_and_single_session_same_entrypoint (test_conformance.Conformance.test_batch_and_single_session_same_entrypoint) ... ok
+test_cs_constants_prefill_scale_clip_and_empty (test_conformance.Conformance.test_cs_constants_prefill_scale_clip_and_empty) ... ok
+test_event_strict_exact_future_and_availability (test_conformance.Conformance.test_event_strict_exact_future_and_availability) ... ok
+test_freezing_identity_and_no_mutable_plugin_or_io (test_conformance.Conformance.test_freezing_identity_and_no_mutable_plugin_or_io) ... ok
+test_full_history_includes_past_reference_members (test_conformance.Conformance.test_full_history_includes_past_reference_members) ... ok
+test_late_fact_not_authorized_by_final_cutoff_or_fill (test_conformance.Conformance.test_late_fact_not_authorized_by_final_cutoff_or_fill) ... ok
+test_membership_reentry_does_not_compress_history (test_conformance.Conformance.test_membership_reentry_does_not_compress_history) ... ok
+test_projection_shuffle_duplicates_schema (test_conformance.Conformance.test_projection_shuffle_duplicates_schema) ... ok
+test_r0_declarative_golden_cases (test_conformance.Conformance.test_r0_declarative_golden_cases) ... ok
+test_remaining_primitives_and_rejections (test_conformance.Conformance.test_remaining_primitives_and_rejections) ... ok
+test_sessions_vs_observations_and_missing_cells (test_conformance.Conformance.test_sessions_vs_observations_and_missing_cells) ... ok
+test_single_output_full_reference_and_industry (test_conformance.Conformance.test_single_output_full_reference_and_industry) ... ok
+test_unknown_transport_admission_and_versions (test_conformance.Conformance.test_unknown_transport_admission_and_versions) ... ok
+test_window_endpoints_reductions_ddof_missing (test_conformance.Conformance.test_window_endpoints_reductions_ddof_missing) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 0.234s
+
+OK
