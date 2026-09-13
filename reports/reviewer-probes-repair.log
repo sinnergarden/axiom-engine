@@ -1,0 +1,11 @@
+test_control_late_fact_cannot_be_filled_valid (__main__.ReviewProbes.test_control_late_fact_cannot_be_filled_valid) ... ok
+test_control_same_cross_section_plan_with_skip (__main__.ReviewProbes.test_control_same_cross_section_plan_with_skip) ... ok
+test_f1_cross_section_reject_sees_only_needed_lag_cells (__main__.ReviewProbes.test_f1_cross_section_reject_sees_only_needed_lag_cells) ... ok
+test_f1_shift_required_column_with_complete_history (__main__.ReviewProbes.test_f1_shift_required_column_with_complete_history) ... ok
+test_numeric_small_cs_scale_is_not_constant (__main__.ReviewProbes.test_numeric_small_cs_scale_is_not_constant) ... ok
+test_numeric_small_std_is_not_zero (__main__.ReviewProbes.test_numeric_small_std_is_not_zero) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.005s
+
+OK

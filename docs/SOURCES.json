@@ -1,0 +1,53 @@
+{
+  "research_commit": "bbb1a21d55a78642d22ea284c457272a18a017c2",
+  "review_commit": "bbb1a21d55a78642d22ea284c457272a18a017c2",
+  "review_result": "PASS_R0 / APPROVE; Financial RC BLOCKED",
+  "sources": {
+    "src/axiom_research/contracts.py": "sha256:149c22d1793d4b84a58b065d6e383c1f88210655033e0996a998d71b5bfec357",
+    "src/axiom_research/api.py": "sha256:29101397af953bf2cd250666079525ae4decce9ef6510ee0b18f14186fb1c4fd",
+    "src/axiom_research/fixtures/financial_rc.json": "sha256:410fb38ed9d03574c7fc5efee32358c28c6d1f1d0202e422095e11590b5fc7c2",
+    "src/axiom_research/fixtures/core_requirements.json": "sha256:3f1085721d55daf9939ad30c57158a4a6dabef35716c564d0c1ceded2a540792",
+    "src/axiom_research/fixtures/core_cases.json": "sha256:9cd555f3e90fa1f54db13ebea50f7d98243b79df866069e03704fae5670b871e",
+    "src/axiom_research/fixtures/data_requirements.json": "sha256:565605e9630e6e8e8bcdc46de82916aabc3705e844a657bcd6759c266d95a5df",
+    "reports/feature-map.json": "sha256:d45db12380fea936b5ccf327626623bf99dee940c8cd63541c3a75720b5f034d",
+    "docs/FORENSIC.md": "sha256:8770c0b1f46af772c5a916199ff92ad35754bc73206fbf338d3f0bf2ce6445a3",
+    "docs/IDENTITY.md": "sha256:87ba9dd1bdb5fbd12436861854ffd8fbb6bdc6376030b52471e527b426f33af1",
+    "docs/HANDOFF.md": "sha256:9df03aab400b0f0fb91c426589c17c4ea4bbee21b20647732af9099487875870"
+  },
+  "design_sources": {
+    "02_axiom_data.md": "sha256:98e46666bd8a569317905c1d8fa846bf6d530108867660906a4bd16313533885",
+    "07_重要补丁_A.md": "sha256:5a175297c215bea6730f04aa3b1ddfeafd1258f0bae9cd65e943cbb51fd4f66c",
+    "01_axiom_overview.md": "sha256:fd577f0f8349629f8a5444ce8e4ecd9bd852c75ac7558eef0be27bc25b7fe129",
+    "03_axiom_core.md": "sha256:c45d375c83165f349606363b0ce6233c8eff42dc493c33aff49b637982897b08",
+    "07_重要补丁_B.md": "sha256:b47ac44bf05063fc76fb39cd387e6e6df5cee75bb80555c03faa6b071e81172f",
+    "05_axiom_research.md": "sha256:52f7ff2b87faf599ebd993148dae1a438e2c32691018a0ed4586b5f5a97d81ce",
+    "06_axiom_ui.md": "sha256:64f151ec81b89e218cfc55b23e509a4932a28740111e988849a33ae640df8af7",
+    "04_axiom_trade.md": "sha256:955202a4af3783aee0e82aa992ae52d4d8ce95de375e5c2c19acf846d86a6072"
+  },
+  "unknown_ids": [
+    "CONCURRENCY",
+    "CORE_ABI",
+    "DATA_CLOSURE",
+    "EVAL_TRAIN_180",
+    "EVAL_TRAIN_60",
+    "FEATURE:avg_shares_per_holder_chg_qoq:window_sessions",
+    "FEATURE:gross_margin_delta_yoy:window_sessions",
+    "FEATURE:holder_concentration_score:window_sessions",
+    "FEATURE:holder_num_chg_2q:window_sessions",
+    "FEATURE:holder_num_chg_qoq:window_sessions",
+    "FEATURE:holder_num_stale_days:window_sessions",
+    "FEATURE:holder_price_confirm_score:window_sessions",
+    "FEATURE:holder_squeeze_score:window_sessions",
+    "FEATURE:is_profitable_ttm:window_sessions",
+    "FEATURE:single_q_revenue_yoy:window_sessions",
+    "FEATURE:top10_holder_ratio:window_sessions",
+    "FEATURE:top10_holder_ratio_chg_qoq:window_sessions",
+    "FEATURE:top10_holder_stale_days:window_sessions",
+    "FEATURE:ttm_revenue_yoy:window_sessions",
+    "LABEL_LINEAGE",
+    "MEMORY_BUDGET",
+    "OOS_LINEAGE",
+    "PIT_BASELINE",
+    "SERVING_RETRAIN"
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "fixture_version": "1",
+  "purpose": "Declarative E0 conformance cases. R0 does not execute these operators or assert E0 exists.",
+  "cases": {
+    "explicit_frames_and_key_time_schema_validation": {
+      "input": {"key": ["security_id", "session"], "rows": [["A", "2020-01-02"], ["A", "2020-01-02"]]},
+      "expected": "Reject duplicate keys before FeaturePlan execution; no row-position alignment"
+    },
+    "grouped_shift_and_finite_rolling": {
+      "input": {"security": "A", "ordered_observations": [1, 2, 3], "window": 2, "min_periods": 2, "inclusive_current": true},
+      "expected": {"shift_1": [null, 1, 2], "rolling_mean": [null, 1.5, 2.5]},
+      "edge": "max_pullback120 has238 prior observations; 756-row lag requires757 observations; member gaps do not compress history"
+    },
+    "safe_arithmetic_boolean_missing_primitives": {
+      "input": {"numerator": 1, "denominator": 0, "policy": "zero_denominator_to_missing"},
+      "expected": {"divide": null},
+      "edge": "Keep is_profitable_ttm legacy missing->0 separate from NaN-preserving ratio policy"
+    },
+    "explicit_reference_universe_group_transform": {
+      "input": {"same_session_values": [1, 1, 3, 100], "member_mask": [true, true, true, false], "ties": "average"},
+      "expected": {"percentile_rank": [0.5, 0.5, 1.0, null]},
+      "edge": "Requesting one security still uses full frozen reference CS; industry uses its own group keys"
+    },
+    "parameterized_zscore_semantics": {
+      "input": {"predictions": [1, 3], "ddof": 0, "clip": null, "epsilon": 1e-12},
+      "expected": {"signal_zscore": [-1, 1]},
+      "edge": "Canonical signal constant/nonfinite predictions reject; legacy feature constant zscore may emit0; rolling score clip3 is distinct"
+    },
+    "cross_sectional_quantile_winsorization": {
+      "input": {"values": [0, 100, 10000], "member_mask": [true, true, false], "quantiles": [0.01, 0.99], "interpolation": "linear"},
+      "expected": {"winsorized": [1, 99, null]},
+      "edge": "Only the six declared selected liquidity columns receive this transform"
+    },
+    "event_availability_and_asof_alignment": {
+      "input": {"feature_session": "2020-04-01", "event_available_session": "2020-04-01"},
+      "expected": "Strict-before audited income excludes event; legacy exact-date-asof includes it only under its separate declared policy",
+      "edge": "Data owns source version selection and stable quarterly/TTM facts; Core consumes fixed facts and propagates dependency availability"
+    },
+    "frozen_recipe_graph_or_pure_plugin_abi": {
+      "input": {"plan": "financial_rc.json#feature_release.plan", "package": "unresolved"},
+      "expected": "Reject execution admission; need frozen compatible E0 ABI/package and resolved Data facts"
+    },
+    "ordered_schema_projection_and_frozen_preprocessing_apply": {
+      "input": {"ordered_columns": ["a", "b"], "values": [null, 10], "center": [1, 2], "scale": [1, 2], "raw_missing_fill": 0, "clip": [-3, 3]},
+      "expected": {"model_input": [-1, 3]},
+      "edge": "Apply saved center/scale without fitting; schema reorder must be explicit and keyed; no1.4826 scaling"
+    },
+    "saved_model_inference_abi": {
+      "input": {"model_expected_columns": ["a", "b"], "frame_columns": ["a", "c"]},
+      "expected": "Reject schema mismatch before predict; valid E0 model-byte prediction conformance requires separately built model fixture"
+    },
+    "signal_join_normalize_weighted_combine": {
+      "input": {"keys": [["A", "2020-01-02"], ["B", "2020-01-02"]], "z60": [-1, 1], "z180": [1, -1], "weights": [0.5, 0.5]},
+      "expected": {"final": [0, 0]},
+      "edge": "Shuffle one input row order: same keyed result; raw_prediction cannot masquerade as daily_zscore; missing one horizon rejects under recipe policy"
+    },
+    "deterministic_replay_and_semantic_identity": {
+      "input": {"change": "manifest locator or display title only"},
+      "expected": "Same semantic identity; model/package/fold/weights change gives new dependent identity",
+      "edge": "Byte digest is separate from semantic identity; same input key never proves output bytes exist or are correct"
+    }
+  }
+}
