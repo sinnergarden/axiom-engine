@@ -24,7 +24,8 @@ def _new_episode(binding, security, fill=None, initial_quantity=0):
 def _actions(run, scope):
     actions = {a["event_id"]: a for a in run["plan"]["market_replay"]["cash_dividends"]}
     if scope is not None:
-        economic_fields = ("security_id", "record_session", "ex_session", "pay_session", "cash_per_unit")
+        cash_name = "cash_before_tax_per_share" if run["contract_version"] == "backtest_run_v3" else "cash_per_unit"
+        economic_fields = ("security_id", "record_session", "ex_session", "pay_session", cash_name)
         expected = {a["event_id"] for a in actions.values()
                     if scope["start_session"] <= a["record_session"] <= scope["end_session"]}
         require(expected <= {a["event_id"] for a in scope["actions"]},
@@ -133,7 +134,7 @@ def evaluate_episodes(run, scope, binding):
             recognized = ex["receivable_delta_minor"]
             integer(recognized)
             # Saved EX is authoritative. PAY is a transfer, not another income.
-            if action["pay_session"] <= end:
+            if action["pay_session"] is not None and action["pay_session"] <= end:
                 require(pay is not None and pay["session"] == action["pay_session"] and
                         pay["cash_delta_minor"] == recognized and pay["receivable_delta_minor"] == -recognized,
                         "saved dividend payment does not reconcile")
@@ -142,7 +143,8 @@ def evaluate_episodes(run, scope, binding):
                 receivable = recognized
         else:
             require(ex is None and pay is None, "future dividend was recognized in saved account")
-            pending = minor(decimal(action["cash_per_unit"], minimum=0) * quantity * 100)
+            cash_name = "cash_before_tax_per_share" if action.get("contract_version") == "stock_cash_action_v1" else "cash_per_unit"
+            pending = minor(decimal(action[cash_name], minimum=0) * quantity * 100)
         episode["dividend_income_minor"] += recognized
         episode["receivable_minor"] += receivable
         episode["dividends"].append({"event_id": action["event_id"], "record_session": action["record_session"],
@@ -150,6 +152,9 @@ def evaluate_episodes(run, scope, binding):
             "recognition_sequence": None if ex is None else ex["sequence"], "payment_sequence": None if pay is None else pay["sequence"],
             "recognized_minor": recognized, "pending_minor": pending, "receivable_minor": receivable,
             "source_refs": action["source_refs"]})
+        if action.get("contract_version") == "stock_cash_action_v1":
+            episode["dividends"][-1].update(payment_status="UNKNOWN" if action["pay_session"] is None else
+                ("PAID" if pay is not None else "PENDING"), tax_convention=action["tax_convention"])
     final_positions = run["final_account"]["positions"]
     for security in set(final_positions) | set(active):
         require(final_positions.get(security, {}).get("quantity", 0) == active.get(security, {}).get("final_quantity", 0),
@@ -192,4 +197,6 @@ def evaluate_episodes(run, scope, binding):
         "mean_episode_return": None if len(valid_returns) != count or not count else str(sum(valid_returns) / count),
         "return_denominator": "cumulative_buy_cost_including_fees", "weighting": "equal_closed_episode",
         "dividend_scope_status": "COVERAGE_UNKNOWN" if scope is None else "OBSERVED_RECORDS_ONLY"}
+    if run["contract_version"] == "backtest_run_v3":
+        metrics["payment_unknown_count"] = sum(d.get("payment_status") == "UNKNOWN" for e in episodes for d in e["dividends"])
     return episodes, metrics
