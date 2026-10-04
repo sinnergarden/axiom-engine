@@ -5,7 +5,7 @@ from .backtest import (BacktestRequest, BacktestRun, MarketReplay, run_backtest,
 from .market_adapter import read_etf_market_replay
 from .profiles import daily_open_profile
 from .evaluation import (BenchmarkSeries, DividendScope, EvaluationSpec, EvaluationReport,
-                         daily_evaluation_spec, evaluate_backtest,
+                         daily_evaluation_spec, long_history_evaluation_spec, evaluate_backtest,
                          save_backtest_evaluation, load_backtest_evaluation)
 from .evaluation_adapter import read_csi300_benchmark, read_dividend_scope
 
@@ -13,5 +13,5 @@ __all__ = ["BatchReference", "DecisionBatchGate", "InputGateError", "stale_price
            "BacktestRequest", "BacktestRun", "MarketReplay", "run_backtest",
            "save_backtest_run", "load_backtest_run", "read_etf_market_replay", "daily_open_profile",
            "BenchmarkSeries", "DividendScope", "EvaluationSpec", "EvaluationReport",
-           "daily_evaluation_spec", "evaluate_backtest", "save_backtest_evaluation",
+           "daily_evaluation_spec", "long_history_evaluation_spec", "evaluate_backtest", "save_backtest_evaluation",
            "load_backtest_evaluation", "read_csi300_benchmark", "read_dividend_scope"]
