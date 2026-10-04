@@ -10,12 +10,14 @@ from ..core.contracts import Document, digest, fields, integer, require, session
 from ..core.portfolio import PORTFOLIO_VERSION, decimal, minor, validate_signals
 from .accounting import AccountLedger
 from .profiles import STATUS_GAP_REASONS
+from .unit_splits import UNIT_SPLIT_POLICY, suspension_events, validate_unit_splits
 
-RUNTIME_VERSION = "axiom.backtest/1.1"
+RUNTIME_VERSION = "axiom.backtest/2"
+LEGACY_RUNTIME_VERSION = "axiom.backtest/1.1"
 
 
 class MarketReplay(Document):
-    """Explicit unadjusted daily simulation facts and cash-dividend events."""
+    """Unadjusted daily facts, cash dividends and bounded ETF unit events."""
 
 
 class BacktestRequest(Document):
@@ -28,13 +30,19 @@ class BacktestRun(Document):
 
 def _validate(request):
     plan = request.to_dict()
-    fields(plan, "contract_version account_id start_session end_session signal_frame market_replay initial_account profile")
-    require(plan["contract_version"] == "backtest_request_v1", "unsupported request")
+    v2 = plan.get("contract_version") == "backtest_request_v2"
+    fields(plan, "contract_version account_id start_session end_session signal_frame market_replay initial_account profile" +
+           (" unit_split_policy" if v2 else ""))
+    require(plan["contract_version"] in ("backtest_request_v1", "backtest_request_v2"), "unsupported request")
+    if v2:
+        require(plan["unit_split_policy"] == UNIT_SPLIT_POLICY, "unsupported unit split policy")
     text(plan["account_id"]); session(plan["start_session"]); session(plan["end_session"])
     signal, signals = validate_signals(SignalFrame.from_dict(plan["signal_frame"]))
     market = plan["market_replay"]
-    fields(market, "contract_version price_basis calendar universe rows cash_dividends source_refs source_evidence limitations")
-    require(market["contract_version"] == "market_replay_v1" and market["price_basis"] == "unadjusted", "unadjusted replay required")
+    fields(market, "contract_version price_basis calendar universe rows cash_dividends source_refs source_evidence limitations" +
+           (" unit_splits" if v2 else ""))
+    require(market["contract_version"] == ("market_replay_v2" if v2 else "market_replay_v1") and
+            market["price_basis"] == "unadjusted", "matching unadjusted replay required")
     calendar = market["calendar"]
     require(type(calendar) is list and bool(calendar) and calendar == sorted(set(calendar)), "explicit ordered calendar required")
     for day in calendar:
@@ -69,6 +77,8 @@ def _validate(request):
         require(bool(row["source_refs"]), "row provenance required")
         for ref in row["source_refs"]:
             digest(ref)
+            if v2:
+                require(ref in market["source_refs"], "unbound v2 market row reference")
         key = row["session"], row["security_id"]
         require(key not in indexed, "duplicate market key")
         indexed[key] = row
@@ -112,6 +122,8 @@ def _validate(request):
         require(all(re.fullmatch(r"cn\.etf\.(SSE|SZSE)\.\d{6}\.\d{8}", s) for s in signal["universe"]),
                 "observed-daily profile requires canonical ETF identities")
     fields(plan["initial_account"], "cash_minor positions")
+    if v2:
+        validate_unit_splits(market, plan["start_session"], plan["end_session"])
     return plan, signal, signals, market, calendar, indexed, profile
 
 
@@ -122,13 +134,18 @@ def _fees(price, quantity, side, profile):
     return gross, commission, tax
 
 
-def _simulate(intent, row, ledger, profile, day, run_id, order_index):
+def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_splits=None):
     order = {**intent, "order_id": run_id + ":order:" + str(order_index), "session": day,
              "status": "EXPIRED", "filled_quantity": 0, "unfilled_quantity": intent["quantity"],
              "reason": None, "execution": "daily_open_approximation"}
     order["market_state"] = row["market_state"]
     order["state_reason"] = row["state_reason"]
     order["execution_admission"] = "CONFIRMED_STATUS"
+    if unit_splits is not None:
+        order["announced_suspension_event_ids"] = suspension_events(unit_splits, intent["security_id"], day)
+        if order["announced_suspension_event_ids"]:
+            order.update(execution_admission="BLOCKED", reason="ANNOUNCED_SUSPENSION")
+            return order
     if row["market_state"] != "normal_trading":
         observed_etf = (profile["unknown_status_policy"] == "etf_daily_observed" and
                         row["market_state"] == "unknown_status" and row["state_reason"] in STATUS_GAP_REASONS)
@@ -153,10 +170,14 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index):
     lot = profile["lot_size"]
     cap = int(decimal(row["volume_units"]) * decimal(profile["participation_rate"]))
     quantity = min(intent["quantity"], cap)
-    if buy or quantity < intent["quantity"]:
+    if buy:
         quantity = quantity // lot * lot
-    if not buy:
-        quantity = min(quantity, ledger.positions.get(intent["security_id"], {"sellable_quantity": 0})["sellable_quantity"])
+    else:
+        held = ledger.positions.get(intent["security_id"], {"quantity": 0, "sellable_quantity": 0})
+        quantity = min(quantity, held["sellable_quantity"])
+        full_exit = (intent["quantity"] == held["quantity"] == held["sellable_quantity"] and cap >= held["quantity"])
+        if not full_exit:
+            quantity = quantity // lot * lot
     if buy and quantity:
         low, high = 0, quantity // lot
         while low < high:
@@ -200,11 +221,15 @@ def run_backtest(request):
 
 def _run(request):
     plan, signal, signals, market, calendar, rows, profile = _validate(request)
-    run_id = Document.from_dict({"request": plan, "core": PORTFOLIO_VERSION, "runtime": RUNTIME_VERSION,
+    v2 = plan["contract_version"] == "backtest_request_v2"
+    runtime = RUNTIME_VERSION if v2 else LEGACY_RUNTIME_VERSION
+    splits = market.get("unit_splits", [])
+    run_id = Document.from_dict({"request": plan, "core": PORTFOLIO_VERSION, "runtime": runtime,
                                 "implementation_ref": IMPLEMENTATION_REF}).identity
     ledger = AccountLedger(cash_minor=plan["initial_account"]["cash_minor"], calendar=calendar,
                            settlement_sessions=profile["settlement_sessions"], positions=plan["initial_account"]["positions"])
     quotes, marks, entitlements = {}, {}, {}
+    registrations, applications, mark_basis = {}, [], {}
     nav, positions, orders, decisions = [], [], [], []
     initial_value = None
     for index, day in enumerate(calendar):
@@ -231,20 +256,42 @@ def _run(request):
                            "account_state_version": ledger.sequence,
                            **{key: profile[key] for key in ("lot_size", "commission_rate", "minimum_commission_minor", "tax_rate", "slippage_bps")}}
                 decision = plan_rotation(SignalFrame.from_dict(signal), account=ledger.account(), context=context).to_dict()
+                if v2:
+                    decision["reference_prices"] = {s: dict(q) for s, q in quotes.items()}
                 decisions.append(decision)
                 for intent in decision["intents"]:
-                    orders.append(_simulate(intent, rows[day, intent["security_id"]], ledger, profile, day, run_id, len(orders)))
+                    orders.append(_simulate(intent, rows[day, intent["security_id"]], ledger, profile, day, run_id, len(orders),
+                                            splits if v2 else None))
             for action in market["cash_dividends"]:
                 if action["record_session"] == day:
                     entitlements[action["event_id"]] = ledger.positions.get(action["security_id"], {"quantity": 0})["quantity"]
+            for item in splits:
+                event = item["event"]
+                if event["record_date"] == day:
+                    position = ledger.positions.get(event["security_id"], {"quantity": 0, "sellable_quantity": 0, "cost_minor": 0})
+                    require(not any(lot["security_id"] == event["security_id"] for lot in ledger.pending) and
+                            position["quantity"] == position["sellable_quantity"],
+                            "unit split registration requires fully settled entitlement")
+                    registrations[event["event_id"]] = {"sequence": ledger.sequence, "position": dict(position)}
         for security in sorted(signal["universe"]):
             row = rows[day, security]
             if row["close"] is not None:
                 quote = {"price": row["close"], "session": day, "available_at": row["close_available_at"], "source_refs": row["source_refs"]}
                 quotes[security] = quote
                 marks[security] = quote
+                mark_basis[security] = None
         if day < plan["start_session"]:
             continue
+        for item in sorted(splits, key=lambda i: i["event"]["event_id"]):
+            event = item["event"]
+            if event["effective_date"] == day:
+                registration = registrations.get(event["event_id"])
+                require(registration is not None, "unit split registration absent")
+                application = ledger.unit_split(item, registration, quotes.get(event["security_id"]))
+                if application is not None:
+                    applications.append(application)
+                    quotes[event["security_id"]] = marks[event["security_id"]] = application["normalized_quote"]
+                    mark_basis[event["security_id"]] = event["event_id"]
         ledger.sequence += 1  # commit the session valuation at one shared watermark
         value = 0
         for security, position in sorted(ledger.positions.items()):
@@ -259,6 +306,8 @@ def _run(request):
                 "is_stale": mark["session"] != day, "stale_sessions": index - calendar.index(mark["session"]),
                 "mark_source_refs": mark["source_refs"], "market_value_minor": amount,
                 "committed_sequence": ledger.sequence})
+            if v2:
+                positions[-1]["mark_basis_event_id"] = mark_basis.get(security)
         receivable = sum(ledger.receivables.values())
         total = ledger.cash + value + receivable
         nav.append({"session": day, "cash_minor": ledger.cash, "market_value_minor": value,
@@ -268,10 +317,10 @@ def _run(request):
     for point in nav:
         peak = max(peak, point["nav_minor"])
         drawdown = min(drawdown, Decimal(point["nav_minor"]) / peak - 1)
-    result = {"contract_version": "backtest_run_v1", "run_id": run_id, "account_id": plan["account_id"],
+    result = {"contract_version": "backtest_run_v2" if v2 else "backtest_run_v1", "run_id": run_id, "account_id": plan["account_id"],
         "status": "COMPLETE", "plan": plan, "signal_ref": signal["signal_run_ref"],
         "market_ref": MarketReplay.from_dict(market).identity, "profile_ref": Document.from_dict(profile).identity,
-        "core_version": PORTFOLIO_VERSION, "runtime_version": RUNTIME_VERSION,
+        "core_version": PORTFOLIO_VERSION, "runtime_version": runtime,
         "implementation_ref": IMPLEMENTATION_REF,
         "committed_sequence": ledger.sequence, "initial_nav_minor": initial_value,
         "final_account": {"cash_minor": ledger.cash, "receivable_minor": sum(ledger.receivables.values()),
@@ -289,6 +338,15 @@ def _run(request):
                          "Metrics cover the fixed short sample only; no OOS, CAGR or Sharpe claim.", *market["limitations"]]}
     if profile["unknown_status_policy"] == "etf_daily_observed":
         result["limitations"].insert(0, "EXPLICIT ETF DAILY APPROXIMATION: UNKNOWN status is retained, not promoted to normal_trading; missing-status executions assume observed daily open/volume/limits and cannot establish opening liquidity. Not a live execution profile.")
+    if v2:
+        result["unit_split_applications"] = applications
+        result["limitations"] = [s.replace("split or delisting support", "general corporate-action or delisting support") for s in result["limitations"]]
+        result["limitations"] = [s.replace("Metrics cover the fixed short sample only; no OOS, CAGR or Sharpe claim.",
+            "Metrics cover the frozen account scope; any annualization belongs to a separate saved evaluation.") for s in result["limitations"]]
+        result["limitations"].extend([
+            "ETF unit replacement applies visible planned arrangements under a single-holder fully settled EOD simulation model; APPLIED is not issuer implemented status.",
+            "Date-only next-open availability is best effort; actual receipt remains unchanged and strict historical PIT is not established.",
+            "Issuer not_stated phase remains native; EOD and no extra T+1 are Runtime conventions. UNKNOWN and missing bars remain; disclosed full-session suspension is an additional hard block."])
     result["content_digest"] = Document.from_dict(result).identity
     return BacktestRun.from_dict(result)
 
@@ -309,11 +367,17 @@ def load_backtest_run(path):
     """Read a saved result and check content/input identity without recomputation."""
     saved = BacktestRun(Path(path).read_text())
     wire = saved.to_dict()
-    require(wire.get("contract_version") == "backtest_run_v1" and wire.get("status") == "COMPLETE", "unsupported saved result")
+    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2") and wire.get("status") == "COMPLETE", "unsupported saved result")
     recorded_digest = wire.pop("content_digest", None)
     require(recorded_digest == Document.from_dict(wire).identity, "saved result content digest mismatch")
     require(wire["run_id"] == Document.from_dict({"request": wire["plan"],
             "core": wire["core_version"], "runtime": wire["runtime_version"],
             "implementation_ref": wire["implementation_ref"]}).identity,
             "saved run identity mismatch")
+    if wire["contract_version"] == "backtest_run_v2":
+        require(wire["runtime_version"] == "axiom.backtest/2" and wire["plan"]["contract_version"] == "backtest_request_v2",
+                "saved v2 tuple mismatch")
+        _validate(BacktestRequest.from_dict(wire["plan"]))
+        from .unit_splits import validate_saved_applications
+        validate_saved_applications(wire)
     return saved
