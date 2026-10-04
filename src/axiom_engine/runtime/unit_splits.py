@@ -7,6 +7,7 @@ from ..core.contracts import Document, digest, fields, integer, require, session
 UNIT_SPLIT_POLICY = "etf_settled_holder_eod_v1"
 UNIT_SPLIT_PHASE = "EOD_AFTER_CLOSE_BEFORE_NAV"
 EVENT_FIELDS = tuple("security_id event_id event_type announcement_date announcement_precision process_status record_date effective_date effective_phase new_price_basis_session new_price_basis_basis ratio_numerator ratio_denominator quantity_rounding quantity_rounding_scope suspension_start suspension_end suspension_scope resume_session document_refs extraction_version revision_id revision_sequence first_observed_at raw_batch_id source_available_at evidence_ref".split())
+EVENT_VALUE_FIELDS = tuple(name for name in EVENT_FIELDS if name not in ("security_id", "event_id"))
 
 
 def eod(day):
@@ -75,7 +76,7 @@ def validate_unit_splits(market, start, end):
             require(_utc(query["cutoff"]) == eod(event["record_date"]), "unit registration query cutoff mismatch")
             require(event in batch["records"], "unit event differs from public selected record")
             usable = []
-            for name in EVENT_FIELDS:
+            for name in EVENT_VALUE_FIELDS:
                 meta = [r for r in batch["field_meta"][name]["by_key"] if
                         r["event_id"] == event["event_id"] and r["security_id"] == event["security_id"]]
                 require(len(meta) == 1 and meta[0]["revision_id"] == event["revision_id"] and

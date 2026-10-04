@@ -10,7 +10,7 @@ from axiom_engine.core.contracts import Document
 from axiom_engine.runtime import BacktestRequest, BacktestRun, run_backtest, save_backtest_run, load_backtest_run
 from axiom_engine.runtime.accounting import AccountLedger
 from axiom_engine.runtime.episode_evaluation import evaluate_episodes
-from axiom_engine.runtime.unit_splits import EVENT_FIELDS, UNIT_SPLIT_POLICY
+from axiom_engine.runtime.unit_splits import EVENT_FIELDS, EVENT_VALUE_FIELDS, UNIT_SPLIT_POLICY
 from test_backtest import etf_fixture, DAYS, REF
 
 
@@ -19,7 +19,7 @@ def bind_event(wire, event):
     batch = {'records': [deepcopy(event)], 'field_meta': {name: {'by_key': [
         {'security_id': event['security_id'], 'event_id': event['event_id'],
          'revision_id': event['revision_id'], 'usable_from': available,
-         'status': 'value' if event[name] is not None else 'source_missing'}]} for name in EVENT_FIELDS},
+         'status': 'value' if event[name] is not None else 'source_missing'}]} for name in EVENT_VALUE_FIELDS},
         'context': {'contract_version': 'data_batch_v1', 'domain': 'fund_share_conversions',
                     'snapshot_id': 's_synthetic', 'query': {'purpose': 'market_replay',
                     'pit_policy': 'best_effort_vendor_v1', 'time_field': 'effective_date',

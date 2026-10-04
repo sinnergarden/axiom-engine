@@ -73,6 +73,8 @@ class SyntheticData:
         if query.domain == 'corporate_actions':
             return Batch({'records':[],'field_meta':{'cash_dividend_per_unit':{'unit':'CNY/fund unit'}},'context':self.context(query)})
         self.assert_domain = query.domain
+        if 'security_id' in query.fields or 'event_id' in query.fields:
+            raise ValueError('event query contains implicit key field')
         source = deepcopy(self.wire['market_replay']['source_evidence'][1]['batch'])
         source['context'] = self.context(query)
         if query.cutoff[:10] > DAYS[2]:

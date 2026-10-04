@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from ..core.contracts import Document, require
 from .backtest import MarketReplay
-from .unit_splits import EVENT_FIELDS, validate_unit_splits
+from .unit_splits import EVENT_VALUE_FIELDS, validate_unit_splits
 
 
 def _utc(value):
@@ -117,7 +117,7 @@ def read_etf_market_replay(data, *, snapshot, universe, first_session, end_sessi
         # comes from a fresh record-cutoff query; future results cannot unlock it.
         def unit_query(symbols, start, end, cutoff):
             return _batch(data.events(snapshot=snapshot, query=EventQuery(
-                "fund_share_conversions", EVENT_FIELDS, tuple(symbols), start, end, cutoff,
+                "fund_share_conversions", EVENT_VALUE_FIELDS, tuple(symbols), start, end, cutoff,
                 "best_effort_vendor_v1", "effective_date", purpose="market_replay")), snapshot)
         candidates = unit_query(universe, first_session, end_session, cutoffs[end_session])
         unit_batches.append(candidates)
@@ -131,7 +131,7 @@ def read_etf_market_replay(data, *, snapshot, universe, first_session, end_sessi
             require(event["record_date"] == candidate["record_date"] and event["effective_date"] == candidate["effective_date"],
                     "unit historical economic dates conflict with discovery scope")
             available = []
-            for name in EVENT_FIELDS:
+            for name in EVENT_VALUE_FIELDS:
                 meta = [row for row in batch["field_meta"][name]["by_key"] if row["event_id"] == event["event_id"] and
                         row["security_id"] == event["security_id"]]
                 require(len(meta) == 1 and meta[0]["usable_from"] is not None, "unit field availability missing")
