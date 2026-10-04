@@ -1,7 +1,7 @@
 """P10 evaluation of saved account observations, without account replay.
 
-Definitions are frozen in axiom-docs Trade §11.1 (60c2ec9). Monetary amounts
-remain CNY fen; decimal ratios are not rounded for presentation here.
+Definitions are frozen in axiom-docs Trade §11.1 and §11.2 (c7d28ff).
+Monetary amounts remain CNY fen; ratios are not rounded for presentation.
 """
 from calendar import monthrange
 from decimal import Context, Decimal, ROUND_HALF_UP, localcontext
@@ -13,8 +13,10 @@ from ..core.portfolio import decimal
 from .backtest import BacktestRun
 from .episode_evaluation import evaluate_episodes
 from .evaluation_inputs import evidence_batch, benchmark_rows, dividend_actions
+from .period_evaluation import period_metrics, validate_period_metrics
 
 EVALUATION_VERSION = "axiom.evaluation/1"
+LONG_EVALUATION_VERSION = "axiom.evaluation/2"
 
 
 class BenchmarkSeries(Document):
@@ -45,6 +47,16 @@ def daily_evaluation_spec():
         "pnl_distribution": {"metric": "net_pnl_minor", "unit": "CNY fen",
             "edges_minor": [-100000, -50000, -10000, 0, 10000, 50000, 100000],
             "interval": "left_closed_right_open", "minimum_episodes": 10}})
+
+
+def long_history_evaluation_spec():
+    """Fixed v2 profile; the daily v1 factory and saved results stay unchanged."""
+    wire = daily_evaluation_spec().to_dict()
+    wire.update(contract_version="evaluation_spec_v2", annualization={
+        "method": "geometric_cagr", "day_count": "actual_actual_calendar_year_split",
+        "interval": "start_inclusive_end_exclusive", "start_anchor": "previous_session_initial_nav",
+        "end_anchor": "last_saved_nav_session", "minimum_year_fraction": "1"})
+    return EvaluationSpec.from_dict(wire)
 
 
 def _verify_run(run):
@@ -251,7 +263,14 @@ def evaluate_backtest(run, *, benchmark, spec, dividend_scope=None):
 
 def _evaluate(run, benchmark, spec, dividend_scope):
     saved = _verify_run(run)
-    require(isinstance(spec, EvaluationSpec) and spec.payload == daily_evaluation_spec().payload, "unsupported EvaluationSpec")
+    require(isinstance(spec, EvaluationSpec), "EvaluationSpec required")
+    long_period = spec.payload == long_history_evaluation_spec().payload
+    require(long_period or spec.payload == daily_evaluation_spec().payload, "unsupported EvaluationSpec")
+    if long_period:
+        calendar = saved["plan"]["market_replay"]["calendar"]
+        require(bool(saved["nav"]) and calendar == sorted(set(calendar)) and
+                saved["nav"][0]["session"] in calendar and calendar.index(saved["nav"][0]["session"]) > 0,
+                "saved NAV requires an ordered frozen calendar and strict prior anchor")
     calendar, days, series = _account_series(saved)
     anchor = calendar[calendar.index(days[0]) - 1]
     snapshots = _provenance(saved["plan"]["market_replay"])
@@ -264,20 +283,23 @@ def _evaluate(run, benchmark, spec, dividend_scope):
     limitations = [*saved["limitations"], *bench_input["limitations"],
         "CSI300 is a price index excluding dividends; account NAV includes recognized dividends. These are different return bases.",
         "Cumulative buy cost including fees is the episode return denominator; equal episode weighting is not IRR or a time-weighted account return.",
-        "No annualization, Sharpe or confidence claim; distribution minimum count is a display threshold."]
+        ("CAGR uses the declared initial-wealth clock and actual calendar-year fractions; simulated annualized returns are not predictions. Input-run metric-scope statements describe that saved run; qualified CAGR is provided only by this v2 evaluation, with all original data, execution and dividend limitations retained. No Sharpe or confidence claim; distribution minimum count is a display threshold."
+         if long_period else "No annualization, Sharpe or confidence claim; distribution minimum count is a display threshold.")]
     if scope is None:
         limitations.append("DIVIDEND COVERAGE UNKNOWN: saved ex-date events cannot establish absence of known pending ex-date income; closed metrics describe observed income only.")
     else:
         limitations.extend(scope["limitations"])
-    wire = {"contract_version": "evaluation_report_v1", "input_run_ref": input_ref,
+    wire = {"contract_version": "evaluation_report_v2" if long_period else "evaluation_report_v1", "input_run_ref": input_ref,
         **{key: saved[key] for key in ("signal_ref", "market_ref", "profile_ref")},
         "spec_ref": spec.identity, "spec": spec.to_dict(), "benchmark_ref": benchmark.identity,
         "benchmark_input": bench_input, "dividend_scope_ref": None if scope is None else dividend_scope.identity,
-        "dividend_scope": scope, "evaluation_version": EVALUATION_VERSION, "implementation_ref": IMPLEMENTATION_REF,
+        "dividend_scope": scope, "evaluation_version": LONG_EVALUATION_VERSION if long_period else EVALUATION_VERSION, "implementation_ref": IMPLEMENTATION_REF,
         "status": "COMPLETE" if scope is not None and bench["status"] == "COMPLETE" and all(m["status"] == "COMPLETE" for m in monthly) else "PARTIAL",
         "series": series, "monthly_returns": monthly, "episodes": episodes, "episode_metrics": metrics,
         "benchmark": bench, "pnl_distribution": _distribution(episodes, spec.to_dict()["pnl_distribution"]),
         "limitations": list(dict.fromkeys(limitations))}
+    if long_period:
+        wire["period_metrics"] = period_metrics(saved, series, bench, anchor=anchor)
     wire["evaluation_ref"] = _identity(wire)
     wire["content_digest"] = Document.from_dict(wire).identity
     return EvaluationReport.from_dict(wire)
@@ -286,9 +308,17 @@ def _evaluate(run, benchmark, spec, dividend_scope):
 def _verify_report(report):
     require(isinstance(report, EvaluationReport), "EvaluationReport required")
     wire = report.to_dict()
-    require(wire.get("contract_version") == "evaluation_report_v1" and wire.get("status") in ("COMPLETE", "PARTIAL"), "unsupported saved evaluation")
+    require(wire.get("contract_version") in ("evaluation_report_v1", "evaluation_report_v2") and
+            wire.get("status") in ("COMPLETE", "PARTIAL"), "unsupported saved evaluation")
     recorded = wire.pop("content_digest", None)
     require(recorded == Document.from_dict(wire).identity, "saved evaluation content digest mismatch")
+    long_period = wire["contract_version"] == "evaluation_report_v2"
+    expected_spec = long_history_evaluation_spec() if long_period else daily_evaluation_spec()
+    require(wire["spec"] == expected_spec.to_dict() and wire["evaluation_version"] ==
+            (LONG_EVALUATION_VERSION if long_period else EVALUATION_VERSION), "saved spec/report/evaluation version mismatch")
+    require(("period_metrics" in wire) == long_period, "saved period metrics contract mismatch")
+    if long_period:
+        validate_period_metrics(wire["period_metrics"])
     fields(wire["input_run_ref"], "run_id content_digest committed_sequence")
     for key in ("run_id", "content_digest"):
         digest(wire["input_run_ref"][key])
