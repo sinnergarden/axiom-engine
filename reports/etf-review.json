@@ -1,0 +1,13 @@
+{
+  "reviewer": "/root/engine_review",
+  "scope": "Read-only Core/Runtime/adapter review and minimal counterexamples; no repeated test suite or Data writes",
+  "findings_fixed": [
+    {"trigger": "Feature-session row carried trade-day 00:50Z cutoff", "fix": "Cutoff must be on feature session; late signal rejected", "reviewer_rechecked": true},
+    {"trigger": "One-unit sale with fee above cash plus proceeds", "fix": "Order expires with INSUFFICIENT_CASH_FOR_FEES; account unchanged", "reviewer_rechecked": true},
+    {"trigger": "Open 0.5 below declared down limit 1", "fix": "Contradictory limits or out-of-range open/close rejected", "reviewer_rechecked": true},
+    {"trigger": "Same version code could share run identity", "fix": "Generated actual source digest binds implementation_ref and run_id; test verifies binding"},
+    {"trigger": "Direct account call could backdate fill after settlement", "fix": "Frozen calendar and monotonically advancing account session reject backfill"}
+  ],
+  "final_reviewer_result": "No remaining fixed-small-sample blockers. Data adapter retains UNKNOWN and blocks fills; record/ex/pay mapping and unexplained-factor-change rejection agree with scope.",
+  "limits": "Not a live broker, SQLite recovery, full event/history, real market-rule or strategy-effectiveness review. Real ETF sample has zero fills due to missing status evidence."
+}
