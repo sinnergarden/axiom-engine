@@ -16,6 +16,7 @@ from axiom_engine.runtime.backtest import _simulate
 from axiom_engine.runtime.stock_inputs import ELIGIBILITY_ID, support_ref, supported_universe
 from axiom_engine.runtime.stock_inputs import validate_stock_request
 from axiom_engine.runtime.stock_market import STOCK_EVENT_FIELDS
+from axiom_engine.runtime.stock_evidence import native_batches, native_ref
 from axiom_engine.runtime.evaluation_inputs import benchmark_rows
 
 REF = "sha256:" + "a" * 64
@@ -114,7 +115,7 @@ def request(*, inputs=None, frame=None, strict=False):
             q=deepcopy(b['context']['query'])
             if kind=='membership':q.update(purpose='decision_facts',fields=['is_member'],symbols=frame['universe'],universe_id='csi300')
             if kind.startswith('warmup-'):q.update(sessions=['2023-12-28'],cutoff_by_session={'2023-12-28':'2023-12-28T20:30:00+08:00'})
-            proof['batches'][side+'-'+kind]={'wire_ref':Document.from_dict(b).identity,'file_digest':REF,
+            proof['batches'][side+'-'+kind]={'wire_ref':market['source_evidence'][index]['reference'],'file_digest':REF,
                 'snapshot_id':proof[side]['snapshot'],'reader_version':b['context']['reader_version'],'query':q}
     proof["admission_ref"] = Document.from_dict(proof).identity
     return BacktestRequest.from_dict({"contract_version":"backtest_request_v3","account_id":"synthetic-stock",
@@ -253,6 +254,37 @@ class StockTests(unittest.TestCase):
     def test_native_projection_tampering_is_rejected(self):
         w=request().to_dict();w['market_replay']['rows'][0]['close']='10.01'
         with self.assertRaises(ValueError):run_backtest(BacktestRequest.from_dict(w))
+
+    def test_large_native_coverage_is_bundle_local_shared_and_hash_checked(self):
+        inputs=native_inputs([cash_event()]);coverage={'supplier_scope':'x'*(1024*1024)}
+        for i in (2,4,5):inputs[i]['context']['coverage']=coverage
+        req=request(inputs=inputs);market=req.to_dict()['market_replay']
+        self.assertEqual(len(market['coverage_bundle']),1)
+        self.assertEqual(native_batches(market['source_evidence'],market['coverage_bundle']),inputs)
+        self.assertEqual(market['source_refs'],[native_ref(b) for b in inputs])
+        self.assertLess(len(req.payload),200000)
+        inline=req.to_dict();inline_market=inline['market_replay'];inline_market.pop('coverage_bundle')
+        inline_market['source_evidence']=[{'reference':native_ref(b),'batch':b} for b in inputs]
+        validate_stock_request(inline)
+        run=run_backtest(req);scope=stock_dividend_scope(run).to_dict()
+        self.assertEqual(scope['coverage_bundle'],market['coverage_bundle'])
+        report=evaluate_backtest(run,spec=long_history_evaluation_spec(),benchmark=benchmark(),dividend_scope=stock_dividend_scope(run))
+        with tempfile.TemporaryDirectory() as d:
+            rp,ep=Path(d)/'run.json',Path(d)/'evaluation.json'
+            save_backtest_run(run,rp);save_backtest_evaluation(report,ep)
+            self.assertEqual(load_backtest_run(rp).payload,run.payload)
+            self.assertEqual(load_backtest_evaluation(ep).payload,report.payload)
+            old_run=run_backtest(BacktestRequest.from_dict(inline));old_path=Path(d)/'old-inline.json'
+            save_backtest_run(old_run,old_path);self.assertEqual(load_backtest_run(old_path).payload,old_run.payload)
+        broken=deepcopy(market);broken['coverage_bundle'][0]['payload']='AA=='
+        with self.assertRaises(ValueError):native_batches(broken['source_evidence'],broken['coverage_bundle'])
+        broken=deepcopy(market);broken['coverage_bundle']=[]
+        with self.assertRaises(ValueError):native_batches(broken['source_evidence'],broken['coverage_bundle'])
+        import base64,gzip,hashlib
+        broken=deepcopy(market);item=broken['coverage_bundle'][0]
+        compressed=gzip.compress(b'x'*(item['uncompressed_bytes']*2),mtime=0)
+        item.update(payload=base64.b64encode(compressed).decode(),compressed_digest='sha256:'+hashlib.sha256(compressed).hexdigest())
+        with self.assertRaises(ValueError):native_batches(broken['source_evidence'],broken['coverage_bundle'])
 
     def test_cash_record_ex_unknown_pay_and_budget(self):
         run=run_backtest(request(inputs=native_inputs([cash_event()])));w=run.to_dict()

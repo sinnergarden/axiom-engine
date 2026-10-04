@@ -3,6 +3,7 @@ from ..core.contracts import Document, require
 from ..core.portfolio import decimal
 from ..core.stock_portfolio import instant
 from .stock_inputs import TAX_CONVENTION
+from .stock_evidence import native_ref, pack_stock_batches, scoped_bundle
 
 STOCK_EVENT_FIELDS = ("implementation_announcement_date", "record_date", "ex_date",
     "cash_dividend_before_tax_per_share", "bonus_shares_per_share", "capital_transfer_shares_per_share",
@@ -47,6 +48,10 @@ def _visible(meta, cutoff):
 def stock_market_from_batches(*, batches, universe, calendar):
     """Preserve complete native batches, including nonimplemented uncertainty."""
     from .backtest import MarketReplay
+    return MarketReplay.from_dict(_stock_market_wire(batches=batches, universe=universe, calendar=calendar))
+
+
+def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, coverage_bundle=None):
     require(len(batches) == 6, "stock states/prices/limits/factors/two action queries required")
     states, prices, limits, factors, ex_actions, record_actions = batches
     snapshot = prices["context"]["snapshot_id"]
@@ -82,7 +87,8 @@ def stock_market_from_batches(*, batches, universe, calendar):
             require(key not in result, "duplicate native stock field metadata")
             result[key] = row
         return result
-    source_refs = [Document.from_dict(batch).identity for batch in batches]
+    source_refs = ([native_ref(batch) for batch in batches] if saved_evidence is None else
+                   [entry["reference"] for entry in saved_evidence])
     p, s, l, f = map(keyed, (prices, states, limits, factors))
     meta = {name: metadata(batch, native) for name, batch, native in
         (("open", prices, "open"), ("close", prices, "close"), ("volume_shares", prices, "volume_shares"),
@@ -188,16 +194,22 @@ def stock_market_from_batches(*, batches, universe, calendar):
                 block(security, day, factor_meta[day, security]["usable_from"], "UNEXPLAINED_FACTOR_CHANGE", source_refs[3])
             previous = factor
     unique_refs = list(dict.fromkeys(source_refs))
-    evidence = [{"reference": ref, "batch": batches[source_refs.index(ref)]} for ref in unique_refs]
+    if saved_evidence is None:
+        evidence, coverage_bundle = pack_stock_batches([batches[source_refs.index(ref)] for ref in unique_refs], unique_refs)
+    else:
+        evidence = saved_evidence
     limitations = sorted({value for batch in batches for value in batch["context"].get("limitations", [])})
     limitations += ["OBSERVED IMPLEMENTED ACTIONS ONLY: nonimplemented uncertainty remains diagnostic; no complete action-history claim.",
         "Stock cash source lacks PAY dates; gross-before-tax receivables remain pending until verified native payment.",
         "Native UNKNOWN and actual field availability are retained; daily open/volume/limits are retrospective execution evidence."]
-    return MarketReplay.from_dict({"contract_version": "market_replay_v3", "price_basis": "unadjusted",
+    wire = {"contract_version": "market_replay_v3", "price_basis": "unadjusted",
         "calendar": list(calendar), "universe": list(universe), "rows": rows,
         "cash_dividends": sorted(actions.values(), key=lambda a: a["event_id"]),
         "action_diagnostics": diagnostics, "action_blocks": blocks, "source_refs": unique_refs,
-        "source_evidence": evidence, "limitations": limitations})
+        "source_evidence": evidence, "limitations": limitations}
+    if coverage_bundle:
+        wire["coverage_bundle"] = coverage_bundle
+    return wire
 
 
 def read_stock_market_replay(data, *, snapshot, universe, calendar):
@@ -226,10 +238,14 @@ def stock_dividend_scope(run):
     require(wire["contract_version"] == "backtest_run_v3", "stock saved run required")
     plan, market = wire["plan"], wire["plan"]["market_replay"]
     evidence = [entry for entry in market["source_evidence"] if entry["batch"]["context"]["domain"] == "corporate_actions"]
-    return DividendScope.from_dict({"contract_version": "dividend_scope_v2", "start_session": plan["start_session"],
+    scope = {"contract_version": "dividend_scope_v2", "start_session": plan["start_session"],
         "end_session": plan["end_session"], "knowledge_cutoff": plan["end_session"] + "T12:30:00Z",
         "universe": plan["execution_universe"], "coverage": "observed_records_only",
         "actions": [a for a in market["cash_dividends"] if plan["start_session"] <= a["record_session"] <= plan["end_session"]],
         "source_refs": [entry["reference"] for entry in evidence], "source_evidence": evidence,
         "limitations": ["Observed implemented stock cash actions only; absent actions do not establish completeness.",
-                        "Unknown PAY remains pending; gross dividends exclude personal holding-period taxes."]})
+                        "Unknown PAY remains pending; gross dividends exclude personal holding-period taxes."]}
+    bundle = scoped_bundle(evidence, market.get("coverage_bundle", []))
+    if bundle:
+        scope["coverage_bundle"] = bundle
+    return DividendScope.from_dict(scope)

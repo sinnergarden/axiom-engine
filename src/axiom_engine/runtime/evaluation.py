@@ -92,6 +92,14 @@ def _provenance(wire):
     require(type(wire["source_evidence"]) is list and type(wire["limitations"]) is list,
             "input evidence/limitations required")
     snapshots = set()
+    if "coverage_bundle" in wire:
+        from .stock_evidence import native_batches
+        batches = native_batches(wire["source_evidence"], wire["coverage_bundle"])
+        require({entry["reference"] for entry in wire["source_evidence"]} == set(wire["source_refs"]), "stock provenance closure mismatch")
+        for batch in batches:
+            require(batch["context"]["query"]["purpose"] == "market_replay", "wrong-purpose evaluation evidence")
+            snapshots.add(batch["context"]["snapshot_id"])
+        return snapshots
     for evidence in wire["source_evidence"]:
         require(evidence["reference"] in wire["source_refs"], "unbound source evidence")
         if "batch" in evidence:
@@ -140,8 +148,9 @@ def _validate_scope(scope, run, snapshots):
         return None
     require(isinstance(scope, DividendScope), "DividendScope required")
     wire = scope.to_dict()
-    fields(wire, "contract_version start_session end_session knowledge_cutoff universe coverage actions source_refs source_evidence limitations")
     plan = run["plan"]
+    fields(wire, "contract_version start_session end_session knowledge_cutoff universe coverage actions source_refs source_evidence limitations" +
+           (" coverage_bundle" if plan["contract_version"] == "backtest_request_v3" and "coverage_bundle" in wire else ""))
     if plan["contract_version"] == "backtest_request_v3":
         from .stock_inputs import validate_cash_action
         require(wire["contract_version"] == "dividend_scope_v2" and wire["coverage"] == "observed_records_only" and
@@ -156,6 +165,9 @@ def _validate_scope(scope, run, snapshots):
                              if entry["batch"]["context"]["domain"] == "corporate_actions"]
         require(wire["source_evidence"] == expected_evidence and
                 wire["source_refs"] == [entry["reference"] for entry in expected_evidence], "stock dividend evidence mismatch")
+        from .stock_evidence import scoped_bundle
+        require(wire.get("coverage_bundle", []) == scoped_bundle(expected_evidence, plan["market_replay"].get("coverage_bundle", [])),
+                "stock dividend coverage closure mismatch")
         for action in wire["actions"]:
             validate_cash_action(action, wire["universe"], wire["source_refs"])
         return wire

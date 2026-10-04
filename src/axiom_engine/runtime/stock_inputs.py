@@ -5,6 +5,7 @@ from ..core.contracts import Document, digest, fields, integer, require, session
 from ..core.stock_portfolio import BUDGET_BASIS, StockPredictionFrame, instant, validate_stock_predictions
 from ..core.portfolio import decimal
 from .profiles import stock_daily_open_profile
+from .stock_evidence import native_batches, native_ref
 
 ELIGIBILITY_ID = "sz_main_a_000_002_003_v1"
 ACTION_POLICY = "observed_implemented_only"
@@ -98,7 +99,7 @@ def _validate_pair_proof(evidence, signal, universe, calendar, batches):
                 require(query.get("fields") == ["is_member"] and query.get("universe_id") == "csi300", "stock member proof query mismatch")
     for key, batch in (("execution-states", batches[0]), ("execution-market", batches[1]), ("execution-factor", batches[3])):
         entry = manifests[key]
-        require(entry["wire_ref"] == Document.from_dict(batch).identity and entry["query"] == batch["context"]["query"] and
+        require(entry["wire_ref"] == native_ref(batch) and entry["query"] == batch["context"]["query"] and
                 entry["reader_version"] == batch["context"]["reader_version"], "stock execution facts differ from admitted batches")
 
 
@@ -127,7 +128,8 @@ def validate_stock_request(plan):
     require(profile == stock_daily_open_profile(unknown_status_policy=profile.get("unknown_status_policy")),
             "stock profile parameters differ from frozen contract")
     market = plan["market_replay"]
-    fields(market, "contract_version price_basis calendar universe rows cash_dividends action_diagnostics action_blocks source_refs source_evidence limitations")
+    fields(market, "contract_version price_basis calendar universe rows cash_dividends action_diagnostics action_blocks source_refs source_evidence limitations" +
+           (" coverage_bundle" if "coverage_bundle" in market else ""))
     require(market["contract_version"] == "market_replay_v3" and market["price_basis"] == "unadjusted" and
             market["universe"] == universe, "stock native market scope required")
     calendar = market["calendar"]
@@ -142,21 +144,21 @@ def validate_stock_request(plan):
         digest(ref)
     require(type(market["source_evidence"]) is list and
             {entry["reference"] for entry in market["source_evidence"]} == set(refs), "stock evidence closure mismatch")
-    for entry in market["source_evidence"]:
-        require(Document.from_dict(entry["batch"]).identity == entry["reference"], "stock DataBatch identity mismatch")
-        context = entry["batch"]["context"]
+    batches = native_batches(market["source_evidence"], market.get("coverage_bundle", []))
+    for batch in batches:
+        context = batch["context"]
         require(context["query"]["purpose"] == "market_replay" and
                 context["snapshot_id"] == evidence["execution"]["snapshot"], "stock market purpose/Snapshot mismatch")
     require(calendar == evidence["scope"]["initial_sessions"], "stock admitted calendar mismatch")
     required_features = calendar[calendar.index(plan["start_session"]) - 1:calendar.index(plan["end_session"])]
     require(all((day, security) in signals for day in required_features for security in signal["universe"]),
             "missing required previous-session prediction group")
-    from .stock_market import stock_market_from_batches
+    from .stock_market import _stock_market_wire
     # Verify frozen native projections, without Data access or account execution.
-    batches = [entry["batch"] for entry in market["source_evidence"]]
     require(len(batches) == 6, "complete stock native closure required")
     _validate_pair_proof(evidence, signal, universe, calendar, batches)
-    require(len(batches) == 6 and market == stock_market_from_batches(batches=batches, universe=universe, calendar=calendar).to_dict(),
+    require(len(batches) == 6 and market == _stock_market_wire(batches=batches, universe=universe, calendar=calendar,
+            saved_evidence=market["source_evidence"], coverage_bundle=market.get("coverage_bundle", [])),
             "stock market projection differs from saved native facts")
     indexed = {}
     for row in market["rows"]:
