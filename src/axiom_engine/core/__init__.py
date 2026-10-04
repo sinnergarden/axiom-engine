@@ -3,7 +3,8 @@ from .contracts import (ABI, SEMANTICS, ContractError, ExecutionContext, FactBat
                         FeatureFrame, FeaturePlan, unresolved)
 from .execution import execute_feature_plan
 from .plan import required_history, validate_plan
+from .portfolio import SignalFrame, PortfolioDecision, plan_rotation
 
 __all__ = ['ABI', 'SEMANTICS', 'ContractError', 'ExecutionContext', 'FactBatch',
            'FeatureFrame', 'FeaturePlan', 'unresolved', 'execute_feature_plan',
-           'required_history', 'validate_plan']
+           'required_history', 'validate_plan', 'SignalFrame', 'PortfolioDecision', 'plan_rotation']

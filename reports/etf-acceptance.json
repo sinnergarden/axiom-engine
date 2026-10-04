@@ -1,0 +1,72 @@
+{
+  "contract_version": "engine_acceptance_v1",
+  "project_id": "76e26315-e881-4634-b1de-b60bbb725a0d",
+  "project_evidence": "Codex list_threads returned this exact local projectId for thread 01a1051a-03db-7675-aa19-9de7ef9330d6",
+  "snapshot_id": "s_e32f4511b69d4fce9accad609feb4005f371cc5cb833ca260d6ae563b75558d1",
+  "signal_frame_file_sha256": "a3809d827afdeb0bd86bd1313788a00690ab94b16019c78bbb6be2f807dbc2fa",
+  "signal_ref": "sha256:e2966ff9febf2b72268091f979afbc29a836218dab008305c2ef40c6dcc6b030",
+  "market_ref": "sha256:357cdc7befe6ecdd748d3a66605ad0bfe5a8b7bf683ae21d3973aa3ed71775ba",
+  "implementation_ref": "sha256:36fd490804f4f3030ceeb14b42103acb2868df39d4815eb5323ed4a92ab22308",
+  "data_root_unchanged": true,
+  "data_inventory_ref": "sha256:1ac93319be1e3a2f64aa0d80869307c77aa7952b25b0137a5cfaab3b4c677558",
+  "repeat_payload_equal": true,
+  "market_states": {
+    "unknown_status": 462
+  },
+  "cash_dividends": [
+    {
+      "cash_per_unit": "0.149",
+      "event_id": "sha256:ed6ecafac3c7d806c4bdddbb01d63d3357fdfdd3456dd0be896891f616e8dcfe",
+      "ex_session": "2026-07-15",
+      "pay_session": "2026-07-20",
+      "record_session": "2026-07-14",
+      "security_id": "cn.etf.SSE.510500.20130315",
+      "source_refs": [
+        "sha256:6805c7fa3e1834a41766a287a623c81ce661701880f19944d9c309845eb520d2"
+      ]
+    },
+    {
+      "cash_per_unit": "0.8144",
+      "event_id": "sha256:de6951d8069f825978641e6a2aaa950e264254fbbc08ae547e4193841dcc4d90",
+      "ex_session": "2026-06-25",
+      "pay_session": "2026-06-30",
+      "record_session": "2026-06-24",
+      "security_id": "cn.etf.SSE.511010.20130325",
+      "source_refs": [
+        "sha256:6805c7fa3e1834a41766a287a623c81ce661701880f19944d9c309845eb520d2"
+      ]
+    }
+  ],
+  "real_fixed_input": {
+    "path": "/Users/liuming/Documents/axiom/.worktrees/axiom-engine-etf/.artifacts/delivery/etf_rotation.blocked.backtest.json",
+    "run_id": "sha256:f9a3bc3ce58177d7a19e3c29a508badbb76734b77ae9a9ef7ff99ecc3bbb2b85",
+    "content_digest": "sha256:98522ddce52644f7328969623968e8708feda0aec2a570e75333727ddd1e8778",
+    "sessions": 65,
+    "orders": 14,
+    "fills": 0,
+    "order_reasons": {
+      "UNKNOWN_MARKET_STATUS": 14
+    },
+    "final_nav_minor": 1000000,
+    "committed_sequence": 69,
+    "outcome": "UNKNOWN status blocked; this is not strategy-effectiveness acceptance"
+  },
+  "synthetic_known_state": {
+    "path": "/Users/liuming/Documents/axiom/.worktrees/axiom-engine-etf/.artifacts/delivery/synthetic_golden.backtest.json",
+    "run_id": "sha256:bf2e77ea2fef57780eb8fb861d0722a60ac3288a9e7145f3fb2b1a18102f9f60",
+    "content_digest": "sha256:01046610b4a950d626028b4a1e794bec6228b7b99412d0fd7e772c70523a75fa",
+    "fills": 3,
+    "final_nav_minor": 999220,
+    "total_fees_minor": 780,
+    "committed_sequence": 10
+  },
+  "test_command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3.12 -m unittest discover -s tests -v",
+  "tests_passed": 49,
+  "unknown_status_gap": "Existing ETF suspend_d responses were empty; source contract intentionally does not infer normal trading from absence. No Engine mapping omission.",
+  "next_data_step": "Data owner must provide independently justified ETF suspension/normal-status coverage and completeness contract; leave ongoing bulk unchanged.",
+  "design_alignment_requested": [
+    "Core 03 sections 3/6: SignalFrame and pure rotation intents implemented",
+    "Trade 04 sections 4/6/9/13/14: isolated cached backtest, fixed profile/source digest, Decimal ledger and cash dividends; no live broker or SQLite recovery",
+    "etf-rotation-data: real fixed signals accepted, UNKNOWN tradeability blocks fills; do not label zero-trade run as strategy acceptance"
+  ]
+}

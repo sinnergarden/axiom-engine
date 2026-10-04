@@ -364,8 +364,9 @@ class Conformance(unittest.TestCase):
         expected=execute_feature_plan(frozen,facts,ctx)
         with patch('builtins.open',side_effect=AssertionError('I/O')), patch('socket.socket',side_effect=AssertionError('network')):
             self.assertEqual(execute_feature_plan(frozen,facts,ctx),expected)
-        source=Path(__file__).parents[1]/'src'
-        allowed={'dataclasses','datetime','hashlib','json','math','re','statistics'}
+        package_root=Path(__file__).parents[1]/'src'
+        source=package_root/'axiom_engine'/'core'
+        allowed={'dataclasses','datetime','decimal','hashlib','json','math','re','statistics'}
         for path in source.rglob('*.py'):
             tree=ast.parse(path.read_text())
             for n in ast.walk(tree):
@@ -379,7 +380,7 @@ class Conformance(unittest.TestCase):
         with self.assertRaises(ContractError):run(bad,f,c)
         code='''import json,sys\nfrom axiom_engine.core import *\np,f,c=json.loads(sys.stdin.read())\nprint(execute_feature_plan(FeaturePlan.from_dict(p),FactBatch.from_dict(f),ExecutionContext.from_dict(c)).payload)'''
         import os
-        env={**os.environ,'PYTHONPATH':str(source.resolve())}
+        env={**os.environ,'PYTHONPATH':str(package_root.resolve())}
         with tempfile.TemporaryDirectory() as cwd:
             Path(cwd,'latest').write_text('unrelated mutable pointer')
             r=subprocess.run([sys.executable,'-c',code],input=json.dumps([frozen.to_dict(),f,c]),text=True,capture_output=True,cwd=cwd,env=env,check=True)

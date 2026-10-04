@@ -1,0 +1,103 @@
+{
+  "contract_version": "engine_etf_daily_acceptance_v1",
+  "snapshot_id": "s_e32f4511b69d4fce9accad609feb4005f371cc5cb833ca260d6ae563b75558d1",
+  "signal_ref": "sha256:e2966ff9febf2b72268091f979afbc29a836218dab008305c2ef40c6dcc6b030",
+  "signal_frame_sha256": "a3809d827afdeb0bd86bd1313788a00690ab94b16019c78bbb6be2f807dbc2fa",
+  "market_ref": "sha256:63b08f358ec251debdab655a65a34fca54619d94971ae15c0f12ac28ede13a1f",
+  "implementation_ref": "sha256:ddffc7c21628ed3d569a1986142191fc0c263476a5321d66c42115d01567b27a",
+  "source_root_unchanged": true,
+  "source_inventory_ref": "sha256:1ac93319be1e3a2f64aa0d80869307c77aa7952b25b0137a5cfaab3b4c677558",
+  "repeat_payload_equal": true,
+  "cash_position_nav_reconciled": true,
+  "strict_default": {
+    "path": "/Users/liuming/Documents/axiom/.worktrees/axiom-engine-etf/.artifacts/etf-daily-v1/strict.blocked.backtest.json",
+    "run_id": "sha256:6db153261ab0f6c933959aac448b66b6fbef7162d57d8ad8dcdc4031747b95ea",
+    "content_digest": "sha256:57fd894a5be98e309fbaa085c35f6046096cad5f14fd395f8ff46d2705ea9b78",
+    "orders": 14,
+    "fills": 0,
+    "final_nav_minor": 1000000
+  },
+  "etf_daily_approximation": {
+    "path": "/Users/liuming/Documents/axiom/.worktrees/axiom-engine-etf/.artifacts/etf-daily-v1/etf_rotation.daily.backtest.json",
+    "run_id": "sha256:c2bed666e2509ed1a8747bfae23f5d94a39f6d6db9227cd2a67f181ffcc3d77b",
+    "content_digest": "sha256:21ca7a5e9a7b3aea5435d85d58955dcbe5f3c6cfcb83c788b3372cf3bed4247c",
+    "profile_ref": "sha256:23103aae52b0151d254e9f3bd4f8e9779024883c27abdbf70526fb35b2440516",
+    "sessions": 65,
+    "orders": 10,
+    "fills": 10,
+    "order_reasons": {
+      "None": 10
+    },
+    "final_nav_minor": 921364,
+    "total_fees_minor": 2526,
+    "total_return": "-0.078636",
+    "max_drawdown": "-0.1689141562070853060087774053836033457856",
+    "committed_sequence": 85,
+    "dividend_cash_events": [
+      {
+        "balance_minor": 30460,
+        "cash_delta_minor": 0,
+        "reason": "DIVIDEND_EX",
+        "receivable_delta_minor": 0,
+        "sequence": 25,
+        "session": "2026-06-25",
+        "source_event_id": "sha256:de6951d8069f825978641e6a2aaa950e264254fbbc08ae547e4193841dcc4d90"
+      },
+      {
+        "balance_minor": 23478,
+        "cash_delta_minor": 0,
+        "reason": "DIVIDEND_PAY",
+        "receivable_delta_minor": 0,
+        "sequence": 32,
+        "session": "2026-06-30",
+        "source_event_id": "sha256:de6951d8069f825978641e6a2aaa950e264254fbbc08ae547e4193841dcc4d90"
+      },
+      {
+        "balance_minor": 23478,
+        "cash_delta_minor": 0,
+        "reason": "DIVIDEND_EX",
+        "receivable_delta_minor": 16390,
+        "sequence": 44,
+        "session": "2026-07-15",
+        "source_event_id": "sha256:ed6ecafac3c7d806c4bdddbb01d63d3357fdfdd3456dd0be896891f616e8dcfe"
+      },
+      {
+        "balance_minor": 39868,
+        "cash_delta_minor": 16390,
+        "reason": "DIVIDEND_PAY",
+        "receivable_delta_minor": -16390,
+        "sequence": 48,
+        "session": "2026-07-20",
+        "source_event_id": "sha256:ed6ecafac3c7d806c4bdddbb01d63d3357fdfdd3456dd0be896891f616e8dcfe"
+      }
+    ]
+  },
+  "market_state_counts": {
+    "unknown_status": 462
+  },
+  "official_source": {
+    "url": "https://tushare.pro/document/2?doc_id=214",
+    "checked_date": "2026-10-04",
+    "finding": "suspend_d describes stock suspension/resumption; documentation makes no ETF completeness promise."
+  },
+  "limitations": [
+    "EXPLICIT ETF DAILY APPROXIMATION: UNKNOWN status is retained, not promoted to normal_trading; missing-status executions assume observed daily open/volume/limits and cannot establish opening liquidity. Not a live execution profile.",
+    "Conservative experimental T+1 and 100-fund-unit lot, not verified real ETF settlement rules. EXPLICIT ETF DAILY APPROXIMATION: missing status may execute only from valid observed open, positive volume and legal limits; UNKNOWN remains unchanged. This does not prove opening liquidity or real tradeability.",
+    "Daily open-price approximation; full-day volume is an execution-side capacity proxy, not known opening liquidity.",
+    "Day orders expire after one simulated fill; no live broker, SQLite recovery, split or delisting support.",
+    "Dividend handling supports explicit record/ex/pay cash events; unsupported economic events must be rejected by the caller adapter.",
+    "Metrics cover the fixed short sample only; no OOS, CAGR or Sharpe claim.",
+    "coverage gap classification describes this Snapshot's observations, not proof the gap was known at a historical decision",
+    "terminal states ordered by system observation under declared source policy; vendor revision/publication order is unknown",
+    "vendor event availability is a declared assumption, not revision-bound historical public evidence",
+    "vendor release time is an assumption, not historical vintage evidence",
+    "UNKNOWN security status is preserved; observed price/volume is not normal-trading evidence. Admission belongs to the explicit Runtime profile.",
+    "Terminal ETF source supplies cash distributions; factor audit is a capability check, not proof of complete split/delisting history."
+  ],
+  "tests_passed": 53,
+  "design_alignment_requested": [
+    "Trade 04 section 6: explicit ETF daily observed admission, strict default retained",
+    "etf-rotation-data: stock suspension coverage does not establish ETF normal status; UNKNOWN facts retained",
+    "Current-delivery: fixed 65-day real signal/account chain demonstrated under a declared simulation approximation, not live execution or full platform"
+  ]
+}
