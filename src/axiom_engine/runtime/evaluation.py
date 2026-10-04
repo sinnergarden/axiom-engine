@@ -10,7 +10,7 @@ from pathlib import Path
 from .._implementation import IMPLEMENTATION_REF
 from ..core.contracts import Document, digest, fields, integer, require, session, timestamp
 from ..core.portfolio import decimal
-from .backtest import BacktestRun
+from .backtest import BacktestRequest, BacktestRun
 from .episode_evaluation import evaluate_episodes
 from .evaluation_inputs import evidence_batch, benchmark_rows, dividend_actions
 from .period_evaluation import period_metrics, validate_period_metrics
@@ -62,7 +62,7 @@ def long_history_evaluation_spec():
 def _verify_run(run):
     require(isinstance(run, BacktestRun), "saved BacktestRun required")
     wire = run.to_dict()
-    require(wire.get("contract_version") == "backtest_run_v1" and wire.get("status") == "COMPLETE",
+    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2") and wire.get("status") == "COMPLETE",
             "complete saved account result required")
     recorded = wire.pop("content_digest", None)
     require(recorded == Document.from_dict(wire).identity, "saved result content digest mismatch")
@@ -70,6 +70,13 @@ def _verify_run(run):
             "runtime": wire["runtime_version"], "implementation_ref": wire["implementation_ref"]}).identity,
             "saved run identity mismatch")
     wire["content_digest"] = recorded
+    if wire["contract_version"] == "backtest_run_v2":
+        from .backtest import _validate
+        from .unit_splits import validate_saved_applications
+        require(wire["runtime_version"] == "axiom.backtest/2" and wire["plan"]["contract_version"] == "backtest_request_v2",
+                "saved v2 tuple mismatch")
+        _validate(BacktestRequest.from_dict(wire["plan"]))
+        validate_saved_applications(wire)
     return wire
 
 

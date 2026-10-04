@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from ..core.contracts import Document, require
 from .backtest import MarketReplay
+from .unit_splits import EVENT_VALUE_FIELDS, validate_unit_splits
 
 
 def _utc(value):
@@ -25,12 +26,13 @@ def _batch(batch, snapshot):
     return wire
 
 
-def read_etf_market_replay(data, *, snapshot, universe, first_session, end_session):
+def read_etf_market_replay(data, *, snapshot, universe, first_session, end_session, include_unit_splits=False):
     """Map public states/read_market/events results, preserving actual contexts.
 
     `first_session` is the preceding signal session, not the evaluation start.
-    The supported terminal ETF source contains cash dividends, not split facts;
-    unexplained factor changes fail admission. No historical completeness claim.
+    By default only cash dividends explain factor changes. Explicit opt-in needs
+    the pinned public fund_share_conversions domain; historical application facts
+    are selected at each record cutoff. No historical completeness claim.
     """
     from axiom_data import EventQuery, QuerySpec  # only this optional adapter needs Data
     require(snapshot not in ("current", "latest", ""), "concrete Snapshot required")
@@ -107,7 +109,55 @@ def read_etf_market_replay(data, *, snapshot, universe, first_session, end_sessi
             "security_id": action["security_id"], "record_session": action["record_date"],
             "ex_session": action["ex_date"], "pay_session": action["pay_date"],
             "cash_per_unit": str(action["cash_dividend_per_unit"]), "source_refs": [refs[-1]]})
+    unit_splits = []
+    unit_batches = []
+    result_checks = []
+    if include_unit_splits:
+        # End-cutoff candidates discover identities only. Every application fact
+        # comes from a fresh record-cutoff query; future results cannot unlock it.
+        def unit_query(symbols, start, end, cutoff):
+            return _batch(data.events(snapshot=snapshot, query=EventQuery(
+                "fund_share_conversions", EVENT_VALUE_FIELDS, tuple(symbols), start, end, cutoff,
+                "best_effort_vendor_v1", "effective_date", purpose="market_replay")), snapshot)
+        candidates = unit_query(universe, first_session, end_session, cutoffs[end_session])
+        unit_batches.append(candidates)
+        for candidate in candidates["records"]:
+            require(candidate["record_date"] in calendar, "unit registration date outside replay")
+            batch = unit_query([candidate["security_id"]], candidate["effective_date"], candidate["effective_date"],
+                               cutoffs[candidate["record_date"]])
+            selected = [row for row in batch["records"] if row["event_id"] == candidate["event_id"]]
+            require(len(selected) == 1, "unit plan absent at registration cutoff; future result cannot unlock history")
+            event = selected[0]
+            require(event["record_date"] == candidate["record_date"] and event["effective_date"] == candidate["effective_date"],
+                    "unit historical economic dates conflict with discovery scope")
+            available = []
+            for name in EVENT_VALUE_FIELDS:
+                meta = [row for row in batch["field_meta"][name]["by_key"] if row["event_id"] == event["event_id"] and
+                        row["security_id"] == event["security_id"]]
+                require(len(meta) == 1 and meta[0]["usable_from"] is not None, "unit field availability missing")
+                available.append(_utc(meta[0]["usable_from"]))
+            ref = Document.from_dict(batch).identity
+            unit_batches.append(batch)
+            unit_splits.append({"event": event, "available_at": max(available), "source_refs": [ref]})
+            compared = ("security_id", "event_type", "record_date", "effective_date", "effective_phase",
+                        "new_price_basis_session", "ratio_numerator", "ratio_denominator", "quantity_rounding",
+                        "quantity_rounding_scope", "suspension_start", "suspension_end", "suspension_scope", "resume_session")
+            mismatch = [name for name in compared if event[name] != candidate[name]]
+            result_checks.append({"event_id": event["event_id"], "plan_revision_id": event["revision_id"],
+                "result_revision_id": candidate["revision_id"] if candidate["process_status"] == "implemented" else None,
+                "status": ("MISMATCH" if mismatch else "MATCH") if candidate["process_status"] == "implemented" else "NO_VISIBLE_RESULT",
+                "compared_fields": list(compared), "mismatched_fields": mismatch if candidate["process_status"] == "implemented" else [],
+                "plan_source_refs": [ref], "result_source_refs": [Document.from_dict(candidates).identity],
+                "verification_cutoff": _utc(cutoffs[end_session])})
+        for batch in unit_batches:
+            ref = Document.from_dict(batch).identity
+            if ref not in refs:
+                refs.append(ref)
+                source_evidence.append({"reference": ref, "batch": batch})
+        source_evidence[next(i for i, e in enumerate(source_evidence) if e["reference"] ==
+                            Document.from_dict(candidates).identity)]["unit_split_result_checks"] = result_checks
     action_keys = {(a["security_id"], a["ex_session"]) for a in cash_dividends}
+    action_keys.update((i["event"]["security_id"], i["event"]["new_price_basis_session"]) for i in unit_splits)
     previous_factors = {}
     for row in sorted(factors["records"], key=lambda r: (r["session"], r["security_id"])):
         security, factor = row["security_id"], row["factor"]
@@ -119,6 +169,13 @@ def read_etf_market_replay(data, *, snapshot, universe, first_session, end_sessi
                           for item in batch["context"].get("limitations", [])})
     limitations.append("UNKNOWN security status is preserved; observed price/volume is not normal-trading evidence. Admission belongs to the explicit Runtime profile.")
     limitations.append("Terminal ETF source supplies cash distributions; factor audit is a capability check, not proof of complete split/delisting history.")
-    return MarketReplay.from_dict({"contract_version": "market_replay_v1", "price_basis": "unadjusted",
+    limitations.extend(item for batch in unit_batches for item in batch["context"].get("limitations", []))
+    result = {"contract_version": "market_replay_v2" if include_unit_splits else "market_replay_v1", "price_basis": "unadjusted",
         "calendar": calendar, "universe": list(universe), "rows": rows, "cash_dividends": cash_dividends,
-        "source_refs": refs, "source_evidence": source_evidence, "limitations": limitations})
+        "source_refs": refs, "source_evidence": source_evidence, "limitations": limitations}
+    if include_unit_splits:
+        result["unit_splits"] = unit_splits
+        # Retain the exact factor records and proof, independently of issuer ratio.
+        source_evidence[3]["batch"] = factors
+        validate_unit_splits(result, first_session, end_session)
+    return MarketReplay.from_dict(result)

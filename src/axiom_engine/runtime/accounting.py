@@ -4,6 +4,7 @@ from decimal import Context, Decimal, ROUND_HALF_UP, localcontext
 
 from ..core.contracts import canonical, integer, require
 from ..core.portfolio import decimal, minor
+from .unit_splits import UNIT_SPLIT_PHASE, eod
 
 
 class AccountLedger:
@@ -122,3 +123,54 @@ class AccountLedger:
             "balance_minor": self.cash, "reason": "DIVIDEND_" + phase,
             "source_event_id": action["event_id"]})
         self._applied[key] = payload
+
+    def unit_split(self, item, registration, quote):
+        """Atomic settled-unit replacement; no cash, fee, fill or new T+1 lot."""
+        with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
+            event = item["event"]
+            key = event["event_id"] + ":UNIT_SPLIT"
+            payload = canonical({"item": item, "registration": registration, "quote": quote})
+            if key in self._applied:
+                require(self._applied[key] == payload, "conflicting unit split payload")
+                return None
+            security = event["security_id"]
+            position = self.positions.get(security, {"quantity": 0, "sellable_quantity": 0, "cost_minor": 0})
+            require(not any(lot["security_id"] == security for lot in self.pending) and position == registration["position"] and
+                    position["quantity"] == position["sellable_quantity"], "unit split requires unchanged fully settled entitlement")
+            require(not any(f["security_id"] == security and f["sequence"] > registration["sequence"] for f in self.fills),
+                    "trading after unit registration unsupported")
+            require(quote is not None and quote["source_refs"] and quote["session"] <= event["effective_date"] and
+                    quote["available_at"] <= eod(event["effective_date"]), "unit split lacks usable old-unit quote")
+            quantity, n, d = position["quantity"], event["ratio_numerator"], event["ratio_denominator"]
+            integer(n, 1); integer(d, 1)
+            require(n > d, "unit consolidation or unchanged ratio unsupported")
+            scaled, remainder = divmod(quantity * n, d)
+            require(not remainder or event["quantity_rounding"] == "ceiling_to_whole_fund_unit",
+                    "fractional units require disclosed rounding")
+            new_quantity = scaled + bool(remainder)
+            old_price = decimal(quote["price"], minimum=0)
+            require(old_price > 0, "positive old-unit quote required")
+            normalized = {**deepcopy(quote), "price": str(old_price * d / n),
+                "available_at": max(quote["available_at"], item["available_at"], eod(event["effective_date"])),
+                "source_refs": sorted(set(quote["source_refs"] + item["source_refs"]))}
+            before = minor(old_price * quantity * 100)
+            after = minor(decimal(normalized["price"]) * new_quantity * 100)
+            application = {"event_id": event["event_id"], "security_id": security,
+                "session": event["effective_date"], "phase": UNIT_SPLIT_PHASE, "sequence": self.sequence + 1,
+                "status": "APPLIED" if quantity else "NO_ENTITLEMENT", "record_sequence": registration["sequence"],
+                "record_quantity": registration["position"]["quantity"], "before_quantity": quantity,
+                "after_quantity": new_quantity, "before_sellable_quantity": position["sellable_quantity"],
+                "after_sellable_quantity": new_quantity, "cost_minor": position["cost_minor"],
+                "rounding_extra_fraction": {"numerator": new_quantity * d - quantity * n, "denominator": d},
+                "original_quote": deepcopy(quote), "normalized_quote": normalized,
+                "before_market_value_minor": before, "after_market_value_minor": after,
+                "rounding_value_minor": after - before, "source_refs": normalized["source_refs"]}
+            self.sequence += 1
+            if quantity:
+                position["quantity"] = position["sellable_quantity"] = new_quantity
+            self.position_ledger.append({"sequence": self.sequence, "session": event["effective_date"],
+                "security_id": security, "quantity_delta": new_quantity - quantity,
+                "sellable_delta": new_quantity - quantity, "cost_delta_minor": 0,
+                "reason": "UNIT_SPLIT", "source_event_id": event["event_id"]})
+            self._applied[key] = payload
+            return application

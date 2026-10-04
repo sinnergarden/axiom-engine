@@ -71,12 +71,25 @@ def evaluate_episodes(run, scope, binding):
         cash_events[key] = event
     snapshots = {(p["session"], p["security_id"]): p for p in run["positions"]}
     require(len(snapshots) == len(run["positions"]), "duplicate saved position key")
+    splits = [row for row in run["position_ledger"] if row["reason"] == "UNIT_SPLIT"]
+    events = sorted([*(dict(fill, kind="FILL") for fill in fills), *(dict(row, kind="UNIT_SPLIT") for row in splits)],
+                    key=lambda row: row["sequence"])
+    require(len({row["sequence"] for row in events}) == len(events), "duplicate saved position event sequence")
+    require(all(a["session"] <= b["session"] for a, b in zip(events, events[1:])), "invalid position event ordering")
     entitlements, cursor = {}, 0
     for point in run["nav"]:
         day = point["session"]
-        while cursor < len(fills) and fills[cursor]["session"] == day:
-            fill = fills[cursor]
+        while cursor < len(events) and events[cursor]["session"] == day:
+            fill = events[cursor]
             cursor += 1
+            if fill["kind"] == "UNIT_SPLIT":
+                episode = active.get(fill["security_id"])
+                if episode is None:
+                    require(fill["quantity_delta"] == 0, "unit event cannot create an episode")
+                else:
+                    require(episode["final_quantity"] + fill["quantity_delta"] > 0, "unit event cannot close an episode")
+                    episode["final_quantity"] += fill["quantity_delta"]
+                continue
             security, buy = fill["security_id"], fill["side"] == "BUY"
             episode = active.get(security)
             if episode is None:
@@ -106,7 +119,7 @@ def evaluate_episodes(run, scope, binding):
                 require(snapshots.get((day, action["security_id"]), {}).get("quantity") == quantity,
                         "record-day entitlement disagrees with saved EOD position")
                 entitlements[action["event_id"]] = (episode, quantity)
-    require(cursor == len(fills), "fill outside saved NAV scope")
+    require(cursor == len(events), "position event outside saved NAV scope")
     for action in actions:
         if action["event_id"] not in entitlements:
             continue
