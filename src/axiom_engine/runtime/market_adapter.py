@@ -1,7 +1,7 @@
 """Read-only Data facade adapter for the explicit small daily ETF replay.
 
 No raw access, feature generation, revision selection, fetching or publication.
-Unknown status is retained and blocks executions in the reference Runtime.
+Unknown status is retained; Runtime admits it only under an explicit ETF profile.
 """
 from datetime import date, datetime, timedelta, timezone
 
@@ -117,7 +117,7 @@ def read_etf_market_replay(data, *, snapshot, universe, first_session, end_sessi
         previous_factors[security] = factor
     limitations = sorted({item for batch in (states, prices, limits, factors, actions)
                           for item in batch["context"].get("limitations", [])})
-    limitations.append("UNKNOWN security status is preserved and blocks fills; observed price/volume is not normal-trading evidence.")
+    limitations.append("UNKNOWN security status is preserved; observed price/volume is not normal-trading evidence. Admission belongs to the explicit Runtime profile.")
     limitations.append("Terminal ETF source supplies cash distributions; factor audit is a capability check, not proof of complete split/delisting history.")
     return MarketReplay.from_dict({"contract_version": "market_replay_v1", "price_basis": "unadjusted",
         "calendar": calendar, "universe": list(universe), "rows": rows, "cash_dividends": cash_dividends,

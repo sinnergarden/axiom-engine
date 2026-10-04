@@ -2,14 +2,16 @@
 from datetime import date
 from decimal import Context, Decimal, ROUND_HALF_UP, localcontext
 from pathlib import Path
+import re
 
 from .._implementation import IMPLEMENTATION_REF
 from ..core import SignalFrame, plan_rotation
 from ..core.contracts import Document, digest, fields, integer, require, session, text, timestamp
 from ..core.portfolio import PORTFOLIO_VERSION, decimal, minor, validate_signals
 from .accounting import AccountLedger
+from .profiles import STATUS_GAP_REASONS
 
-RUNTIME_VERSION = "axiom.backtest/1"
+RUNTIME_VERSION = "axiom.backtest/1.1"
 
 
 class MarketReplay(Document):
@@ -105,7 +107,10 @@ def _validate(request):
     timestamp(plan["start_session"] + "T" + profile["decision_time_utc"])
     require(profile["decision_time_utc"] < "01:30:00Z", "decision must precede mainland open")
     text(profile["limitation"])
-    require(profile["unknown_status_policy"] == "block", "unknown market status must block execution")
+    require(profile["unknown_status_policy"] in ("block", "etf_daily_observed"), "unsupported unknown-status policy")
+    if profile["unknown_status_policy"] == "etf_daily_observed":
+        require(all(re.fullmatch(r"cn\.etf\.(SSE|SZSE)\.\d{6}\.\d{8}", s) for s in signal["universe"]),
+                "observed-daily profile requires canonical ETF identities")
     fields(plan["initial_account"], "cash_minor positions")
     return plan, signal, signals, market, calendar, indexed, profile
 
@@ -123,11 +128,20 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index):
              "reason": None, "execution": "daily_open_approximation"}
     order["market_state"] = row["market_state"]
     order["state_reason"] = row["state_reason"]
+    order["execution_admission"] = "CONFIRMED_STATUS"
     if row["market_state"] != "normal_trading":
-        order["reason"] = "UNKNOWN_MARKET_STATUS" if row["market_state"] == "unknown_status" else "NOT_TRADING"
-        return order
+        observed_etf = (profile["unknown_status_policy"] == "etf_daily_observed" and
+                        row["market_state"] == "unknown_status" and row["state_reason"] in STATUS_GAP_REASONS)
+        if not observed_etf:
+            order["execution_admission"] = "BLOCKED"
+            order["reason"] = "UNKNOWN_MARKET_STATUS" if row["market_state"] == "unknown_status" else "NOT_TRADING"
+            return order
+        order["execution_admission"] = "ETF_OBSERVED_DAILY_ASSUMPTION"
     if any(row[key] is None for key in ("open", "volume_units", "limit_up", "limit_down")):
         order["reason"] = "MISSING_EXECUTION_FACT"
+        return order
+    if decimal(row["volume_units"]) <= 0:
+        order["reason"] = "NO_VOLUME"
         return order
     opening = decimal(row["open"])
     buy = intent["side"] == "BUY"
@@ -167,6 +181,8 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index):
             "slippage_minor": minor(abs(price - opening) * quantity * 100),
             "cash_delta_minor": -gross - commission - tax if buy else gross - commission - tax,
             "source_refs": row["source_refs"]}
+    fill.update({"market_state": row["market_state"], "state_reason": row["state_reason"],
+                 "execution_admission": order["execution_admission"]})
     ledger.apply_fill(fill)
     order.update({"filled_quantity": quantity, "unfilled_quantity": intent["quantity"] - quantity,
                   "status": "FILLED" if quantity == intent["quantity"] else "PARTIAL_EXPIRED",
@@ -271,6 +287,8 @@ def _run(request):
                          "Day orders expire after one simulated fill; no live broker, SQLite recovery, split or delisting support.",
                          "Dividend handling supports explicit record/ex/pay cash events; unsupported economic events must be rejected by the caller adapter.",
                          "Metrics cover the fixed short sample only; no OOS, CAGR or Sharpe claim.", *market["limitations"]]}
+    if profile["unknown_status_policy"] == "etf_daily_observed":
+        result["limitations"].insert(0, "EXPLICIT ETF DAILY APPROXIMATION: UNKNOWN status is retained, not promoted to normal_trading; missing-status executions assume observed daily open/volume/limits and cannot establish opening liquidity. Not a live execution profile.")
     result["content_digest"] = Document.from_dict(result).identity
     return BacktestRun.from_dict(result)
 

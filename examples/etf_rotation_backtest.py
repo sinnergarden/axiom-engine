@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from axiom_engine.runtime import (BacktestRequest, read_etf_market_replay,
-                                  run_backtest, save_backtest_run)
+                                  run_backtest, save_backtest_run, daily_open_profile)
 
 
 def main():
@@ -26,12 +26,7 @@ def main():
         'account_id': 'offline-etf-rotation', 'start_session': args.start_session,
         'end_session': args.end_session, 'signal_frame': signals, 'market_replay': market.to_dict(),
         'initial_account': {'cash_minor': args.cash_minor, 'positions': {}},
-        'profile': {'contract_version': 'daily_open_profile_v1', 'lot_size': 100,
-            'settlement_sessions': 1, 'commission_rate': '0.0003', 'minimum_commission_minor': 0,
-            'tax_rate': '0', 'slippage_bps': '0', 'participation_rate': '0.1',
-            'decision_time_utc': '00:55:00Z', 'execution': 'open', 'approximation': 'daily_volume_proxy',
-            'unknown_status_policy': 'block',
-            'limitation': 'Conservative experimental T+1 and 100-fund-unit lot, not verified real ETF settlement rules; UNKNOWN status blocks all fills.'}})
+        'profile': daily_open_profile(unknown_status_policy='etf_daily_observed')})
     result = run_backtest(request)
     save_backtest_run(result, args.output)
     wire = result.to_dict()

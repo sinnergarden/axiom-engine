@@ -10,7 +10,7 @@ from unittest.mock import patch
 from axiom_engine.core import ContractError, SignalFrame, plan_rotation
 from axiom_engine.core.contracts import Document
 from axiom_engine.runtime import (BacktestRequest, run_backtest, save_backtest_run,
-                                  load_backtest_run)
+                                  load_backtest_run, daily_open_profile)
 from axiom_engine.runtime.accounting import AccountLedger
 
 REF = 'sha256:' + '1' * 64
@@ -50,6 +50,19 @@ def fixture():
 
 def run(wire):
     return run_backtest(BacktestRequest.from_dict(wire)).to_dict()
+
+
+def etf_fixture():
+    wire = fixture()
+    ids = {'A': 'cn.etf.SSE.510300.20120528', 'B': 'cn.etf.SSE.510500.20130315'}
+    for domain in ('signal_frame', 'market_replay'):
+        wire[domain]['universe'] = [ids[s] for s in wire[domain]['universe']]
+        for row in wire[domain]['rows']:
+            row['security_id'] = ids[row['security_id']]
+    for row in wire['market_replay']['rows']:
+        row.update(market_state='unknown_status', state_reason='status_source_missing')
+    wire['profile'] = daily_open_profile(unknown_status_policy='etf_daily_observed')
+    return wire
 
 
 class AccountingGoldenTests(unittest.TestCase):
@@ -125,7 +138,7 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(len(result['fills']), 1)
         self.assertEqual(result['final_account']['positions']['A']['quantity'], 900)
 
-    def test_unknown_state_blocks_and_cannot_opt_into_trading(self):
+    def test_unknown_state_blocks_by_default_and_unknown_policy_rejected(self):
         wire = fixture()
         for row in wire['market_replay']['rows']:
             row.update(market_state='unknown_status', state_reason='status_source_missing')
@@ -133,8 +146,71 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(blocked['fills'], [])
         self.assertTrue(all(o['reason'] == 'UNKNOWN_MARKET_STATUS' for o in blocked['orders']))
         wire['profile']['unknown_status_policy'] = 'observed_daily_proxy'
-        with self.assertRaisesRegex(ContractError, 'must block'):
+        with self.assertRaisesRegex(ContractError, 'unsupported unknown-status'):
             run(wire)
+
+    def test_explicit_etf_profile_admits_observed_daily_without_changing_facts(self):
+        wire = etf_fixture()
+        observed = run(wire)
+        self.assertEqual(len(observed['fills']), 3)
+        self.assertEqual(observed['nav'][-1]['nav_minor'], 999220)
+        self.assertTrue(all(f['market_state'] == 'unknown_status' and
+                            f['execution_admission'] == 'ETF_OBSERVED_DAILY_ASSUMPTION'
+                            for f in observed['fills']))
+        self.assertTrue(all(r['market_state'] == 'unknown_status' for r in observed['plan']['market_replay']['rows']))
+        self.assertIn('EXPLICIT ETF DAILY APPROXIMATION', observed['limitations'][0])
+        wire['profile'] = daily_open_profile()
+        strict = run(wire)
+        self.assertEqual(strict['fills'], [])
+        self.assertNotEqual(strict['profile_ref'], observed['profile_ref'])
+        self.assertNotEqual(strict['run_id'], observed['run_id'])
+        # The approximation cannot leak into a stock/generic signal universe.
+        wire = fixture()
+        wire['profile'] = daily_open_profile(unknown_status_policy='etf_daily_observed')
+        with self.assertRaisesRegex(ContractError, 'canonical ETF'):
+            run(wire)
+
+    def test_etf_profile_never_overrides_suspended_partial_or_other_unknowns(self):
+        for state, reason in (('suspended', None), ('unknown_status', 'partial_session_suspension'),
+                              ('unknown_status', 'market_coverage_unknown'), ('unknown_status', None)):
+            with self.subTest(state=state, reason=reason):
+                wire = etf_fixture()
+                wire['end_session'] = DAYS[1]
+                for row in wire['market_replay']['rows']:
+                    if row['session'] == DAYS[1]:
+                        row.update(market_state=state, state_reason=reason)
+                self.assertEqual(run(wire)['fills'], [])
+
+    def test_etf_approximation_requires_positive_volume_prices_and_both_limits(self):
+        for field, value, reason in (('open', None, 'MISSING_EXECUTION_FACT'),
+                                     ('volume_units', '0', 'NO_VOLUME'),
+                                     ('volume_units', None, 'MISSING_EXECUTION_FACT'),
+                                     ('limit_up', None, 'MISSING_EXECUTION_FACT'),
+                                     ('limit_down', None, 'MISSING_EXECUTION_FACT'),
+                                     ('limit_up', '10', 'PRICE_LIMIT')):
+            with self.subTest(field=field, value=value):
+                wire = etf_fixture()
+                wire['end_session'] = DAYS[1]
+                for row in wire['market_replay']['rows']:
+                    if row['session'] == DAYS[1] and row['security_id'] == wire['signal_frame']['universe'][0]:
+                        row[field] = value
+                result = run(wire)
+                self.assertEqual(result['fills'], [])
+                self.assertEqual(result['orders'][0]['reason'], reason)
+
+    def test_etf_sell_failure_still_preserves_cash_lot_and_settlement_constraints(self):
+        wire = etf_fixture()
+        security = wire['signal_frame']['universe'][0]
+        for row in wire['market_replay']['rows']:
+            if row['session'] == DAYS[-1] and row['security_id'] == security:
+                row['market_state'] = 'suspended'
+        result = run(wire)
+        self.assertEqual(result['orders'][1]['reason'], 'NOT_TRADING')
+        self.assertEqual(result['orders'][2]['reason'], 'INSUFFICIENT_CASH')
+        self.assertEqual(len(result['fills']), 1)
+        self.assertEqual(result['positions'][0]['sellable_quantity'], 0)
+        self.assertEqual(result['positions'][1]['sellable_quantity'], 900)
+        self.assertTrue(all(f['quantity'] % 100 == 0 for f in result['fills']))
 
     def test_trade_day_cutoff_rejected_and_sell_fees_reject_without_failure(self):
         wire = fixture()
