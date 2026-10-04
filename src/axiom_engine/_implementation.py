@@ -1,2 +1,2 @@
 """Generated source identity; see tools/freeze_implementation.py."""
-IMPLEMENTATION_REF = 'sha256:86c7fff609e63e06f87bcc4d6777bb6837e04f0611154c819d4d7c2680f89ec4'
+IMPLEMENTATION_REF = 'sha256:836d28f351dafc50966b07f5d9c66bacdfb8a11537d3d4202b71da2f3c6e35b1'

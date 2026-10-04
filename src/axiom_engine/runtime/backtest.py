@@ -5,7 +5,8 @@ from pathlib import Path
 import re
 
 from .._implementation import IMPLEMENTATION_REF
-from ..core import SignalFrame, plan_rotation
+from ..core import SignalFrame, plan_rotation, StockPredictionFrame, plan_stock_portfolio
+from ..core.stock_portfolio import STOCK_PORTFOLIO_VERSION
 from ..core.contracts import Document, digest, fields, integer, require, session, text, timestamp
 from ..core.portfolio import PORTFOLIO_VERSION, decimal, minor, validate_signals
 from .accounting import AccountLedger
@@ -30,6 +31,9 @@ class BacktestRun(Document):
 
 def _validate(request):
     plan = request.to_dict()
+    if plan.get("contract_version") == "backtest_request_v3":
+        from .stock_inputs import validate_stock_request
+        return validate_stock_request(plan)
     v2 = plan.get("contract_version") == "backtest_request_v2"
     fields(plan, "contract_version account_id start_session end_session signal_frame market_replay initial_account profile" +
            (" unit_split_policy" if v2 else ""))
@@ -134,41 +138,66 @@ def _fees(price, quantity, side, profile):
     return gross, commission, tax
 
 
-def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_splits=None):
+def _fee_components(price, quantity, side, profile):
+    if profile["contract_version"] != "stock_daily_open_profile_v1":
+        return (*_fees(price, quantity, side, profile), 0)
+    gross = minor(price * quantity * 100)
+    commission = max(profile["minimum_commission_minor"], minor(Decimal(gross) * decimal(profile["commission_rate"])))
+    stamp = minor(Decimal(gross) * decimal(profile["sell_stamp_tax_rate"])) if side == "SELL" else 0
+    transfer = minor(Decimal(gross) * decimal(profile["transfer_fee_rate"]))
+    return gross, commission, stamp, transfer
+
+
+def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_splits=None, stock_market=None):
     order = {**intent, "order_id": run_id + ":order:" + str(order_index), "session": day,
              "status": "EXPIRED", "filled_quantity": 0, "unfilled_quantity": intent["quantity"],
              "reason": None, "execution": "daily_open_approximation"}
     order["market_state"] = row["market_state"]
     order["state_reason"] = row["state_reason"]
     order["execution_admission"] = "CONFIRMED_STATUS"
+    stock = profile["contract_version"] == "stock_daily_open_profile_v1"
+    volume_field = "volume_shares" if stock else "volume_units"
+    if stock:
+        from .stock_inputs import applicable_blocks
+        order["execution_evidence_cutoff"] = row["execution_evidence_cutoff"]
+        order["field_available_at"] = row["field_available_at"]
+        blocks = applicable_blocks(stock_market, intent["security_id"], day)
+        if blocks:
+            order.update(execution_admission="BLOCKED", reason="UNSUPPORTED_STOCK_ACTION", action_blocks=blocks)
+            return order
     if unit_splits is not None:
         order["announced_suspension_event_ids"] = suspension_events(unit_splits, intent["security_id"], day)
         if order["announced_suspension_event_ids"]:
             order.update(execution_admission="BLOCKED", reason="ANNOUNCED_SUSPENSION")
             return order
     if row["market_state"] != "normal_trading":
-        observed_etf = (profile["unknown_status_policy"] == "etf_daily_observed" and
+        observed_etf = (profile["unknown_status_policy"] in ("etf_daily_observed", "stock_daily_observed") and
                         row["market_state"] == "unknown_status" and row["state_reason"] in STATUS_GAP_REASONS)
         if not observed_etf:
             order["execution_admission"] = "BLOCKED"
             order["reason"] = "UNKNOWN_MARKET_STATUS" if row["market_state"] == "unknown_status" else "NOT_TRADING"
             return order
-        order["execution_admission"] = "ETF_OBSERVED_DAILY_ASSUMPTION"
-    if any(row[key] is None for key in ("open", "volume_units", "limit_up", "limit_down")):
+        order["execution_admission"] = "STOCK_OBSERVED_DAILY_ASSUMPTION" if stock else "ETF_OBSERVED_DAILY_ASSUMPTION"
+    if any(row[key] is None for key in ("open", volume_field, "limit_up", "limit_down")):
         order["reason"] = "MISSING_EXECUTION_FACT"
         return order
-    if decimal(row["volume_units"]) <= 0:
+    if Decimal(row[volume_field]) <= 0:
         order["reason"] = "NO_VOLUME"
         return order
     opening = decimal(row["open"])
     buy = intent["side"] == "BUY"
     price = opening * (1 + decimal(profile["slippage_bps"]) / 10000 * (1 if buy else -1))
+    if stock and price % decimal(profile["price_tick"]) != 0:
+        order["reason"] = "PRICE_TICK"
+        return order
     if (price > decimal(row["limit_up"]) or price < decimal(row["limit_down"]) or
             (buy and price == decimal(row["limit_up"])) or (not buy and price == decimal(row["limit_down"]))):
         order["reason"] = "PRICE_LIMIT"
         return order
     lot = profile["lot_size"]
-    cap = int(decimal(row["volume_units"]) * decimal(profile["participation_rate"]))
+    cap = int(Decimal(row[volume_field]) * decimal(profile["participation_rate"]))
+    if stock:
+        cap = min(cap, profile["maximum_order_quantity"])
     quantity = min(intent["quantity"], cap)
     if buy:
         quantity = quantity // lot * lot
@@ -182,8 +211,8 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
         low, high = 0, quantity // lot
         while low < high:
             mid = (low + high + 1) // 2
-            gross, commission, tax = _fees(price, mid * lot, "BUY", profile)
-            if gross + commission + tax <= ledger.cash:
+            gross, commission, tax, transfer = _fee_components(price, mid * lot, "BUY", profile)
+            if gross + commission + tax + transfer <= ledger.cash:
                 low = mid
             else:
                 high = mid - 1
@@ -191,19 +220,23 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
     if not quantity:
         order["reason"] = "INSUFFICIENT_CASH" if buy and cap >= lot else "NO_VOLUME_OR_SELLABLE_QUANTITY"
         return order
-    gross, commission, tax = _fees(price, quantity, intent["side"], profile)
-    if not buy and ledger.cash + gross < commission + tax:
+    gross, commission, tax, transfer = _fee_components(price, quantity, intent["side"], profile)
+    fee = commission + tax + transfer
+    if not buy and ledger.cash + gross < fee:
         order["reason"] = "INSUFFICIENT_CASH_FOR_FEES"
         return order
     fill = {"fill_id": order["order_id"] + ":fill:0", "order_id": order["order_id"], "session": day,
             "security_id": intent["security_id"], "side": intent["side"], "quantity": quantity,
             "price": str(price), "reference_open": str(opening), "gross_minor": gross,
-            "commission_minor": commission, "tax_minor": tax, "fee_minor": commission + tax,
+            "commission_minor": commission, "tax_minor": tax, "fee_minor": fee,
             "slippage_minor": minor(abs(price - opening) * quantity * 100),
-            "cash_delta_minor": -gross - commission - tax if buy else gross - commission - tax,
+            "cash_delta_minor": -gross - fee if buy else gross - fee,
             "source_refs": row["source_refs"]}
     fill.update({"market_state": row["market_state"], "state_reason": row["state_reason"],
                  "execution_admission": order["execution_admission"]})
+    if stock:
+        fill.update(stamp_tax_minor=tax, transfer_fee_minor=transfer, quantity_unit="shares",
+                    execution_evidence_cutoff=row["execution_evidence_cutoff"], field_available_at=row["field_available_at"])
     ledger.apply_fill(fill)
     order.update({"filled_quantity": quantity, "unfilled_quantity": intent["quantity"] - quantity,
                   "status": "FILLED" if quantity == intent["quantity"] else "PARTIAL_EXPIRED",
@@ -222,9 +255,11 @@ def run_backtest(request):
 def _run(request):
     plan, signal, signals, market, calendar, rows, profile = _validate(request)
     v2 = plan["contract_version"] == "backtest_request_v2"
-    runtime = RUNTIME_VERSION if v2 else LEGACY_RUNTIME_VERSION
+    stock = plan["contract_version"] == "backtest_request_v3"
+    runtime = "axiom.backtest/3" if stock else (RUNTIME_VERSION if v2 else LEGACY_RUNTIME_VERSION)
+    core_version = STOCK_PORTFOLIO_VERSION if stock else PORTFOLIO_VERSION
     splits = market.get("unit_splits", [])
-    run_id = Document.from_dict({"request": plan, "core": PORTFOLIO_VERSION, "runtime": runtime,
+    run_id = Document.from_dict({"request": plan, "core": core_version, "runtime": runtime,
                                 "implementation_ref": IMPLEMENTATION_REF}).identity
     ledger = AccountLedger(cash_minor=plan["initial_account"]["cash_minor"], calendar=calendar,
                            settlement_sessions=profile["settlement_sessions"], positions=plan["initial_account"]["positions"])
@@ -232,6 +267,7 @@ def _run(request):
     registrations, applications, mark_basis = {}, [], {}
     nav, positions, orders, decisions = [], [], [], []
     initial_value = None
+    stopped = None
     for index, day in enumerate(calendar):
         if day > plan["end_session"]:
             break
@@ -242,6 +278,14 @@ def _run(request):
                                                    for s, p in ledger.positions.items())
                 require(initial_value > 0, "positive initial NAV required")
             ledger.advance(day)
+            if stock:
+                from .stock_inputs import applicable_blocks
+                blocking = [block for security, position in ledger.positions.items() if position["quantity"]
+                            for block in applicable_blocks(market, security, day)]
+                if blocking:
+                    stopped = {"session": day, "reason": "HELD_UNSUPPORTED_STOCK_ACTION", "blocks": blocking,
+                               "committed_sequence": ledger.sequence}
+                    break
             for phase, key in (("EX", "ex_session"), ("PAY", "pay_session")):
                 for action in sorted(market["cash_dividends"], key=lambda a: a["event_id"]):
                     if action[key] == day and action["event_id"] in entitlements:
@@ -254,14 +298,19 @@ def _run(request):
                            "decision_time": day + "T" + profile["decision_time_utc"],
                            "knowledge_cutoff": first["knowledge_cutoff"], "reference_prices": quotes,
                            "account_state_version": ledger.sequence,
-                           **{key: profile[key] for key in ("lot_size", "commission_rate", "minimum_commission_minor", "tax_rate", "slippage_bps")}}
-                decision = plan_rotation(SignalFrame.from_dict(signal), account=ledger.account(), context=context).to_dict()
-                if v2:
+                           **{key: profile[key] for key in ("lot_size", "commission_rate", "minimum_commission_minor", "slippage_bps")}}
+                if stock:
+                    context.update(supported_security_ids=plan["execution_universe"], supported_universe_ref=plan["supported_universe_ref"])
+                    decision = plan_stock_portfolio(StockPredictionFrame.from_dict(signal), account=ledger.account(), context=context).to_dict()
+                else:
+                    context["tax_rate"] = profile["tax_rate"]
+                    decision = plan_rotation(SignalFrame.from_dict(signal), account=ledger.account(), context=context).to_dict()
+                if v2 or stock:
                     decision["reference_prices"] = {s: dict(q) for s, q in quotes.items()}
                 decisions.append(decision)
                 for intent in decision["intents"]:
                     orders.append(_simulate(intent, rows[day, intent["security_id"]], ledger, profile, day, run_id, len(orders),
-                                            splits if v2 else None))
+                                            splits if v2 else None, market if stock else None))
             for action in market["cash_dividends"]:
                 if action["record_session"] == day:
                     entitlements[action["event_id"]] = ledger.positions.get(action["security_id"], {"quantity": 0})["quantity"]
@@ -273,7 +322,7 @@ def _run(request):
                             position["quantity"] == position["sellable_quantity"],
                             "unit split registration requires fully settled entitlement")
                     registrations[event["event_id"]] = {"sequence": ledger.sequence, "position": dict(position)}
-        for security in sorted(signal["universe"]):
+        for security in sorted(market["universe"]):
             row = rows[day, security]
             if row["close"] is not None:
                 quote = {"price": row["close"], "session": day, "available_at": row["close_available_at"], "source_refs": row["source_refs"]}
@@ -317,10 +366,10 @@ def _run(request):
     for point in nav:
         peak = max(peak, point["nav_minor"])
         drawdown = min(drawdown, Decimal(point["nav_minor"]) / peak - 1)
-    result = {"contract_version": "backtest_run_v2" if v2 else "backtest_run_v1", "run_id": run_id, "account_id": plan["account_id"],
-        "status": "COMPLETE", "plan": plan, "signal_ref": signal["signal_run_ref"],
+    result = {"contract_version": "backtest_run_v3" if stock else ("backtest_run_v2" if v2 else "backtest_run_v1"), "run_id": run_id, "account_id": plan["account_id"],
+        "status": "BLOCKED" if stopped else "COMPLETE", "plan": plan, "signal_ref": signal["signal_run_ref"],
         "market_ref": MarketReplay.from_dict(market).identity, "profile_ref": Document.from_dict(profile).identity,
-        "core_version": PORTFOLIO_VERSION, "runtime_version": runtime,
+        "core_version": core_version, "runtime_version": runtime,
         "implementation_ref": IMPLEMENTATION_REF,
         "committed_sequence": ledger.sequence, "initial_nav_minor": initial_value,
         "final_account": {"cash_minor": ledger.cash, "receivable_minor": sum(ledger.receivables.values()),
@@ -328,8 +377,8 @@ def _run(request):
         "decisions": decisions, "orders": orders, "fills": ledger.fills,
         "cash_ledger": ledger.cash_ledger, "position_ledger": ledger.position_ledger,
         "nav": nav, "positions": positions,
-        "metrics": {"total_return": str(Decimal(nav[-1]["nav_minor"]) / initial_value - 1),
-                    "max_drawdown": str(drawdown), "total_fees_minor": sum(f["fee_minor"] for f in ledger.fills),
+        "metrics": {"total_return": None if stopped else str(Decimal(nav[-1]["nav_minor"]) / initial_value - 1),
+                    "max_drawdown": None if stopped else str(drawdown), "total_fees_minor": sum(f["fee_minor"] for f in ledger.fills),
                     "turnover_minor": sum(f["gross_minor"] for f in ledger.fills), "fill_count": len(ledger.fills),
                     "unfilled_order_count": sum(o["unfilled_quantity"] > 0 for o in orders)},
         "limitations": [profile["limitation"], "Daily open-price approximation; full-day volume is an execution-side capacity proxy, not known opening liquidity.",
@@ -347,6 +396,14 @@ def _run(request):
             "ETF unit replacement applies visible planned arrangements under a single-holder fully settled EOD simulation model; APPLIED is not issuer implemented status.",
             "Date-only next-open availability is best effort; actual receipt remains unchanged and strict historical PIT is not established.",
             "Issuer not_stated phase remains native; EOD and no extra T+1 are Runtime conventions. UNKNOWN and missing bars remain; disclosed full-session suspension is an additional hard block."])
+    if stock:
+        result.update(quantity_unit="shares", price_unit="CNY/share", stopped=stopped,
+                      admission_ref=plan["admission_ref"], supported_universe_ref=plan["supported_universe_ref"])
+        result["limitations"] += signal["limitations"]
+        result["limitations"].insert(0, profile["limitation"])
+        result["limitations"] = [value.replace("split or delisting support", "general stock quantity-action or delisting support")
+            .replace("Metrics cover the fixed short sample only; no OOS, CAGR or Sharpe claim.",
+                     "Metrics cover the frozen stock sample; separate saved evaluation owns annualization.") for value in result["limitations"]]
     result["content_digest"] = Document.from_dict(result).identity
     return BacktestRun.from_dict(result)
 
@@ -367,7 +424,9 @@ def load_backtest_run(path):
     """Read a saved result and check content/input identity without recomputation."""
     saved = BacktestRun(Path(path).read_text())
     wire = saved.to_dict()
-    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2") and wire.get("status") == "COMPLETE", "unsupported saved result")
+    stock = wire.get("contract_version") == "backtest_run_v3"
+    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3") and
+            wire.get("status") in (("COMPLETE", "BLOCKED") if stock else ("COMPLETE",)), "unsupported saved result")
     recorded_digest = wire.pop("content_digest", None)
     require(recorded_digest == Document.from_dict(wire).identity, "saved result content digest mismatch")
     require(wire["run_id"] == Document.from_dict({"request": wire["plan"],
@@ -380,4 +439,9 @@ def load_backtest_run(path):
         _validate(BacktestRequest.from_dict(wire["plan"]))
         from .unit_splits import validate_saved_applications
         validate_saved_applications(wire)
+    if stock:
+        require(wire["runtime_version"] == "axiom.backtest/3" and wire["core_version"] == STOCK_PORTFOLIO_VERSION and
+                wire["plan"]["contract_version"] == "backtest_request_v3", "saved stock tuple mismatch")
+        _validate(BacktestRequest.from_dict(wire["plan"]))
+        require((wire["status"] == "BLOCKED") == (wire["stopped"] is not None), "saved stock stop status mismatch")
     return saved

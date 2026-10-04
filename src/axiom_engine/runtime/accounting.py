@@ -107,7 +107,8 @@ class AccountLedger:
             require(self._applied[key] == payload, "conflicting corporate action")
             return
         with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
-            amount = minor(decimal(action["cash_per_unit"], minimum=0) * entitlement * 100)
+            name = "cash_before_tax_per_share" if action.get("contract_version") == "stock_cash_action_v1" else "cash_per_unit"
+            amount = minor(decimal(action[name], minimum=0) * entitlement * 100)
         receivable_delta, cash_delta = (amount, 0) if phase == "EX" else (-amount, amount)
         require(phase in ("EX", "PAY"), "unsupported dividend phase")
         if phase == "PAY":

@@ -62,7 +62,7 @@ def long_history_evaluation_spec():
 def _verify_run(run):
     require(isinstance(run, BacktestRun), "saved BacktestRun required")
     wire = run.to_dict()
-    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2") and wire.get("status") == "COMPLETE",
+    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3") and wire.get("status") == "COMPLETE",
             "complete saved account result required")
     recorded = wire.pop("content_digest", None)
     require(recorded == Document.from_dict(wire).identity, "saved result content digest mismatch")
@@ -77,6 +77,11 @@ def _verify_run(run):
                 "saved v2 tuple mismatch")
         _validate(BacktestRequest.from_dict(wire["plan"]))
         validate_saved_applications(wire)
+    if wire["contract_version"] == "backtest_run_v3":
+        from .stock_inputs import validate_stock_request
+        require(wire["runtime_version"] == "axiom.backtest/3" and wire["core_version"] == "axiom.stock_portfolio/1" and
+                wire["stopped"] is None, "complete stock tuple required")
+        validate_stock_request(wire["plan"])
     return wire
 
 
@@ -87,6 +92,14 @@ def _provenance(wire):
     require(type(wire["source_evidence"]) is list and type(wire["limitations"]) is list,
             "input evidence/limitations required")
     snapshots = set()
+    if "coverage_bundle" in wire:
+        from .stock_evidence import native_batches
+        batches = native_batches(wire["source_evidence"], wire["coverage_bundle"])
+        require({entry["reference"] for entry in wire["source_evidence"]} == set(wire["source_refs"]), "stock provenance closure mismatch")
+        for batch in batches:
+            require(batch["context"]["query"]["purpose"] == "market_replay", "wrong-purpose evaluation evidence")
+            snapshots.add(batch["context"]["snapshot_id"])
+        return snapshots
     for evidence in wire["source_evidence"]:
         require(evidence["reference"] in wire["source_refs"], "unbound source evidence")
         if "batch" in evidence:
@@ -135,8 +148,29 @@ def _validate_scope(scope, run, snapshots):
         return None
     require(isinstance(scope, DividendScope), "DividendScope required")
     wire = scope.to_dict()
-    fields(wire, "contract_version start_session end_session knowledge_cutoff universe coverage actions source_refs source_evidence limitations")
     plan = run["plan"]
+    fields(wire, "contract_version start_session end_session knowledge_cutoff universe coverage actions source_refs source_evidence limitations" +
+           (" coverage_bundle" if plan["contract_version"] == "backtest_request_v3" and "coverage_bundle" in wire else ""))
+    if plan["contract_version"] == "backtest_request_v3":
+        from .stock_inputs import validate_cash_action
+        require(wire["contract_version"] == "dividend_scope_v2" and wire["coverage"] == "observed_records_only" and
+                wire["start_session"] == plan["start_session"] and wire["end_session"] == plan["end_session"] and
+                wire["universe"] == plan["execution_universe"] and
+                wire["knowledge_cutoff"] == plan["end_session"] + "T12:30:00Z", "stock dividend scope mismatch")
+        require(_provenance(wire) == snapshots, "stock dividend Snapshot mismatch")
+        expected = [a for a in plan["market_replay"]["cash_dividends"]
+                    if plan["start_session"] <= a["record_session"] <= plan["end_session"]]
+        require(wire["actions"] == expected, "stock dividend scope differs from frozen account actions")
+        expected_evidence = [entry for entry in plan["market_replay"]["source_evidence"]
+                             if entry["batch"]["context"]["domain"] == "corporate_actions"]
+        require(wire["source_evidence"] == expected_evidence and
+                wire["source_refs"] == [entry["reference"] for entry in expected_evidence], "stock dividend evidence mismatch")
+        from .stock_evidence import scoped_bundle
+        require(wire.get("coverage_bundle", []) == scoped_bundle(expected_evidence, plan["market_replay"].get("coverage_bundle", [])),
+                "stock dividend coverage closure mismatch")
+        for action in wire["actions"]:
+            validate_cash_action(action, wire["universe"], wire["source_refs"])
+        return wire
     require(wire["contract_version"] == "dividend_scope_v1" and wire["coverage"] == "observed_records_only" and
             wire["start_session"] == plan["start_session"] and wire["end_session"] == plan["end_session"] and
             set(wire["universe"]) == set(plan["signal_frame"]["universe"]) and
