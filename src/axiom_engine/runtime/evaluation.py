@@ -62,7 +62,7 @@ def long_history_evaluation_spec():
 def _verify_run(run):
     require(isinstance(run, BacktestRun), "saved BacktestRun required")
     wire = run.to_dict()
-    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3") and wire.get("status") == "COMPLETE",
+    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4") and wire.get("status") == "COMPLETE",
             "complete saved account result required")
     recorded = wire.pop("content_digest", None)
     require(recorded == Document.from_dict(wire).identity, "saved result content digest mismatch")
@@ -77,9 +77,10 @@ def _verify_run(run):
                 "saved v2 tuple mismatch")
         _validate(BacktestRequest.from_dict(wire["plan"]))
         validate_saved_applications(wire)
-    if wire["contract_version"] == "backtest_run_v3":
+    if wire["contract_version"] in ("backtest_run_v3", "backtest_run_v4"):
         from .stock_inputs import validate_stock_request, validate_saved_stock_core
-        require(wire["runtime_version"] == "axiom.backtest/3" and
+        require(wire["runtime_version"] == ("axiom.backtest/4" if wire["contract_version"] == "backtest_run_v4" else "axiom.backtest/3") and
+                wire["plan"]["contract_version"] == ("backtest_request_v4" if wire["contract_version"] == "backtest_run_v4" else "backtest_request_v3") and
                 wire["core_version"] in ("axiom.stock_portfolio/1", "axiom.stock_portfolio/2") and
                 wire["stopped"] is None, "complete stock tuple required")
         validate_stock_request(wire["plan"], legacy_saved_top5=wire["core_version"] == "axiom.stock_portfolio/1")
@@ -156,8 +157,8 @@ def _validate_scope(scope, run, snapshots):
     wire = scope.to_dict()
     plan = run["plan"]
     fields(wire, "contract_version start_session end_session knowledge_cutoff universe coverage actions source_refs source_evidence limitations" +
-           (" coverage_bundle" if plan["contract_version"] == "backtest_request_v3" and "coverage_bundle" in wire else ""))
-    if plan["contract_version"] == "backtest_request_v3":
+           (" coverage_bundle" if plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4") and "coverage_bundle" in wire else ""))
+    if plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4"):
         from .stock_inputs import validate_cash_action
         require(wire["contract_version"] == "dividend_scope_v2" and wire["coverage"] == "observed_records_only" and
                 wire["start_session"] == plan["start_session"] and wire["end_session"] == plan["end_session"] and
