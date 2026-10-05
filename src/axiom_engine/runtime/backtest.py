@@ -443,8 +443,8 @@ def load_backtest_run(path):
     if stock:
         require(wire["runtime_version"] == "axiom.backtest/3" and wire["core_version"] in (STOCK_PORTFOLIO_VERSION, TOPK_PORTFOLIO_VERSION) and
                 wire["plan"]["contract_version"] == "backtest_request_v3", "saved stock tuple mismatch")
-        _validate(BacktestRequest.from_dict(wire["plan"]))
-        from .stock_inputs import validate_saved_stock_core
+        from .stock_inputs import validate_saved_stock_core, validate_stock_request
+        validate_stock_request(wire["plan"], legacy_saved_top5=wire["core_version"] == STOCK_PORTFOLIO_VERSION)
         validate_saved_stock_core(wire)
         require((wire["status"] == "BLOCKED") == (wire["stopped"] is not None), "saved stock stop status mismatch")
     return saved

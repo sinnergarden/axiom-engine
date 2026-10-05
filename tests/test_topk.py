@@ -80,3 +80,18 @@ class TopKTests(unittest.TestCase):
             self.assertEqual(legacy.to_dict()["core_version"],"axiom.stock_portfolio/1")
             evaluate_backtest(legacy,benchmark=benchmark(),spec=long_history_evaluation_spec())
         self.assertEqual(evaluate_backtest(results[0],benchmark=benchmark(),spec=long_history_evaluation_spec()).to_dict()["input_run_ref"]["run_id"],three["run_id"])
+
+    def test_saved_legacy_small_universe_keeps_no_decision_semantics(self):
+        for n in range(1,5):
+            with self.subTest(universe_size=n):
+                run=load_backtest_run(Path(__file__).parent/f"fixtures/top5_run_v1_{n}_members.json")
+                wire=run.to_dict()
+                self.assertEqual(len(wire["plan"]["execution_universe"]),n)
+                self.assertTrue(all(d["status"]=="NO_DECISION" for d in wire["decisions"]))
+                self.assertEqual(wire["fills"],[])
+                evaluate_backtest(run,benchmark=benchmark(),spec=long_history_evaluation_spec())
+                with patch("axiom_engine.runtime.backtest.AccountLedger",side_effect=AssertionError("started ledger")):
+                    with self.assertRaises(ContractError):
+                        run_backtest(BacktestRequest.from_dict(wire["plan"]))
+                with self.assertRaises(ContractError):
+                    stock_portfolio_policy(top_k=5,execution_universe=wire["plan"]["execution_universe"])

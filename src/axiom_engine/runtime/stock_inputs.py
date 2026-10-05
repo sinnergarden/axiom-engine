@@ -113,7 +113,7 @@ def _validate_pair_proof(evidence, signal, universe, calendar, batches):
                 entry["reader_version"] == batch["context"]["reader_version"], "stock execution facts differ from admitted batches")
 
 
-def validate_stock_request(plan):
+def validate_stock_request(plan, *, legacy_saved_top5=False):
     fields(plan, "contract_version account_id start_session end_session signal_frame market_replay initial_account profile prediction_universe execution_universe supported_universe_ref portfolio_policy admission_ref admission_evidence stock_action_policy")
     require(plan["contract_version"] == "backtest_request_v3" and plan["stock_action_policy"] == ACTION_POLICY,
             "unsupported stock request/action policy")
@@ -125,8 +125,10 @@ def validate_stock_request(plan):
     require(bool(universe) and plan["supported_universe_ref"] == support_ref(universe), "stock support identity mismatch")
     policy = plan["portfolio_policy"]
     fields(policy, "eligibility_id top_k rebalance budget_basis")
-    require(policy == stock_portfolio_policy(top_k=policy.get("top_k"), execution_universe=universe),
-            "unsupported stock portfolio policy")
+    expected = ({"eligibility_id": ELIGIBILITY_ID, "top_k": 5,
+                 "rebalance": "weekly_first_trading_session", "budget_basis": BUDGET_BASIS}
+                if legacy_saved_top5 else stock_portfolio_policy(top_k=policy.get("top_k"), execution_universe=universe))
+    require(policy == expected and type(policy["top_k"]) is int, "unsupported stock portfolio policy")
     digest(plan["admission_ref"])
     evidence = dict(plan["admission_evidence"])
     recorded = evidence.pop("admission_ref", None)
