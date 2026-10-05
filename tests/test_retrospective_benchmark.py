@@ -120,5 +120,21 @@ class RetrospectiveBenchmarkTests(unittest.TestCase):
             bad=report.to_dict();bad['benchmark_comparisons']['SSE_COMPOSITE']['observation_cutoff']='2020-01-01T00:00:00Z'
             with self.assertRaises(ContractError):save_backtest_evaluation(rehash_report(bad),Path(temp)/'bad.json')
 
+    def test_rehashed_anchor_missing_status_and_required_SSE_percentages(self):
+        batch,receipt=native(self.base_wire,[None,110,120,130])
+        original=self.report(admitted(batch,receipt)).to_dict()
+        with tempfile.TemporaryDirectory() as temp:
+            for i,case in enumerate(('no_percent','invent_norm','complete','anchor')):
+                wire=deepcopy(original);sse=wire['benchmark_comparisons']['SSE_COMPOSITE']
+                if case=='no_percent':
+                    for point in [*sse['native_series'],*sse['series']]:point.pop('benchmark_cumulative_return')
+                elif case=='invent_norm':
+                    for point in [*sse['native_series'],*sse['series']]:
+                        point['normalized_index']='1';point['benchmark_cumulative_return']='0'
+                elif case=='complete':sse['status']='COMPLETE'
+                else:sse.update(anchor_session='2019-01-01',anchor_close='100')
+                with self.subTest(case=case),self.assertRaises(ContractError):
+                    save_backtest_evaluation(rehash_report(wire),Path(temp)/str(i))
+
 
 if __name__=='__main__':unittest.main()

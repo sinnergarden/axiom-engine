@@ -400,11 +400,23 @@ def _validate_outputs(wire, base):
                 require(all(point[name] == row[name] for name in ("close","available_at","source_refs")),
                         "saved comparison native observations mismatch")
             indexed={p["session"]:p for p in native["rows"]}
+            anchor_day=base["period_metrics"]["window"]["anchor_session"]
+            anchor=indexed.get(anchor_day)
+            anchor_close=None if anchor is None else anchor["close"]
+            require(comparison["anchor_session"]==anchor_day and comparison["anchor_close"]==anchor_close,
+                    "saved comparison anchor raw boundary differs")
+            if key == "SSE_COMPOSITE":require(all(percentages),"new SSE contract requires saved percentages")
+            for point in comparison["native_series"]:
+                missing=anchor_close is None or point["close"] is None
+                require((point["normalized_index"] is None)==missing,"native normalized boundary/null differs")
+                _nullable_decimal(point["normalized_index"])
             require([p["account_session"] for p in comparison["series"]] == [p["session"] for p in base["series"]],
                     "saved comparison account dates mismatch")
             for point in comparison["series"]:
                 require(point["native_session"] in (None,point["account_session"]), "saved cross-market date filling forbidden")
                 row=indexed.get(point["account_session"])
+                missing=anchor_close is None or row is None or row["close"] is None
+                require((point["normalized_index"] is None)==missing,"projected normalized boundary/null differs")
                 require(point["native_session"] == (None if row is None else row["session"]) and
                     all(point[name] == (None if row is None else row[name]) for name in ("close","available_at")) and
                     point["source_refs"] == ([] if row is None else row["source_refs"]),
@@ -412,3 +424,6 @@ def _validate_outputs(wire, base):
                 if comparison["currency"] != "CNY":
                     require(point["account_relative_wealth"] is None,"FX evidence is required for CNY comparison")
                 for name in ("close","normalized_index","account_relative_wealth"): _nullable_decimal(point[name])
+            complete=anchor_close is not None and all(indexed.get(p["session"]) is not None and
+                indexed[p["session"]]["close"] is not None for p in base["series"])
+            require(comparison["status"]==("COMPLETE" if complete else "PARTIAL"),"saved benchmark missing/status differs")
