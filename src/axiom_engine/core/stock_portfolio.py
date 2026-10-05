@@ -125,6 +125,9 @@ def _plan(frame, account, context, top_k, admitted=None):
     if v2:
         require(top_k is not None and "feature_knowledge_cutoff" in context,
                 "v2 neutral predictions only; account clock consumption is not admitted without explicit TopK and feature clock")
+        if admitted is None:
+            unsigned = dict(wire); reference = unsigned.pop("signal_run_ref")
+            require(Document.from_dict(unsigned).identity == reference, "Saved v2 prediction identity mismatch")
     fields(context, "trade_session feature_session decision_time knowledge_cutoff reference_prices lot_size commission_rate minimum_commission_minor slippage_bps account_state_version supported_security_ids supported_universe_ref" +
            (" feature_knowledge_cutoff" if v2 else ""))
     session(context["trade_session"]); session(context["feature_session"])
@@ -221,7 +224,7 @@ def _plan(frame, account, context, top_k, admitted=None):
         **({} if legacy else {"top_k": k}), "tie_break": "security_id_asc",
         "budget_basis": BUDGET_BASIS, "reference_budget_minor": minor(budget), "sizing": "previous_native_close",
         "score_semantics": wire["score_semantics"], "cash_check": "actual_fill_cash"})
-    identity = Document.from_dict({"contract": version, "frame": wire, "context": context, "account": account,
+    identity = Document.from_dict({"contract": version, **({"frame_ref": wire["signal_run_ref"]} if v2 else {"frame": wire}), "context": context, "account": account,
                                   **({} if legacy else {"top_k": k})}).identity
     for index, intent in enumerate(result["intents"]):
         intent.update(intent_id=identity + ":" + str(index), expected_account_version=account["version"], valid_until=context["trade_session"])

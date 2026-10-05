@@ -165,6 +165,7 @@ class StockScheduleTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "sizing reference"):
             plan_stock_portfolio(StockPredictionFrame.from_dict(frame), account=account, context=ctx, top_k=3)
         frame["rows"][0].update(valid=False, score=None, invalid_reason="MISSING")
+        frame = seal(frame, "signal_run_ref")
         result = plan_stock_portfolio(StockPredictionFrame.from_dict(frame), account=account, context=ctx, top_k=3).to_dict()
         self.assertEqual(result["status"], "NO_DECISION")
         self.assertIn("prediction_clock", result)
@@ -240,3 +241,57 @@ class StockScheduleTests(unittest.TestCase):
             path = Path(tmp)/"bad.json"; path.write_text(Document.from_dict(wire).payload)
             with self.assertRaisesRegex(ContractError, "trade mapping"):
                 load_backtest_run(path)
+
+    def test_equivalent_aware_clocks_in_unordered_rows_keep_saved_original_row(self):
+        plan = scheduled_request().to_dict()
+        frame = plan["prediction_schedule"]["folds"][0]["prediction_frame"]
+        row = frame["rows"][1]
+        for name in ("knowledge_cutoff", "available_at", "feature_knowledge_cutoff", "simulated_model_available_at"):
+            from axiom_engine.core.stock_portfolio import instant
+            from datetime import timezone
+            row[name] = instant(row[name]).astimezone(timezone.utc).isoformat()
+        frame["rows"][0], frame["rows"][1] = frame["rows"][1], frame["rows"][0]
+        reseal_schedule(plan)
+        # Refresh the serialized reference in the saved trade mapping as well.
+        for entry in plan["prediction_schedule"]["trade_schedule"]:
+            if entry["trade_session"] in plan["prediction_schedule"]["folds"][0]["fold_spec"]["oos_trade_sessions"]:
+                entry["signal_run_ref"] = plan["prediction_schedule"]["folds"][0]["prediction_frame"]["signal_run_ref"]
+        reseal_schedule(plan)
+        run = run_backtest(BacktestRequest.from_dict(plan))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/"mixed.json"; save_backtest_run(run, path)
+            self.assertEqual(load_backtest_run(path).payload, run.payload)
+
+    def test_new_pair_counts_reject_float_and_bool(self):
+        for section, name, value in (("listing_identity_checks", "checked_rows", 6.0),
+                                     ("listing_identity_checks", "paired_rows", True),
+                                     ("previous_close_basis_checks", "equal_rows", 66.0),
+                                     ("previous_close_basis_checks", "listing_identity_checked_rows", 66.0)):
+            plan = scheduled_request().to_dict()
+            plan["admission_evidence"][section][name] = value
+            reseal_schedule(plan)
+            with self.subTest(section=section, name=name), self.assertRaises(ContractError):
+                stock_inputs.validate_stock_request(plan)
+
+    def test_public_and_entry_admitted_core_agree_without_rehashing_frame_per_intent(self):
+        request = scheduled_request()
+        original_hash = Document.from_dict
+        identities = []
+        def observe(value):
+            if value.get("contract") == "axiom.stock_portfolio/2": identities.append(value)
+            return original_hash(value)
+        with patch.object(Document, "from_dict", side_effect=observe):
+            run = run_backtest(request).to_dict()
+        self.assertEqual(len(identities), 2)
+        self.assertTrue(all("frame_ref" in value and "frame" not in value for value in identities))
+        decision = deepcopy(run["decisions"][0]); quotes = decision.pop("reference_prices")
+        plan = run["plan"]; frame = plan["prediction_schedule"]["folds"][0]["prediction_frame"]
+        context = {"trade_session": CALENDAR[1], "feature_session": CALENDAR[0],
+            "decision_time": CALENDAR[1]+"T00:55:00Z", "knowledge_cutoff": frame["rows"][0]["knowledge_cutoff"],
+            "feature_knowledge_cutoff": frame["rows"][0]["feature_knowledge_cutoff"], "reference_prices": quotes,
+            "account_state_version": decision["expected_account_version"], "supported_security_ids": legacy.SECURITIES,
+            "supported_universe_ref": plan["supported_universe_ref"], **{k: plan["profile"][k] for k in
+                ("lot_size", "commission_rate", "minimum_commission_minor", "slippage_bps")}}
+        public = plan_stock_portfolio(StockPredictionFrame.from_dict(frame), account={"cash_minor": 50000000,
+            "positions": {}, "version": decision["expected_account_version"]}, context=context, top_k=3).to_dict()
+        self.assertEqual(public, decision)

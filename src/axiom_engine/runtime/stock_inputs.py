@@ -59,7 +59,9 @@ def _validate_pair_proof(evidence, signal, universe, calendar, batches):
     v2 = signal["contract_version"] == "stock_prediction_schedule_v1"
     if v2:
         identity = evidence.get("listing_identity_checks", {})
+        fields(identity, "checked_rows paired_rows mismatches")
         require(evidence.get("contract_version") == "stock_snapshot_pair_admission_v2" and
+                type(identity["checked_rows"]) is int and type(identity["paired_rows"]) is int and
                 identity.get("checked_rows") == len(universe) and identity.get("paired_rows") == len(universe) and
                 identity.get("mismatches") == [], "incomplete dynamic stock listing identity proof")
     else:
@@ -76,7 +78,9 @@ def _validate_pair_proof(evidence, signal, universe, calendar, batches):
             basis.get("paired_rows_per_root") == count and basis.get("checked_rows_both_roots") == 2 * count,
             "incomplete previous-close basis pairing")
     if v2:
-        require(basis.get("equal_rows") == count and basis.get("listing_identity_checked_rows") == count and
+        require(all(type(basis.get(name)) is int for name in
+                ("equal_rows", "listing_identity_checked_rows", "paired_rows_per_root", "checked_rows_both_roots")) and
+                basis.get("equal_rows") == count and basis.get("listing_identity_checked_rows") == count and
                 basis.get("listing_identity_mismatches") == [], "incomplete dynamic previous-close identity pairing")
     else:
         require(basis.get("equal_all_83_23") is True and basis.get("listing_suffix_and_SZSE_identity_all_83") is True,
@@ -282,7 +286,8 @@ def validate_saved_stock_core(wire):
             require(trade is not None and trade["signal_run_ref"] == decision.get("signal_ref") and
                     trade["feature_session"] == decision.get("feature_session"), "Saved decision differs from admitted trade mapping")
             frame = frames[trade["signal_run_ref"]]
-            original = next((r for r in frame["rows"] if r["session"] == decision["feature_session"]), None)
+            original = next((r for r in frame["rows"] if r["session"] == decision["feature_session"] and
+                             r["security_id"] == frame["universe"][0]), None)
             require(original is not None and decision.get("prediction_clock") == {
                 "clock_basis": frame["clock_basis"], "feature_knowledge_cutoff": original["feature_knowledge_cutoff"],
                 "inference_cutoff": original["knowledge_cutoff"], "simulated_model_available_at": original["simulated_model_available_at"],
