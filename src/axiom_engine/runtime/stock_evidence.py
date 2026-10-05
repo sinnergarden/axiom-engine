@@ -5,7 +5,7 @@ import hashlib
 import io
 import json
 
-from ..core.contracts import canonical, digest, fields, require, _pairs
+from ..core.contracts import canonical, digest, fields, require, _pairs, _walk
 
 ENCODING = 'gzip_base64_json_v1'
 MIN_COVERAGE_BYTES = 1024 * 1024
@@ -13,6 +13,33 @@ MIN_COVERAGE_BYTES = 1024 * 1024
 
 def native_ref(value):
     return 'sha256:' + hashlib.sha256(canonical(value).encode()).hexdigest()
+
+
+def _native_ref_with_verified_coverage(batch, raw):
+    """Hash complete native bytes using coverage verified in this load only."""
+    # Keep the coverage key when checking the remaining structure: removing it
+    # could hide an extra field inside a reserved Unknown object.
+    context = batch['context']
+    tuple(_walk({**batch, 'context': {**context, 'coverage': None}}))
+    hashed = hashlib.sha256()
+
+    def object_bytes(value, coverage=False):
+        hashed.update(b'{')
+        for index, key in enumerate(sorted(value)):
+            if index:
+                hashed.update(b',')
+            hashed.update(canonical(key).encode())
+            hashed.update(b':')
+            if coverage and key == 'coverage':
+                hashed.update(raw)
+            elif not coverage and key == 'context':
+                object_bytes(context, coverage=True)
+            else:
+                hashed.update(canonical(value[key]).encode())
+        hashed.update(b'}')
+
+    object_bytes(batch)
+    return 'sha256:' + hashed.hexdigest()
 
 
 def pack_stock_batches(batches, references=None):
@@ -64,8 +91,8 @@ def native_batches(entries, bundle=()):
             value = json.loads(raw, object_pairs_hook=_pairs)
         except (ValueError, TypeError, OSError, EOFError) as exc:
             raise ValueError('invalid stock compressed coverage') from exc
-        require(type(value) is dict and native_ref(value) == item['reference'], 'noncanonical stock coverage')
-        table[item['reference']] = value
+        require(type(value) is dict and canonical(value).encode() == raw, 'noncanonical stock coverage')
+        table[item['reference']] = (value, raw)
     batches, used, refs = [], set(), set()
     for entry in entries:
         fields(entry, 'reference batch'); digest(entry['reference'])
@@ -77,8 +104,12 @@ def native_batches(entries, bundle=()):
             require(ref in table and 'coverage' not in context, 'unbound stock coverage reference')
             used.add(ref)
             context = {key: value for key, value in context.items() if key != 'coverage_ref'}
-            batch = {**batch, 'context': {**context, 'coverage': table[ref]}}
-        require(native_ref(batch) == entry['reference'], 'stock native DataBatch hash mismatch')
+            value, raw = table[ref]
+            batch = {**batch, 'context': {**context, 'coverage': value}}
+            reference = _native_ref_with_verified_coverage(batch, raw)
+        else:
+            reference = native_ref(batch)
+        require(reference == entry['reference'], 'stock native DataBatch hash mismatch')
         batches.append(batch)
     require(used == set(table), 'unused or missing stock coverage closure')
     return batches
