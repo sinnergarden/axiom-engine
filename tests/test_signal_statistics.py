@@ -96,3 +96,16 @@ class SignalStatisticsTests(unittest.TestCase):
         result = self.evaluate(wire)
         self.assertEqual(result["series"][3]["valid_pair_count"], 19)
         self.assertIsNone(result["series"][3]["ic"])
+
+    def test_affine_offset_and_opposite_extremes_preserve_correlation(self):
+        for scores in ([1e12 + i * math.ulp(1e12) for i in range(20)],
+                       [1e16 + 2 * i for i in range(20)],
+                       [-1e308] * 10 + [1e308] * 10):
+            wire = {"contract_version": "signal_statistics_input_v1", "sessions": DAYS,
+                    "signal_keys": ["a"], "pairs": [
+                        {"signal_key": "a", "session": DAYS[0], "security_id": f"s{i:02}",
+                         "score": value, "outcome": i if scores[0] != -1e308 else (i >= 10) * 1.0}
+                        for i, value in enumerate(scores)]}
+            result = self.evaluate(wire)
+            self.assertAlmostEqual(result["series"][0]["ic"], 1, delta=1e-12)
+            self.assertAlmostEqual(result["series"][0]["rank_ic"], 1, delta=1e-12)

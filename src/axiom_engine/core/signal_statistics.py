@@ -28,11 +28,16 @@ def _ranks(values):
 
 
 def _correlation(x, y):
-    # Scaling before centering avoids overflow for admitted finite extremes.
+    # Translate first to preserve small representable gaps at a large offset.
+    # Opposite finite extremes may overflow subtraction; only then scale first.
     centered = []
     for values in (x, y):
-        scale = max(abs(v) for v in values)
-        scaled = [v / scale if scale else 0.0 for v in values]
+        shifted = [v - values[0] for v in values]
+        if not all(math.isfinite(v) for v in shifted):
+            scale = max(abs(v) for v in values)
+            shifted = [v / scale for v in values]
+        scale = max(abs(v) for v in shifted)
+        scaled = [v / scale if scale else 0.0 for v in shifted]
         mean = math.fsum(scaled) / len(scaled)
         centered.append([v - mean for v in scaled])
     x, y = centered
