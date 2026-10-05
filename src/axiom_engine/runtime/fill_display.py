@@ -171,14 +171,17 @@ def _event_scope(run_events, data_events, cutoff):
         require(type(events) is list, "unit event scope must be saved")
         ids = set()
         for event in events:
-            require(type(event) is dict and event.get("event_id") and event["event_id"] not in ids,
+            key = event.get("event_id") if index == 0 else (event.get("security_id"),event.get("event_id"))
+            require(type(event) is dict and event.get("event_id") and key not in ids,
                     "duplicate/missing unit event key")
-            ids.add(event["event_id"])
+            ids.add(key)
             for name in ("record_date", "effective_date", "new_price_basis_session"):
                 if event.get(name) is not None: session(event[name])
                 elif index == 0: require(False, "original account unit date is missing")
             if event.get("effective_date") and event.get("new_price_basis_session"):
-                require(event["new_price_basis_session"] > event["effective_date"], "unit basis must follow effective date")
+                strict = index == 0 or event.get("effective_phase") == "end_of_day"
+                require(event["new_price_basis_session"] > event["effective_date"] if strict else
+                    event["new_price_basis_session"] >= event["effective_date"], "invalid native unit basis date")
             if event.get("first_observed_at") is not None:
                 require(_instant(event["first_observed_at"]) <= _instant(cutoff), "unit event is later than display cutoff")
 

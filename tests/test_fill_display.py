@@ -113,6 +113,14 @@ class FillDisplayTests(unittest.TestCase):
         self.assertIsNone(_basis_reason(fill,[event],[event]))
         self.assertIsNone(_basis_reason(dict(fill,session='2024-01-03'),[event],[]))
 
+    def test_Data_scoped_event_keys_and_explicit_same_day_basis(self):
+        from axiom_engine.runtime.fill_display import _event_scope
+        event=dict(event_id='shared-native-id',security_id='s',event_type='unit_split',record_date='2024-01-02',
+            effective_date='2024-01-03',effective_phase='not_stated',new_price_basis_session='2024-01-03')
+        _event_scope([],[event,dict(event,security_id='another')],'2026-10-05T06:00:00Z')
+        self.assertEqual(_basis_reason(dict(security_id='s',session='2024-01-08'),[],[event]),'NEW_PRICE_BASIS_UNVERIFIED')
+        with self.assertRaises(ContractError):_event_scope([event],[],'2026-10-05T06:00:00Z')
+
     def test_equivalent_cutoff_timezones_preserve_wire(self):
         with tempfile.TemporaryDirectory() as temp:
             for i,cutoff in enumerate(('2026-10-05T06:17:55+00:00','2026-10-05T14:17:55+08:00','2026-10-05T06:17:55Z')):
