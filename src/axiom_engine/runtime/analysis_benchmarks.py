@@ -18,7 +18,8 @@ def _project_native(base, native, input_ref):
         close = None if row["close"] is None else decimal(row["close"])
         native_series.append(dict(native_session=row["session"],close=row["close"],
             available_at=row["available_at"],source_refs=row["source_refs"],
-            normalized_index=None if initial is None or close is None else str(close/initial)))
+            normalized_index=None if initial is None or close is None else str(close/initial),
+            benchmark_cumulative_return=None if initial is None or close is None else str(close/initial-1)))
     projected=[]
     for day,p in by_day.items():
         row=indexed.get(day)
@@ -33,6 +34,7 @@ def _project_native(base, native, input_ref):
         projected.append(dict(account_session=day,native_session=None if row is None else row["session"],
             close=None if row is None else row["close"],available_at=None if row is None else row["available_at"],
             source_refs=[] if row is None else row["source_refs"],normalized_index=None if norm is None else str(norm),
+            benchmark_cumulative_return=None if norm is None else str(norm-1),
             account_relative_wealth=relative,relative_status=status))
     complete=initial is not None and all(p["normalized_index"] is not None for p in projected)
     return dict(input_ref=input_ref,security_id=native["security_id"],currency=native["currency"],
@@ -59,11 +61,18 @@ def benchmark_comparisons(base, benchmarks):
                 anchor_session=anchor,anchor_close=None,native_series=[],series=[])
             continue
         require(isinstance(value,BenchmarkSeries),"BenchmarkSeries required")
-        require(key == "CSI300", "new benchmark native contract awaits the Data owner handoff")
         native=value.to_dict()
-        require(native == base["benchmark_input"] and value.identity == base["benchmark_ref"],
-                "original CSI300 benchmark cannot be replaced")
-        _validate_benchmark_wire(native,days,set())
+        if key == "CSI300":
+            require(native == base["benchmark_input"] and value.identity == base["benchmark_ref"],
+                    "original CSI300 benchmark cannot be replaced")
+            _validate_benchmark_wire(native,days,set())
+        else:
+            require(key == "SSE_COMPOSITE", "new benchmark native contract awaits the Data owner handoff")
+            from .retrospective_benchmark import validate_sse_for_base
+            validate_sse_for_base(native,base)
         inputs[key],refs[key]=native,value.identity
         comparisons[key]=_project_native(base,{**native,"currency":"CNY","timezone":"Asia/Shanghai"},value.identity)
+        if key == "SSE_COMPOSITE":
+            comparisons[key].update(observation_snapshot_id=native["snapshot_id"],observation_cutoff=native["knowledge_cutoff"],
+                observation_pit_policy=native["pit_policy"],observation_purpose=native["purpose"])
     return comparisons,inputs,refs

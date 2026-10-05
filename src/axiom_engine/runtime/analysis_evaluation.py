@@ -253,10 +253,13 @@ def verify_analysis_wire(wire):
     fields(wire["benchmark_inputs"]," ".join(BENCHMARK_KEYS));fields(wire["benchmark_refs"]," ".join(BENCHMARK_KEYS))
     for k in BENCHMARK_KEYS:
         native=wire["benchmark_inputs"][k]
-        if k != "CSI300":
+        if k == "NASDAQ100" or (k == "SSE_COMPOSITE" and native is None):
             require(native is None and wire["benchmark_refs"][k] is None and
                     wire["benchmark_comparisons"][k]["status"] == "SOURCE_UNAVAILABLE",
                     "new benchmark native contract awaits the Data owner handoff")
+        elif k == "SSE_COMPOSITE":
+            from .retrospective_benchmark import validate_sse_for_base
+            validate_sse_for_base(native,base)
         require(wire["benchmark_refs"][k] == (None if native is None else Document.from_dict(native).identity),
                 "saved benchmark input reference mismatch")
     require(wire["benchmark_inputs"]["CSI300"] == base["benchmark_input"], "original CSI300 benchmark changed")
@@ -375,12 +378,24 @@ def _validate_outputs(wire, base):
                     "unavailable benchmark cannot contain observations")
         else:
             native=wire["benchmark_inputs"][key]
-            require(key == "CSI300" and comparison["security_id"] == native["security_id"] and
+            require(key in ("CSI300","SSE_COMPOSITE") and comparison["security_id"] == native["security_id"] and
                 comparison["currency"] == "CNY" and comparison["timezone"] == "Asia/Shanghai" and
                 comparison["return_basis"] == native["series_kind"] and comparison["native_calendar"] == native["calendar"],
                 "saved comparison native metadata mismatch")
+            if key == "SSE_COMPOSITE":
+                require(all(comparison[output] == native[source] for output,source in
+                    (("observation_snapshot_id","snapshot_id"),("observation_cutoff","knowledge_cutoff"),
+                    ("observation_pit_policy","pit_policy"),("observation_purpose","purpose"))), "saved SSE observation scope differs")
             require([p["native_session"] for p in comparison["native_series"]] == native["calendar"],
                     "saved comparison native dates mismatch")
+            points=[*comparison["native_series"],*comparison["series"]]
+            percentages=["benchmark_cumulative_return" in point for point in points]
+            require(not any(percentages) or all(percentages),"partial benchmark percentage projection")
+            if all(percentages):
+                for point in points:
+                    require((point["benchmark_cumulative_return"] is None)==(point["normalized_index"] is None),
+                        "benchmark percentage null/boundary differs")
+                    _nullable_decimal(point["benchmark_cumulative_return"])
             for point,row in zip(comparison["native_series"],native["rows"]):
                 require(all(point[name] == row[name] for name in ("close","available_at","source_refs")),
                         "saved comparison native observations mismatch")
