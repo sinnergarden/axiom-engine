@@ -59,12 +59,13 @@ def fold(calendar, trades, reverse=False):
             "fold_spec": spec, "model": model, "prediction_frame": seal(frame, "signal_run_ref")}
 
 
-def scheduled_request(calendar=None, split=6, k=3):
+def scheduled_request(calendar=None, split=6, k=3, cash=False):
     calendar = calendar or CALENDAR
     folds = [fold(calendar, calendar[1:split]), fold(calendar, calendar[split:], reverse=True)]
     schedule = stock_prediction_schedule(folds=folds, calendar=calendar).to_dict()
     with patch.object(legacy, "DAYS", calendar):
-        plan = legacy.request().to_dict()
+        event = {**legacy.cash_event(), "record_date": calendar[1], "ex_date": calendar[2]}
+        plan = legacy.request(inputs=legacy.native_inputs([event]) if cash else None).to_dict()
     plan["contract_version"] = "backtest_request_v4"
     plan.pop("signal_frame")
     plan.update(account_id=f"synthetic-50w-top{k}", prediction_schedule=schedule,
@@ -203,6 +204,20 @@ class StockScheduleTests(unittest.TestCase):
                 save_fill_display(display, root/"display.json")
                 self.assertEqual(load_backtest_evaluation(root/"evaluation.json").payload, analysis.payload)
                 self.assertEqual(load_fill_display(root/"display.json").payload, display.payload)
+
+    def test_v4_stock_cash_receivable_and_unknown_payment_survive_saved_evaluation(self):
+        from test_analysis_evaluation import RF
+        run = run_backtest(scheduled_request(cash=True))
+        self.assertGreater(run.to_dict()["final_account"]["receivable_minor"], 0)
+        with patch.object(legacy, "DAYS", CALENDAR): benchmark = legacy.benchmark()
+        base = evaluate_backtest(run, benchmark=benchmark, spec=long_history_evaluation_spec(), dividend_scope=stock_dividend_scope(run))
+        self.assertEqual(base.to_dict()["episode_metrics"]["payment_unknown_count"], 1)
+        report = evaluate_saved_analysis(run, base, benchmarks={"CSI300": benchmark, "SSE_COMPOSITE": None, "NASDAQ100": None},
+                                         spec=analysis_evaluation_spec(risk_free=RF))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/"evaluation.json"; save_backtest_evaluation(report, path)
+            with patch("axiom_engine.runtime.backtest.run_backtest", side_effect=AssertionError("replay")):
+                self.assertEqual(load_backtest_evaluation(path).payload, report.payload)
 
     def test_caller_resource_budget_rejects_before_ledger_without_fold_cap(self):
         request = scheduled_request()
