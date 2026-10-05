@@ -1,6 +1,6 @@
 """Small synthetic v5 policies through the single owner Runtime and loaders."""
 from copy import deepcopy
-from decimal import Decimal
+from decimal import Decimal, Inexact, ROUND_DOWN, localcontext
 from pathlib import Path
 import tempfile
 import unittest
@@ -188,3 +188,37 @@ class ETFV5Tests(unittest.TestCase):
                 bad["content_digest"]=Document.from_dict(bad).identity
                 (root/"bad.json").write_text(Document.from_dict(bad).payload)
                 with self.assertRaisesRegex(ContractError,"binding mismatch"):load_backtest_run(root/"bad.json")
+
+    def test_saved_loader_uses_fixed_context_for_grid_admission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for hold in (False, True):
+                result = run(request(hold=hold))
+                path = root / ("hold.json" if hold else "rotation.json")
+                save_backtest_run(result, path)
+                with localcontext() as ctx, \
+                     patch("axiom_engine.runtime.backtest.AccountLedger", side_effect=AssertionError("ledger")):
+                    ctx.prec = 1
+                    ctx.rounding = ROUND_DOWN
+                    ctx.traps[Inexact] = True
+                    self.assertEqual(load_backtest_run(path).payload, result.payload)
+
+    def test_resealed_entry_links_and_strict_predecessor_are_rejected_without_replay(self):
+        original = run(request(hold=True)).to_dict()
+        mutations = [lambda w: w["fills"][0].update(order_id="not-entry-order"),
+            lambda w: w["fills"][0].update(side="SELL", session=DAYS[2]),
+            lambda w: w["orders"][0].update(intent_id="not-entry-intent"),
+            lambda w: w["decisions"][0].update(reference_session=w["plan"]["start_session"]),
+            lambda w: w["orders"][0].update(filled_quantity=0),
+            lambda w: w["orders"].append(deepcopy(w["orders"][0]))]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad.json"
+            for mutate in mutations:
+                wire = deepcopy(original)
+                mutate(wire)
+                wire.pop("content_digest")
+                wire["content_digest"] = Document.from_dict(wire).identity
+                path.write_text(Document.from_dict(wire).payload)
+                with patch("axiom_engine.runtime.backtest.AccountLedger", side_effect=AssertionError("ledger")):
+                    with self.assertRaisesRegex(ContractError, "entry"):
+                        load_backtest_run(path)
