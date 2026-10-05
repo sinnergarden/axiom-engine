@@ -119,6 +119,8 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
             "unsupported stock request/action policy")
     text(plan["account_id"]); session(plan["start_session"]); session(plan["end_session"])
     signal, signals = validate_stock_predictions(StockPredictionFrame.from_dict(plan["signal_frame"]))
+    require(signal["contract_version"] == "stock_prediction_run_v1",
+            "v2 neutral predictions only; account clock consumption is not admitted")
     universe = plan["execution_universe"]
     require(plan["prediction_universe"] == signal["universe"] and universe == supported_universe(signal["universe"]),
             "stock prediction/execution scope mismatch")
