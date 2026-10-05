@@ -124,6 +124,7 @@ def validate_stock_request(plan):
             "stock prediction/execution scope mismatch")
     require(bool(universe) and plan["supported_universe_ref"] == support_ref(universe), "stock support identity mismatch")
     policy = plan["portfolio_policy"]
+    fields(policy, "eligibility_id top_k rebalance budget_basis")
     require(policy == stock_portfolio_policy(top_k=policy.get("top_k"), execution_universe=universe),
             "unsupported stock portfolio policy")
     digest(plan["admission_ref"])
@@ -220,3 +221,18 @@ def validate_stock_request(plan):
     require(not plan["initial_account"]["positions"], "first stock path requires empty initial holdings")
     integer(plan["initial_account"]["cash_minor"], 1)
     return plan, signal, signals, market, calendar, indexed, profile
+
+
+def validate_saved_stock_core(wire):
+    """Check saved version tuples and decisions, without replaying the planner."""
+    version = wire["core_version"]
+    k = wire["plan"]["portfolio_policy"]["top_k"]
+    require(version in ("axiom.stock_portfolio/1", "axiom.stock_portfolio/2"), "unsupported saved stock Core")
+    if version == "axiom.stock_portfolio/1":
+        require(type(k) is int and k == 5, "legacy stock Core only supports Top5")
+    require(type(wire["decisions"]) is list, "saved decisions required")
+    for decision in wire["decisions"]:
+        require(decision.get("contract_version") == version, "saved decision/Core version mismatch")
+        if version == "axiom.stock_portfolio/2":
+            require(type(decision.get("top_k")) is int and decision["top_k"] == k,
+                    "saved decision/portfolio top_k mismatch")

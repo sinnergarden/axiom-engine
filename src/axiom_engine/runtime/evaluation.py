@@ -78,14 +78,12 @@ def _verify_run(run):
         _validate(BacktestRequest.from_dict(wire["plan"]))
         validate_saved_applications(wire)
     if wire["contract_version"] == "backtest_run_v3":
-        from .stock_inputs import validate_stock_request
+        from .stock_inputs import validate_stock_request, validate_saved_stock_core
         require(wire["runtime_version"] == "axiom.backtest/3" and
                 wire["core_version"] in ("axiom.stock_portfolio/1", "axiom.stock_portfolio/2") and
                 wire["stopped"] is None, "complete stock tuple required")
-        if wire["core_version"] == "axiom.stock_portfolio/1":
-            require(type(wire["plan"]["portfolio_policy"]["top_k"]) is int and
-                    wire["plan"]["portfolio_policy"]["top_k"] == 5, "legacy stock Core only supports Top5")
         validate_stock_request(wire["plan"])
+        validate_saved_stock_core(wire)
     return wire
 
 

@@ -75,5 +75,8 @@ class TopKTests(unittest.TestCase):
                 "runtime":wire["runtime_version"],"implementation_ref":wire["implementation_ref"]}).identity
             wire.pop("content_digest");wire["content_digest"]=Document.from_dict(wire).identity
             path=Path(tmp)/"legacy.json";path.write_text(Document.from_dict(wire).payload)
-            self.assertEqual(load_backtest_run(path).to_dict()["core_version"],"axiom.stock_portfolio/1")
+            with self.assertRaises(ContractError): load_backtest_run(path)
+            legacy = load_backtest_run(Path(__file__).parent/"fixtures/top5_run_v1.json")
+            self.assertEqual(legacy.to_dict()["core_version"],"axiom.stock_portfolio/1")
+            evaluate_backtest(legacy,benchmark=benchmark(),spec=long_history_evaluation_spec())
         self.assertEqual(evaluate_backtest(results[0],benchmark=benchmark(),spec=long_history_evaluation_spec()).to_dict()["input_run_ref"]["run_id"],three["run_id"])
