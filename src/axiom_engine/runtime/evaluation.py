@@ -117,7 +117,11 @@ def _provenance(wire):
 
 def _validate_benchmark(benchmark, required_sessions, snapshots):
     require(isinstance(benchmark, BenchmarkSeries), "BenchmarkSeries required")
-    wire = benchmark.to_dict()
+    return _validate_benchmark_wire(benchmark.to_dict(), required_sessions, snapshots)
+
+
+def _validate_benchmark_wire(wire, required_sessions, snapshots):
+    """Reuse the caller's decoded input when validating the same native proof."""
     fields(wire, "contract_version security_id series_kind unit calendar rows source_refs source_evidence limitations")
     require(wire["contract_version"] == "benchmark_series_v1" and wire["security_id"] == "000300.SH" and
             wire["series_kind"] == "price_index_excluding_dividends" and wire["unit"] == "index points",
@@ -350,11 +354,20 @@ def _evaluate(run, benchmark, spec, dividend_scope):
 
 def _verify_report(report):
     require(isinstance(report, EvaluationReport), "EvaluationReport required")
-    wire = report.to_dict()
-    require(wire.get("contract_version") in ("evaluation_report_v1", "evaluation_report_v2") and
+    return _verify_report_wire(report.to_dict())
+
+
+def _verify_report_wire(wire):
+    """Share one decoded input within a call, including an embedded saved base."""
+    require(wire.get("contract_version") in ("evaluation_report_v1", "evaluation_report_v2", "evaluation_report_v3") and
             wire.get("status") in ("COMPLETE", "PARTIAL"), "unsupported saved evaluation")
     recorded = wire.pop("content_digest", None)
     require(recorded == Document.from_dict(wire).identity, "saved evaluation content digest mismatch")
+    if wire["contract_version"] == "evaluation_report_v3":
+        from .analysis_evaluation import verify_analysis_wire
+        verify_analysis_wire(wire)
+        wire["content_digest"] = recorded
+        return wire
     long_period = wire["contract_version"] == "evaluation_report_v2"
     expected_spec = long_history_evaluation_spec() if long_period else daily_evaluation_spec()
     require(wire["spec"] == expected_spec.to_dict() and wire["evaluation_version"] ==
@@ -372,6 +385,8 @@ def _verify_report(report):
             "saved evaluation input identity mismatch")
     digest(wire["implementation_ref"])
     require(wire["evaluation_ref"] == _identity(wire), "saved evaluation identity mismatch")
+    wire["content_digest"] = recorded
+    return wire
 
 
 def save_backtest_evaluation(report, path):

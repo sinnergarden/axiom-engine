@@ -1,0 +1,69 @@
+"""Exact native-date display comparisons, without forward fill or FX inference."""
+from decimal import Decimal
+
+from ..core.contracts import fields, require
+from ..core.portfolio import decimal
+from .analysis_evaluation import BENCHMARK_KEYS
+
+
+def _project_native(base, native, input_ref):
+    """Internal normalized native observations; adapters own native input admission."""
+    anchor_day = base["period_metrics"]["window"]["anchor_session"]
+    indexed = {r["session"]:r for r in native["rows"]}
+    anchor = indexed.get(anchor_day)
+    initial = None if anchor is None or anchor["close"] is None else decimal(anchor["close"])
+    by_day = {p["session"]:p for p in base["series"]}
+    native_series=[]
+    for row in native["rows"]:
+        close = None if row["close"] is None else decimal(row["close"])
+        native_series.append(dict(native_session=row["session"],close=row["close"],
+            available_at=row["available_at"],source_refs=row["source_refs"],
+            normalized_index=None if initial is None or close is None else str(close/initial)))
+    projected=[]
+    for day,p in by_day.items():
+        row=indexed.get(day)
+        close=None if row is None or row["close"] is None else decimal(row["close"])
+        norm=None if close is None or initial is None else close/initial
+        if norm is None:
+            relative,status=None,"MISSING_BOUNDARY" if initial is None else "MISSING_OBSERVATION"
+        elif native["currency"] != "CNY":
+            relative,status=None,"FX_REQUIRED"
+        else:
+            relative,status=str(decimal(p["nav_index"])/norm-1),"PRICE_INDEX_PROXY"
+        projected.append(dict(account_session=day,native_session=None if row is None else row["session"],
+            close=None if row is None else row["close"],available_at=None if row is None else row["available_at"],
+            source_refs=[] if row is None else row["source_refs"],normalized_index=None if norm is None else str(norm),
+            account_relative_wealth=relative,relative_status=status))
+    complete=initial is not None and all(p["normalized_index"] is not None for p in projected)
+    return dict(input_ref=input_ref,security_id=native["security_id"],currency=native["currency"],
+        return_basis=native["series_kind"],native_calendar=native["calendar"],timezone=native["timezone"],
+        clock_scope="RETROSPECTIVE_LOCAL_SESSION",status="COMPLETE" if complete else "PARTIAL",
+        unavailable_reason=None,anchor_session=anchor_day,anchor_close=None if anchor is None else anchor["close"],
+        native_series=native_series,series=projected)
+
+
+def benchmark_comparisons(base, benchmarks):
+    from .evaluation import BenchmarkSeries, _validate_benchmark_wire
+    fields(benchmarks," ".join(BENCHMARK_KEYS))
+    anchor=base["period_metrics"]["window"]["anchor_session"]
+    days=[anchor,*[p["session"] for p in base["series"]]]
+    inputs,refs,comparisons={},{},{}
+    for key in BENCHMARK_KEYS:
+        value=benchmarks[key]
+        if value is None:
+            require(key != "CSI300","original CSI300 input is required")
+            inputs[key],refs[key]=None,None
+            comparisons[key]=dict(input_ref=None,security_id=None,currency=None,return_basis=None,
+                native_calendar=None,timezone=None,clock_scope="RETROSPECTIVE_LOCAL_SESSION",
+                status="SOURCE_UNAVAILABLE",unavailable_reason="OWNER_NATIVE_INPUT_NOT_SUPPLIED",
+                anchor_session=anchor,anchor_close=None,native_series=[],series=[])
+            continue
+        require(isinstance(value,BenchmarkSeries),"BenchmarkSeries required")
+        require(key == "CSI300", "new benchmark native contract awaits the Data owner handoff")
+        native=value.to_dict()
+        require(native == base["benchmark_input"] and value.identity == base["benchmark_ref"],
+                "original CSI300 benchmark cannot be replaced")
+        _validate_benchmark_wire(native,days,set())
+        inputs[key],refs[key]=native,value.identity
+        comparisons[key]=_project_native(base,{**native,"currency":"CNY","timezone":"Asia/Shanghai"},value.identity)
+    return comparisons,inputs,refs
