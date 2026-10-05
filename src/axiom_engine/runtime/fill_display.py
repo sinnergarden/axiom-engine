@@ -121,7 +121,7 @@ def _units(saved):
         require(saved["price_unit"] == "CNY/share" and saved["quantity_unit"] == "shares",
                 "stock account unit differs")
         return "CNY/share"
-    require(profile["contract_version"] == "daily_open_profile_v1", "ETF quantity contract required")
+    require(profile["contract_version"] == ("daily_open_profile_v2" if saved["contract_version"] == "backtest_run_v5" else "daily_open_profile_v1"), "ETF quantity contract required")
     return "CNY/fund unit"
 
 
@@ -134,10 +134,11 @@ def _unit_contract(saved):
 def _contract_unit(contract):
     fields(contract, "backtest_contract_version profile_contract_version quantity_unit price_unit")
     stock = contract["backtest_contract_version"] in ("backtest_run_v3", "backtest_run_v4")
-    require(contract["backtest_contract_version"] in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4") and
-        contract["profile_contract_version"] == ("stock_daily_open_profile_v1" if stock else "daily_open_profile_v1"),
+    v5 = contract["backtest_contract_version"] == "backtest_run_v5"
+    require(contract["backtest_contract_version"] in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4", "backtest_run_v5") and
+        contract["profile_contract_version"] == ("stock_daily_open_profile_v1" if stock else ("daily_open_profile_v2" if v5 else "daily_open_profile_v1")),
         "unsupported saved account unit contract")
-    require((contract["quantity_unit"], contract["price_unit"]) == (("shares", "CNY/share") if stock else (None, None)),
+    require((contract["quantity_unit"], contract["price_unit"]) == (("shares", "CNY/share") if stock else (("fund units", "CNY/fund unit") if v5 else (None, None))),
         "saved account unit metadata differs")
     return "CNY/share" if stock else "CNY/fund unit"
 

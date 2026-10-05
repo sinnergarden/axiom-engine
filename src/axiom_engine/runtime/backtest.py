@@ -1,6 +1,6 @@
 """Frozen cached-signal daily replay, Core decisions, SimBroker and accounting."""
 from datetime import date
-from decimal import Context, Decimal, ROUND_HALF_UP, localcontext
+from decimal import Context, Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, localcontext
 from pathlib import Path
 import re
 
@@ -30,20 +30,30 @@ class BacktestRun(Document):
     """One immutable, complete offline result; no live account side effects."""
 
 
-def _validate(request):
-    plan = request.to_dict()
+def _validate(request, *, decoded_plan=None):
+    plan = request.to_dict() if decoded_plan is None else decoded_plan
     if plan.get("contract_version") in ("backtest_request_v3", "backtest_request_v4"):
         from .stock_inputs import validate_stock_request
         return validate_stock_request(plan)
-    v2 = plan.get("contract_version") == "backtest_request_v2"
+    v5 = plan.get("contract_version") == "backtest_request_v5"
+    v2 = plan.get("contract_version") in ("backtest_request_v2", "backtest_request_v5")
     fields(plan, "contract_version account_id start_session end_session signal_frame market_replay initial_account profile" +
-           (" unit_split_policy" if v2 else ""))
-    require(plan["contract_version"] in ("backtest_request_v1", "backtest_request_v2"), "unsupported request")
+           (" unit_split_policy" if v2 else "") + (" portfolio_policy price_unit" if v5 else ""))
+    require(plan["contract_version"] in ("backtest_request_v1", "backtest_request_v2", "backtest_request_v5"), "unsupported request")
     if v2:
         require(plan["unit_split_policy"] == UNIT_SPLIT_POLICY, "unsupported unit split policy")
     text(plan["account_id"]); session(plan["start_session"]); session(plan["end_session"])
-    signal, signals = validate_signals(SignalFrame.from_dict(plan["signal_frame"]))
     market = plan["market_replay"]
+    if v5 and plan["signal_frame"] is None:
+        from ..core.etf_buy_hold import validate_buy_hold_policy
+        validate_buy_hold_policy(plan["portfolio_policy"])
+        universe = market["universe"]
+        require(type(universe) is list and bool(universe) and all(type(s) is str for s in universe) and
+                len(set(universe)) == len(universe), "unique explicit ETF universe required")
+        signal, signals = None, {}
+    else:
+        signal, signals = validate_signals(SignalFrame.from_dict(plan["signal_frame"]))
+        universe = signal["universe"]
     fields(market, "contract_version price_basis calendar universe rows cash_dividends source_refs source_evidence limitations" +
            (" unit_splits" if v2 else ""))
     require(market["contract_version"] == ("market_replay_v2" if v2 else "market_replay_v1") and
@@ -52,8 +62,8 @@ def _validate(request):
     require(type(calendar) is list and bool(calendar) and calendar == sorted(set(calendar)), "explicit ordered calendar required")
     for day in calendar:
         session(day)
-    require(set(market["universe"]) == set(signal["universe"]) and
-            len(market["universe"]) == len(signal["universe"]), "signal/market universe mismatch")
+    require(set(market["universe"]) == set(universe) and
+            len(market["universe"]) == len(universe), "signal/market universe mismatch")
     require(plan["start_session"] in calendar and plan["end_session"] in calendar and
             calendar.index(plan["start_session"]) > 0 and plan["start_session"] <= plan["end_session"], "scope needs prior trading session")
     require(type(market["limitations"]) is list and type(market["source_refs"]) is list and bool(market["source_refs"]), "market provenance required")
@@ -62,7 +72,7 @@ def _validate(request):
     indexed = {}
     for row in market["rows"]:
         fields(row, "security_id session open close volume_units limit_up limit_down close_available_at market_state state_reason source_refs")
-        require(row["security_id"] in signal["universe"] and row["session"] in calendar, "market key outside scope")
+        require(row["security_id"] in universe and row["session"] in calendar, "market key outside scope")
         for name in ("open", "close", "limit_up", "limit_down"):
             if row[name] is not None:
                 require(decimal(row[name], minimum=0) > 0, "positive market price required")
@@ -74,6 +84,11 @@ def _validate(request):
             for name in ("open", "close"):
                 require(row[name] is None or lower <= decimal(row[name]) <= upper,
                         "market price outside declared limits")
+        if v5:
+            for name in ("open", "close"):
+                if row[name] is not None:
+                    require(row["limit_up"] is None or decimal(row[name]) <= decimal(row["limit_up"]), "market price above known limit")
+                    require(row["limit_down"] is None or decimal(row[name]) >= decimal(row["limit_down"]), "market price below known limit")
         timestamp(row["close_available_at"])
         require(row["market_state"] in ("normal_trading", "unknown_status", "suspended", "source_gap"),
                 "unsupported market state, listing or calendar scope")
@@ -87,14 +102,14 @@ def _validate(request):
         key = row["session"], row["security_id"]
         require(key not in indexed, "duplicate market key")
         indexed[key] = row
-    require(set(indexed) == {(d, s) for d in calendar for s in signal["universe"]}, "incomplete market key coverage")
+    require(set(indexed) == {(d, s) for d in calendar for s in universe}, "incomplete market key coverage")
     actions = market["cash_dividends"]
     seen = set()
     require(type(actions) is list, "explicit corporate action scope required")
     for action in actions:
         fields(action, "event_id security_id record_session ex_session pay_session cash_per_unit source_refs")
         text(action["event_id"])
-        require(action["event_id"] not in seen and action["security_id"] in signal["universe"], "duplicate/unknown action")
+        require(action["event_id"] not in seen and action["security_id"] in universe, "duplicate/unknown action")
         seen.add(action["event_id"])
         for key in ("record_session", "ex_session", "pay_session"):
             session(action[key])
@@ -110,8 +125,9 @@ def _validate(request):
         require(not (plan["initial_account"]["positions"] and action["record_session"] < plan["start_session"] <= action["pay_session"]),
                 "initial dividend entitlements require an explicit supported seed")
     profile = plan["profile"]
-    fields(profile, "contract_version lot_size settlement_sessions commission_rate minimum_commission_minor tax_rate slippage_bps participation_rate decision_time_utc execution approximation unknown_status_policy limitation")
-    require(profile["contract_version"] == "daily_open_profile_v1" and
+    fields(profile, "contract_version lot_size settlement_sessions commission_rate minimum_commission_minor tax_rate slippage_bps participation_rate decision_time_utc execution approximation unknown_status_policy limitation" +
+           (" price_limit_policy price_grid_policy price_grid_ref price_grid" if v5 else ""))
+    require(profile["contract_version"] == ("daily_open_profile_v2" if v5 else "daily_open_profile_v1") and
             profile["execution"] == "open" and profile["approximation"] == "daily_volume_proxy", "unsupported execution profile")
     integer(profile["lot_size"], 1); integer(profile["settlement_sessions"])
     integer(profile["minimum_commission_minor"])
@@ -124,9 +140,12 @@ def _validate(request):
     text(profile["limitation"])
     require(profile["unknown_status_policy"] in ("block", "etf_daily_observed"), "unsupported unknown-status policy")
     if profile["unknown_status_policy"] == "etf_daily_observed":
-        require(all(re.fullmatch(r"cn\.etf\.(SSE|SZSE)\.\d{6}\.\d{8}", s) for s in signal["universe"]),
+        require(all(re.fullmatch(r"cn\.etf\.(SSE|SZSE)\.\d{6}\.\d{8}", s) for s in universe),
                 "observed-daily profile requires canonical ETF identities")
     fields(plan["initial_account"], "cash_minor positions")
+    if v5:
+        from .etf_inputs import validate_v5_plan
+        validate_v5_plan(plan, profile, universe)
     if v2:
         validate_unit_splits(market, plan["start_session"], plan["end_session"])
     return plan, signal, signals, market, calendar, indexed, profile
@@ -179,7 +198,9 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
             order["reason"] = "UNKNOWN_MARKET_STATUS" if row["market_state"] == "unknown_status" else "NOT_TRADING"
             return order
         order["execution_admission"] = "STOCK_OBSERVED_DAILY_ASSUMPTION" if stock else "ETF_OBSERVED_DAILY_ASSUMPTION"
-    if any(row[key] is None for key in ("open", volume_field, "limit_up", "limit_down")):
+    etf_v2 = profile["contract_version"] == "daily_open_profile_v2"
+    required = ("open", volume_field) if etf_v2 and profile["price_limit_policy"] == "known_only" else ("open", volume_field, "limit_up", "limit_down")
+    if any(row[key] is None for key in required):
         order["reason"] = "MISSING_EXECUTION_FACT"
         return order
     if Decimal(row[volume_field]) <= 0:
@@ -188,11 +209,27 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
     opening = decimal(row["open"])
     buy = intent["side"] == "BUY"
     price = opening * (1 + decimal(profile["slippage_bps"]) / 10000 * (1 if buy else -1))
+    rounding = {}
+    if etf_v2:
+        from .etf_grid import price_tick_for
+        tick = decimal(price_tick_for(profile, intent["security_id"]))
+        if opening % tick != 0:
+            order["reason"] = "PRICE_TICK"
+            return order
+        raw = price
+        price = (raw / tick).to_integral_value(rounding=ROUND_CEILING if buy else ROUND_FLOOR) * tick
+        rounding = dict(raw_slipped_price=str(raw), price_tick=str(tick), price_grid_ref=profile["price_grid_ref"],
+            price_rounding="adverse_tick", rounding_delta=str(price - raw),
+            effective_slippage_bps=str(((price / opening - 1) if buy else (1 - price / opening)) * 10000))
+        order.update(rounding)
+        if price <= 0:
+            order["reason"] = "INVALID_EXECUTION_PRICE"
+            return order
     if stock and price % decimal(profile["price_tick"]) != 0:
         order["reason"] = "PRICE_TICK"
         return order
-    if (price > decimal(row["limit_up"]) or price < decimal(row["limit_down"]) or
-            (buy and price == decimal(row["limit_up"])) or (not buy and price == decimal(row["limit_down"]))):
+    if ((row["limit_up"] is not None and (price > decimal(row["limit_up"]) or (buy and price == decimal(row["limit_up"])))) or
+            (row["limit_down"] is not None and (price < decimal(row["limit_down"]) or (not buy and price == decimal(row["limit_down"]))))):
         order["reason"] = "PRICE_LIMIT"
         return order
     lot = profile["lot_size"]
@@ -235,6 +272,7 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
             "source_refs": row["source_refs"]}
     fill.update({"market_state": row["market_state"], "state_reason": row["state_reason"],
                  "execution_admission": order["execution_admission"]})
+    fill.update(rounding)
     if stock:
         fill.update(stamp_tax_minor=tax, transfer_fee_minor=transfer, quantity_unit="shares",
                     execution_evidence_cutoff=row["execution_evidence_cutoff"], field_available_at=row["field_available_at"])
@@ -249,20 +287,24 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
 def run_backtest(request, *, limits=None):
     """Run an explicit frozen request; no Data/Research import, discovery or I/O."""
     require(isinstance(request, BacktestRequest), "BacktestRequest required")
+    decoded_plan = None
     if limits is not None:
         from .stock_schedule import _resource_preflight
-        _resource_preflight(request, limits)
+        decoded_plan = _resource_preflight(request, limits)
     with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
-        return _run(request)
+        return _run(request, decoded_plan=decoded_plan)
 
 
-def _run(request):
-    plan, signal, signals, market, calendar, rows, profile = _validate(request)
-    v2 = plan["contract_version"] == "backtest_request_v2"
+def _run(request, *, decoded_plan=None):
+    plan, signal, signals, market, calendar, rows, profile = _validate(request, decoded_plan=decoded_plan)
+    v5 = plan["contract_version"] == "backtest_request_v5"
+    v2 = plan["contract_version"] in ("backtest_request_v2", "backtest_request_v5")
     v4 = plan["contract_version"] == "backtest_request_v4"
     stock = plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4")
-    runtime = "axiom.backtest/4" if v4 else ("axiom.backtest/3" if stock else (RUNTIME_VERSION if v2 else LEGACY_RUNTIME_VERSION))
-    core_version = TOPK_PORTFOLIO_VERSION if stock else PORTFOLIO_VERSION
+    hold = v5 and plan["portfolio_policy"]["contract_version"] == "etf_buy_and_hold_policy_v1"
+    from ..core.etf_buy_hold import BUY_HOLD_VERSION, plan_etf_buy_and_hold
+    runtime = "axiom.backtest/5" if v5 else ("axiom.backtest/4" if v4 else ("axiom.backtest/3" if stock else (RUNTIME_VERSION if v2 else LEGACY_RUNTIME_VERSION)))
+    core_version = BUY_HOLD_VERSION if hold else (TOPK_PORTFOLIO_VERSION if stock else PORTFOLIO_VERSION)
     splits = market.get("unit_splits", [])
     run_id = Document.from_dict({"request": plan, "core": core_version, "runtime": runtime,
                                 "implementation_ref": IMPLEMENTATION_REF}).identity
@@ -296,15 +338,19 @@ def _run(request):
                     if action[key] == day and action["event_id"] in entitlements:
                         ledger.dividend(action, phase, entitlements.get(action["event_id"], 0))
             previous = calendar[index - 1]
-            if date.fromisoformat(day).isocalendar()[:2] != date.fromisoformat(previous).isocalendar()[:2]:
+            rebalance = day == plan["start_session"] if hold else date.fromisoformat(day).isocalendar()[:2] != date.fromisoformat(previous).isocalendar()[:2]
+            if rebalance:
                 active, active_rows = signals[day] if v4 else (signal, signals)
-                first = active_rows.get((previous, active["universe"][0]))
-                require(first is not None, "missing previous-session signal")
-                context = {"trade_session": day, "feature_session": previous,
-                           "decision_time": day + "T" + profile["decision_time_utc"],
-                           "knowledge_cutoff": first["knowledge_cutoff"], "reference_prices": quotes,
+                context = {"trade_session": day, "decision_time": day + "T" + profile["decision_time_utc"], "reference_prices": quotes,
                            "account_state_version": ledger.sequence,
                            **{key: profile[key] for key in ("lot_size", "commission_rate", "minimum_commission_minor", "slippage_bps")}}
+                if hold:
+                    context.update(reference_session=previous, reference_cutoff=previous + "T12:30:00Z", tax_rate=profile["tax_rate"])
+                    decision = plan_etf_buy_and_hold(plan["portfolio_policy"], account=ledger.account(), context=context).to_dict()
+                else:
+                    first = active_rows.get((previous, active["universe"][0]))
+                    require(first is not None, "missing previous-session signal")
+                    context.update(feature_session=previous, knowledge_cutoff=first["knowledge_cutoff"])
                 if stock:
                     context.update(supported_security_ids=plan["execution_universe"], supported_universe_ref=plan["supported_universe_ref"])
                     if v4:
@@ -314,7 +360,7 @@ def _run(request):
                     else:
                         decision = plan_stock_portfolio(StockPredictionFrame.from_dict(signal), account=ledger.account(),
                             context=context, top_k=plan["portfolio_policy"]["top_k"]).to_dict()
-                else:
+                elif not hold:
                     context["tax_rate"] = profile["tax_rate"]
                     decision = plan_rotation(SignalFrame.from_dict(signal), account=ledger.account(), context=context).to_dict()
                 if v2 or stock:
@@ -378,8 +424,8 @@ def _run(request):
     for point in nav:
         peak = max(peak, point["nav_minor"])
         drawdown = min(drawdown, Decimal(point["nav_minor"]) / peak - 1)
-    result = {"contract_version": "backtest_run_v4" if v4 else ("backtest_run_v3" if stock else ("backtest_run_v2" if v2 else "backtest_run_v1")), "run_id": run_id, "account_id": plan["account_id"],
-        "status": "BLOCKED" if stopped else "COMPLETE", "plan": plan, "signal_ref": signal["schedule_ref"] if v4 else signal["signal_run_ref"],
+    result = {"contract_version": "backtest_run_v5" if v5 else ("backtest_run_v4" if v4 else ("backtest_run_v3" if stock else ("backtest_run_v2" if v2 else "backtest_run_v1"))), "run_id": run_id, "account_id": plan["account_id"],
+        "status": "BLOCKED" if stopped else "COMPLETE", "plan": plan, "signal_ref": None if hold else (signal["schedule_ref"] if v4 else signal["signal_run_ref"]),
         "market_ref": MarketReplay.from_dict(market).identity, "profile_ref": Document.from_dict(profile).identity,
         "core_version": core_version, "runtime_version": runtime,
         "implementation_ref": IMPLEMENTATION_REF,
@@ -408,6 +454,9 @@ def _run(request):
             "ETF unit replacement applies visible planned arrangements under a single-holder fully settled EOD simulation model; APPLIED is not issuer implemented status.",
             "Date-only next-open availability is best effort; actual receipt remains unchanged and strict historical PIT is not established.",
             "Issuer not_stated phase remains native; EOD and no extra T+1 are Runtime conventions. UNKNOWN and missing bars remain; disclosed full-session suspension is an additional hard block."])
+    if v5:
+        result.update(portfolio_policy_ref=Document.from_dict(plan["portfolio_policy"]).identity,
+                      price_unit=plan["price_unit"], quantity_unit="fund units")
     if stock:
         result.update(quantity_unit="shares", price_unit="CNY/share", stopped=stopped,
                       admission_ref=plan["admission_ref"], supported_universe_ref=plan["supported_universe_ref"])
@@ -438,7 +487,7 @@ def load_backtest_run(path):
     wire = saved.to_dict()
     v4 = wire.get("contract_version") == "backtest_run_v4"
     stock = wire.get("contract_version") in ("backtest_run_v3", "backtest_run_v4")
-    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4") and
+    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4", "backtest_run_v5") and
             wire.get("status") in (("COMPLETE", "BLOCKED") if stock else ("COMPLETE",)), "unsupported saved result")
     recorded_digest = wire.pop("content_digest", None)
     require(recorded_digest == Document.from_dict(wire).identity, "saved result content digest mismatch")
@@ -452,6 +501,9 @@ def load_backtest_run(path):
         _validate(BacktestRequest.from_dict(wire["plan"]))
         from .unit_splits import validate_saved_applications
         validate_saved_applications(wire)
+    if wire["contract_version"] == "backtest_run_v5":
+        from .etf_inputs import validate_saved_v5
+        validate_saved_v5(wire)
     if stock:
         require(wire["runtime_version"] == ("axiom.backtest/4" if v4 else "axiom.backtest/3") and
                 wire["core_version"] in (STOCK_PORTFOLIO_VERSION, TOPK_PORTFOLIO_VERSION) and

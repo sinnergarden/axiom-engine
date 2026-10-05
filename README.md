@@ -4,13 +4,17 @@ Shared deterministic computation for Axiom. Core and Runtime are distinct
 logical owners in this independent repository. Core owns features and pure
 rotation decisions; Runtime owns an offline cached-signal replay and account ledger.
 
-The source package version is `0.3.0`, also exposed as `axiom_engine.__version__`.
-This is the first package version declaring the public
+The source package version is `0.3.1`, also exposed as `axiom_engine.__version__`.
+Version `0.3.0` first declares the public
 `axiom_engine.core.evaluate_signal_statistics(input, *, spec)` API and the Runtime
 `stock_prediction_schedule(*, folds, calendar)` API. Consumers requiring these
 APIs must declare `axiom-engine>=0.3.0` and retain their reviewed source commit
 lock. Signal statistics retain `signal_statistics_input_v1` / `signal_statistics_v1`
 data contracts; package versions and saved contract versions are separate.
+Version `0.3.1` adds the ETF profile/grid and request/run v5, the pure
+`etf_buy_and_hold_policy` / `plan_etf_buy_and_hold` API, and the explicit
+`benchmark_comparison_v2` evaluation projection. Consumers of these additions
+must require `axiom-engine>=0.3.1` and lock the reviewed source commit.
 
 E0 PR1 exposes `axiom_engine.core.execute_feature_plan` with immutable explicit
 FactBatch, FeaturePlan and ExecutionContext inputs. See [ABI](docs/ABI.md),

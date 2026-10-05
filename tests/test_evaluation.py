@@ -132,7 +132,7 @@ def scope(run, extra=()):
         status='value', missing_reason=None, usable_from=r['record_date']+'T12:00:00Z') for r in raw]
     batch = dict(records=raw, field_meta={n:dict(unit='CNY/fund unit' if n=='cash_dividend_per_unit' else None, by_key=meta) for n in names},
         context=dict(contract_version='data_batch_v1', domain='corporate_actions', snapshot_id='s_synthetic', reader_version='synthetic_reader',
-            logical_key=['security_id','announcement_date','process_status'], query=dict(fields=names, symbols=w['plan']['signal_frame']['universe'],
+            logical_key=['security_id','announcement_date','process_status'], query=dict(fields=names, symbols=w['plan']['market_replay']['universe'],
                 start=w['plan']['start_session'], end=w['plan']['end_session'], cutoff=w['plan']['end_session']+'T20:30:00+08:00',
                 purpose='market_replay', pit_policy='best_effort_vendor_v1', time_field='record_date', filters={})))
     ref = Document.from_dict(batch).identity
@@ -141,7 +141,7 @@ def scope(run, extra=()):
         available_at=r['record_date']+'T12:00:00Z',source_refs=[ref]) for r in raw]
     return DividendScope.from_dict(dict(contract_version='dividend_scope_v1', coverage='observed_records_only',
         start_session=w['plan']['start_session'], end_session=w['plan']['end_session'],
-        knowledge_cutoff=w['plan']['end_session'] + 'T12:30:00Z', universe=w['plan']['signal_frame']['universe'],
+        knowledge_cutoff=w['plan']['end_session'] + 'T12:30:00Z', universe=w['plan']['market_replay']['universe'],
         actions=sorted(actions,key=lambda a:a['event_id']), source_refs=[ref],
         source_evidence=[dict(reference=ref,batch=batch)], limitations=['Synthetic known record-date scope.']))
 

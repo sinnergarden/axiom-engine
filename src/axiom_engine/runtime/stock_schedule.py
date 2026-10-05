@@ -125,3 +125,4 @@ def _resource_preflight(request, limits):
               "max_market_rows": len(plan["market_replay"]["rows"])}
     for name, value in counts.items():
         require(value <= limits[name], f"Stock resource budget exceeded: {name}={value} > {limits[name]}")
+    return plan
