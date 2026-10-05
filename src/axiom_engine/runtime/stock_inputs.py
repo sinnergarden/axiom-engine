@@ -124,6 +124,12 @@ def _validate_pair_proof(evidence, signal, universe, calendar, batches):
                     "stock pair batch binding mismatch")
             if kind == "membership":
                 require(query.get("fields") == ["is_member"] and query.get("universe_id") == "csi300", "stock member proof query mismatch")
+                if v2:
+                    cutoffs = query.get("cutoff_by_session")
+                    require(type(cutoffs) is dict and set(cutoffs) == set(expected_sessions),
+                            "stock member proof cutoff session coverage mismatch")
+                    require(all(instant(cutoffs[day]) == instant(day + "T20:30:00+08:00") for day in expected_sessions),
+                            "stock member proof must retain original Feature cutoff")
     for key, batch in (("execution-states", batches[0]), ("execution-market", batches[1]), ("execution-factor", batches[3])):
         entry = manifests[key]
         require(entry["wire_ref"] == native_ref(batch) and entry["query"] == batch["context"]["query"] and

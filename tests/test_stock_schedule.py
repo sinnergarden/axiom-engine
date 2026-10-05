@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from axiom_engine.core import ContractError, StockPredictionFrame, plan_stock_portfolio
 from axiom_engine.core.contracts import Document
-from axiom_engine.runtime import (BacktestRequest, run_backtest, stock_prediction_schedule,
+from axiom_engine.runtime import (BacktestRequest, BacktestRun, run_backtest, stock_prediction_schedule,
     stock_portfolio_policy, save_backtest_run, load_backtest_run, evaluate_backtest,
     long_history_evaluation_spec, stock_dividend_scope)
 from axiom_engine.runtime import (analysis_evaluation_spec, evaluate_saved_analysis,
@@ -295,3 +295,60 @@ class StockScheduleTests(unittest.TestCase):
         public = plan_stock_portfolio(StockPredictionFrame.from_dict(frame), account={"cash_minor": 50000000,
             "positions": {}, "version": decision["expected_account_version"]}, context=context, top_k=3).to_dict()
         self.assertEqual(public, decision)
+
+    def test_evaluation_rejects_resealed_stock_run_request_version_mismatch_before_admission(self):
+        for version in (3, 4):
+            if version == 4:
+                run = run_backtest(scheduled_request())
+                with patch.object(legacy, "DAYS", CALENDAR): benchmark = legacy.benchmark()
+            else:
+                run = run_backtest(legacy.request())
+                benchmark = legacy.benchmark()
+            wire = run.to_dict()
+            other = 3 if version == 4 else 4
+            wire.update(contract_version=f"backtest_run_v{other}", runtime_version=f"axiom.backtest/{other}")
+            wire["decisions"][0]["trade_session"] = "2024-01-09"
+            if version == 4:
+                wire["decisions"][0]["prediction_clock"]["inference_cutoff"] = "2024-01-10T21:00:00+08:00"
+            wire["run_id"] = Document.from_dict({"request": wire["plan"], "core": wire["core_version"],
+                "runtime": wire["runtime_version"], "implementation_ref": wire["implementation_ref"]}).identity
+            forged = BacktestRun.from_dict(seal(wire, "content_digest"))
+            with self.subTest(actual_request=version), patch.object(stock_inputs, "validate_stock_request", side_effect=AssertionError("native admission started")):
+                with self.assertRaisesRegex(ContractError, "complete stock tuple"):
+                    evaluate_backtest(forged, benchmark=benchmark, spec=long_history_evaluation_spec())
+
+    def test_input_byte_budget_rejects_before_decoding_request(self):
+        request = scheduled_request()
+        limits = {"max_folds": 2, "max_prediction_rows": 60, "max_market_rows": 66,
+                  "max_input_bytes": len(request.payload.encode("utf-8"))-1}
+        with patch.object(BacktestRequest, "to_dict", side_effect=AssertionError("request decoded")), \
+             patch("axiom_engine.runtime.backtest.AccountLedger", side_effect=AssertionError("ledger started")):
+            with self.assertRaisesRegex(ContractError, "budget exceeded: max_input_bytes"):
+                run_backtest(request, limits=limits)
+
+    def test_v4_membership_query_keeps_complete_original_feature_cutoffs(self):
+        for side in ("model", "execution"):
+            for mutation in ("late", "missing", "extra"):
+                plan = scheduled_request().to_dict()
+                clocks = plan["admission_evidence"]["batches"][side+"-membership"]["query"]["cutoff_by_session"]
+                if mutation == "late": clocks[CALENDAR[0]] = CALENDAR[0]+"T21:00:00+08:00"
+                if mutation == "missing": clocks.pop(CALENDAR[0])
+                if mutation == "extra": clocks["2024-01-22"] = "2024-01-22T20:30:00+08:00"
+                reseal_schedule(plan)
+                with self.subTest(side=side, mutation=mutation), patch("axiom_engine.runtime.backtest.AccountLedger", side_effect=AssertionError("ledger started")):
+                    with self.assertRaisesRegex(ContractError, "member.*cutoff"):
+                        run_backtest(BacktestRequest.from_dict(plan))
+        plan = scheduled_request().to_dict()
+        for side in ("model", "execution"):
+            query = plan["admission_evidence"]["batches"][side+"-membership"]["query"]
+            query["cutoff_by_session"] = {day: day+"T12:30:00Z" for day in CALENDAR}
+        reseal_schedule(plan)
+        self.assertEqual(run_backtest(BacktestRequest.from_dict(plan)).to_dict()["status"], "COMPLETE")
+
+    def test_old_v3_member_receipt_loading_does_not_gain_new_v4_clock_gate(self):
+        plan = legacy.request().to_dict()
+        plan["admission_evidence"]["batches"]["model-membership"]["query"]["cutoff_by_session"][legacy.DAYS[0]] = legacy.DAYS[0]+"T21:00:00+08:00"
+        plan["admission_evidence"] = seal(plan["admission_evidence"], "admission_ref")
+        plan["admission_ref"] = plan["admission_evidence"]["admission_ref"]
+        # Saved v1/Top5 admission retains its historical shape and rules.
+        stock_inputs.validate_stock_request(plan, legacy_saved_top5=True)

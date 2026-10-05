@@ -80,6 +80,7 @@ def _verify_run(run):
     if wire["contract_version"] in ("backtest_run_v3", "backtest_run_v4"):
         from .stock_inputs import validate_stock_request, validate_saved_stock_core
         require(wire["runtime_version"] == ("axiom.backtest/4" if wire["contract_version"] == "backtest_run_v4" else "axiom.backtest/3") and
+                wire["plan"]["contract_version"] == ("backtest_request_v4" if wire["contract_version"] == "backtest_run_v4" else "backtest_request_v3") and
                 wire["core_version"] in ("axiom.stock_portfolio/1", "axiom.stock_portfolio/2") and
                 wire["stopped"] is None, "complete stock tuple required")
         validate_stock_request(wire["plan"], legacy_saved_top5=wire["core_version"] == "axiom.stock_portfolio/1")
