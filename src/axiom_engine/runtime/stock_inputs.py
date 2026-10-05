@@ -2,7 +2,7 @@
 import re
 
 from ..core.contracts import Document, digest, fields, integer, require, session, text
-from ..core.stock_portfolio import BUDGET_BASIS, StockPredictionFrame, instant, validate_stock_predictions
+from ..core.stock_portfolio import BUDGET_BASIS, StockPredictionFrame, instant, validate_stock_predictions, validate_top_k
 from ..core.portfolio import decimal
 from .profiles import stock_daily_open_profile
 from .stock_evidence import native_batches, native_ref
@@ -10,6 +10,16 @@ from .stock_evidence import native_batches, native_ref
 ELIGIBILITY_ID = "sz_main_a_000_002_003_v1"
 ACTION_POLICY = "observed_implemented_only"
 TAX_CONVENTION = "gross_before_tax_no_personal_tax_model"
+
+
+def stock_portfolio_policy(*, top_k: int, execution_universe: list[str]) -> dict:
+    """Pure explicit TopK configuration; never read members, prices or predictions."""
+    require(type(execution_universe) is list and bool(execution_universe) and
+            execution_universe == supported_universe(execution_universe) and
+            len(set(execution_universe)) == len(execution_universe), "frozen supported execution universe required")
+    validate_top_k(top_k, execution_universe)
+    return {"eligibility_id": ELIGIBILITY_ID, "top_k": top_k,
+            "rebalance": "weekly_first_trading_session", "budget_basis": BUDGET_BASIS}
 
 
 def supported_universe(universe):
@@ -103,7 +113,7 @@ def _validate_pair_proof(evidence, signal, universe, calendar, batches):
                 entry["reader_version"] == batch["context"]["reader_version"], "stock execution facts differ from admitted batches")
 
 
-def validate_stock_request(plan):
+def validate_stock_request(plan, *, legacy_saved_top5=False):
     fields(plan, "contract_version account_id start_session end_session signal_frame market_replay initial_account profile prediction_universe execution_universe supported_universe_ref portfolio_policy admission_ref admission_evidence stock_action_policy")
     require(plan["contract_version"] == "backtest_request_v3" and plan["stock_action_policy"] == ACTION_POLICY,
             "unsupported stock request/action policy")
@@ -113,8 +123,12 @@ def validate_stock_request(plan):
     require(plan["prediction_universe"] == signal["universe"] and universe == supported_universe(signal["universe"]),
             "stock prediction/execution scope mismatch")
     require(bool(universe) and plan["supported_universe_ref"] == support_ref(universe), "stock support identity mismatch")
-    require(plan["portfolio_policy"] == {"eligibility_id": ELIGIBILITY_ID, "top_k": 5,
-            "rebalance": "weekly_first_trading_session", "budget_basis": BUDGET_BASIS}, "unsupported stock portfolio policy")
+    policy = plan["portfolio_policy"]
+    fields(policy, "eligibility_id top_k rebalance budget_basis")
+    expected = ({"eligibility_id": ELIGIBILITY_ID, "top_k": 5,
+                 "rebalance": "weekly_first_trading_session", "budget_basis": BUDGET_BASIS}
+                if legacy_saved_top5 else stock_portfolio_policy(top_k=policy.get("top_k"), execution_universe=universe))
+    require(policy == expected and type(policy["top_k"]) is int, "unsupported stock portfolio policy")
     digest(plan["admission_ref"])
     evidence = dict(plan["admission_evidence"])
     recorded = evidence.pop("admission_ref", None)
@@ -209,3 +223,18 @@ def validate_stock_request(plan):
     require(not plan["initial_account"]["positions"], "first stock path requires empty initial holdings")
     integer(plan["initial_account"]["cash_minor"], 1)
     return plan, signal, signals, market, calendar, indexed, profile
+
+
+def validate_saved_stock_core(wire):
+    """Check saved version tuples and decisions, without replaying the planner."""
+    version = wire["core_version"]
+    k = wire["plan"]["portfolio_policy"]["top_k"]
+    require(version in ("axiom.stock_portfolio/1", "axiom.stock_portfolio/2"), "unsupported saved stock Core")
+    if version == "axiom.stock_portfolio/1":
+        require(type(k) is int and k == 5, "legacy stock Core only supports Top5")
+    require(type(wire["decisions"]) is list, "saved decisions required")
+    for decision in wire["decisions"]:
+        require(decision.get("contract_version") == version, "saved decision/Core version mismatch")
+        if version == "axiom.stock_portfolio/2":
+            require(type(decision.get("top_k")) is int and decision["top_k"] == k,
+                    "saved decision/portfolio top_k mismatch")

@@ -6,7 +6,7 @@ import re
 
 from .._implementation import IMPLEMENTATION_REF
 from ..core import SignalFrame, plan_rotation, StockPredictionFrame, plan_stock_portfolio
-from ..core.stock_portfolio import STOCK_PORTFOLIO_VERSION
+from ..core.stock_portfolio import STOCK_PORTFOLIO_VERSION, TOPK_PORTFOLIO_VERSION
 from ..core.contracts import Document, digest, fields, integer, require, session, text, timestamp
 from ..core.portfolio import PORTFOLIO_VERSION, decimal, minor, validate_signals
 from .accounting import AccountLedger
@@ -257,7 +257,7 @@ def _run(request):
     v2 = plan["contract_version"] == "backtest_request_v2"
     stock = plan["contract_version"] == "backtest_request_v3"
     runtime = "axiom.backtest/3" if stock else (RUNTIME_VERSION if v2 else LEGACY_RUNTIME_VERSION)
-    core_version = STOCK_PORTFOLIO_VERSION if stock else PORTFOLIO_VERSION
+    core_version = TOPK_PORTFOLIO_VERSION if stock else PORTFOLIO_VERSION
     splits = market.get("unit_splits", [])
     run_id = Document.from_dict({"request": plan, "core": core_version, "runtime": runtime,
                                 "implementation_ref": IMPLEMENTATION_REF}).identity
@@ -301,7 +301,8 @@ def _run(request):
                            **{key: profile[key] for key in ("lot_size", "commission_rate", "minimum_commission_minor", "slippage_bps")}}
                 if stock:
                     context.update(supported_security_ids=plan["execution_universe"], supported_universe_ref=plan["supported_universe_ref"])
-                    decision = plan_stock_portfolio(StockPredictionFrame.from_dict(signal), account=ledger.account(), context=context).to_dict()
+                    decision = plan_stock_portfolio(StockPredictionFrame.from_dict(signal), account=ledger.account(),
+                        context=context, top_k=plan["portfolio_policy"]["top_k"]).to_dict()
                 else:
                     context["tax_rate"] = profile["tax_rate"]
                     decision = plan_rotation(SignalFrame.from_dict(signal), account=ledger.account(), context=context).to_dict()
@@ -440,8 +441,10 @@ def load_backtest_run(path):
         from .unit_splits import validate_saved_applications
         validate_saved_applications(wire)
     if stock:
-        require(wire["runtime_version"] == "axiom.backtest/3" and wire["core_version"] == STOCK_PORTFOLIO_VERSION and
+        require(wire["runtime_version"] == "axiom.backtest/3" and wire["core_version"] in (STOCK_PORTFOLIO_VERSION, TOPK_PORTFOLIO_VERSION) and
                 wire["plan"]["contract_version"] == "backtest_request_v3", "saved stock tuple mismatch")
-        _validate(BacktestRequest.from_dict(wire["plan"]))
+        from .stock_inputs import validate_saved_stock_core, validate_stock_request
+        validate_stock_request(wire["plan"], legacy_saved_top5=wire["core_version"] == STOCK_PORTFOLIO_VERSION)
+        validate_saved_stock_core(wire)
         require((wire["status"] == "BLOCKED") == (wire["stopped"] is not None), "saved stock stop status mismatch")
     return saved
