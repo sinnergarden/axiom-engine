@@ -253,10 +253,13 @@ def verify_analysis_wire(wire):
     fields(wire["benchmark_inputs"]," ".join(BENCHMARK_KEYS));fields(wire["benchmark_refs"]," ".join(BENCHMARK_KEYS))
     for k in BENCHMARK_KEYS:
         native=wire["benchmark_inputs"][k]
-        if k != "CSI300":
+        if k == "NASDAQ100" or (k == "SSE_COMPOSITE" and native is None):
             require(native is None and wire["benchmark_refs"][k] is None and
                     wire["benchmark_comparisons"][k]["status"] == "SOURCE_UNAVAILABLE",
                     "new benchmark native contract awaits the Data owner handoff")
+        elif k == "SSE_COMPOSITE":
+            from .retrospective_benchmark import validate_sse_for_base
+            validate_sse_for_base(native,base)
         require(wire["benchmark_refs"][k] == (None if native is None else Document.from_dict(native).identity),
                 "saved benchmark input reference mismatch")
     require(wire["benchmark_inputs"]["CSI300"] == base["benchmark_input"], "original CSI300 benchmark changed")
@@ -369,31 +372,62 @@ def _validate_outputs(wire, base):
     require(wire["status"] == expected,"saved analysis completeness status mismatch")
     for key,comparison in wire["benchmark_comparisons"].items():
         require(comparison["input_ref"] == wire["benchmark_refs"][key] and
-            comparison["status"] in ("COMPLETE","PARTIAL","SOURCE_UNAVAILABLE"), "saved comparison input/status mismatch")
+            comparison["status"] in ("COMPLETE","PARTIAL","SOURCE_UNAVAILABLE") and
+            comparison["clock_scope"] == "RETROSPECTIVE_LOCAL_SESSION", "saved comparison input/status/clock mismatch")
         if comparison["status"] == "SOURCE_UNAVAILABLE":
             require(wire["benchmark_inputs"][key] is None and comparison["native_series"] == [] and comparison["series"] == [],
                     "unavailable benchmark cannot contain observations")
         else:
             native=wire["benchmark_inputs"][key]
-            require(key == "CSI300" and comparison["security_id"] == native["security_id"] and
+            require(key in ("CSI300","SSE_COMPOSITE") and comparison["security_id"] == native["security_id"] and
                 comparison["currency"] == "CNY" and comparison["timezone"] == "Asia/Shanghai" and
                 comparison["return_basis"] == native["series_kind"] and comparison["native_calendar"] == native["calendar"],
                 "saved comparison native metadata mismatch")
+            if key == "SSE_COMPOSITE":
+                require(all(comparison[output] == native[source] for output,source in
+                    (("observation_snapshot_id","snapshot_id"),("observation_cutoff","knowledge_cutoff"),
+                    ("observation_pit_policy","pit_policy"),("observation_purpose","purpose"))), "saved SSE observation scope differs")
             require([p["native_session"] for p in comparison["native_series"]] == native["calendar"],
                     "saved comparison native dates mismatch")
+            points=[*comparison["native_series"],*comparison["series"]]
+            percentages=["benchmark_cumulative_return" in point for point in points]
+            require(not any(percentages) or all(percentages),"partial benchmark percentage projection")
+            if all(percentages):
+                for point in points:
+                    require((point["benchmark_cumulative_return"] is None)==(point["normalized_index"] is None),
+                        "benchmark percentage null/boundary differs")
+                    _nullable_decimal(point["benchmark_cumulative_return"])
             for point,row in zip(comparison["native_series"],native["rows"]):
                 require(all(point[name] == row[name] for name in ("close","available_at","source_refs")),
                         "saved comparison native observations mismatch")
             indexed={p["session"]:p for p in native["rows"]}
+            anchor_day=base["period_metrics"]["window"]["anchor_session"]
+            anchor=indexed.get(anchor_day)
+            anchor_close=None if anchor is None else anchor["close"]
+            require(comparison["anchor_session"]==anchor_day and comparison["anchor_close"]==anchor_close,
+                    "saved comparison anchor raw boundary differs")
+            if key == "SSE_COMPOSITE":require(all(percentages),"new SSE contract requires saved percentages")
+            for point in comparison["native_series"]:
+                missing=anchor_close is None or point["close"] is None
+                require((point["normalized_index"] is None)==missing,"native normalized boundary/null differs")
+                _nullable_decimal(point["normalized_index"])
             require([p["account_session"] for p in comparison["series"]] == [p["session"] for p in base["series"]],
                     "saved comparison account dates mismatch")
             for point in comparison["series"]:
                 require(point["native_session"] in (None,point["account_session"]), "saved cross-market date filling forbidden")
                 row=indexed.get(point["account_session"])
+                missing=anchor_close is None or row is None or row["close"] is None
+                require((point["normalized_index"] is None)==missing,"projected normalized boundary/null differs")
                 require(point["native_session"] == (None if row is None else row["session"]) and
                     all(point[name] == (None if row is None else row[name]) for name in ("close","available_at")) and
                     point["source_refs"] == ([] if row is None else row["source_refs"]),
                     "saved comparison projected native observations mismatch")
-                if comparison["currency"] != "CNY":
-                    require(point["account_relative_wealth"] is None,"FX evidence is required for CNY comparison")
+                relative_status=("MISSING_BOUNDARY" if anchor_close is None else "MISSING_OBSERVATION") if missing else (
+                    "PRICE_INDEX_PROXY" if comparison["currency"] == "CNY" else "FX_REQUIRED")
+                require(point["relative_status"]==relative_status and
+                    (point["account_relative_wealth"] is None)==(missing or comparison["currency"] != "CNY"),
+                    "saved relative wealth raw boundary/status differs")
                 for name in ("close","normalized_index","account_relative_wealth"): _nullable_decimal(point[name])
+            complete=anchor_close is not None and all(indexed.get(p["session"]) is not None and
+                indexed[p["session"]]["close"] is not None for p in base["series"])
+            require(comparison["status"]==("COMPLETE" if complete else "PARTIAL"),"saved benchmark missing/status differs")

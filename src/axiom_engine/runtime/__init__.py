@@ -11,6 +11,7 @@ from .evaluation import (BenchmarkSeries, DividendScope, EvaluationSpec, Evaluat
                          save_backtest_evaluation, load_backtest_evaluation)
 from .evaluation_adapter import read_csi300_benchmark, read_dividend_scope
 from .analysis_evaluation import analysis_evaluation_spec, evaluate_saved_analysis
+from .retrospective_benchmark import retrospective_sse_benchmark, read_sse_benchmark
 from .fill_display import (SavedReviewDisplay, FillDisplayReport, read_review_display,
                           build_fill_display, save_fill_display, load_fill_display)
 
@@ -22,5 +23,6 @@ __all__ = ["BatchReference", "DecisionBatchGate", "InputGateError", "stale_price
            "load_backtest_evaluation", "read_csi300_benchmark", "read_dividend_scope",
            "stock_daily_open_profile", "read_stock_market_replay", "stock_market_from_batches", "stock_dividend_scope",
            "stock_portfolio_policy", "analysis_evaluation_spec", "evaluate_saved_analysis",
+           "retrospective_sse_benchmark", "read_sse_benchmark",
            "SavedReviewDisplay", "FillDisplayReport", "read_review_display",
            "build_fill_display", "save_fill_display", "load_fill_display"]
