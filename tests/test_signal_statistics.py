@@ -100,7 +100,8 @@ class SignalStatisticsTests(unittest.TestCase):
     def test_affine_offset_and_opposite_extremes_preserve_correlation(self):
         for scores in ([1e12 + i * math.ulp(1e12) for i in range(20)],
                        [1e16 + 2 * i for i in range(20)],
-                       [-1e308] * 10 + [1e308] * 10):
+                       [-1e308] * 10 + [1e308] * 10,
+                       [-(10**308)] * 10 + [10**308] * 10):
             wire = {"contract_version": "signal_statistics_input_v1", "sessions": DAYS,
                     "signal_keys": ["a"], "pairs": [
                         {"signal_key": "a", "session": DAYS[0], "security_id": f"s{i:02}",

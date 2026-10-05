@@ -33,7 +33,11 @@ def _correlation(x, y):
     centered = []
     for values in (x, y):
         shifted = [v - values[0] for v in values]
-        if not all(math.isfinite(v) for v in shifted):
+        try:
+            finite_shift = all(math.isfinite(v) for v in shifted)
+        except OverflowError:  # finite int endpoints can have a larger exact difference
+            finite_shift = False
+        if not finite_shift:
             scale = max(abs(v) for v in values)
             shifted = [v / scale for v in values]
         scale = max(abs(v) for v in shifted)
