@@ -132,6 +132,8 @@ class FillDisplayTests(unittest.TestCase):
         for missing in (dict(event,effective_phase=None),dict(event,new_price_basis_session=None)):
             self.assertEqual(_basis_reason(fill,[],[missing]),'NEW_PRICE_BASIS_UNVERIFIED')
         self.assertEqual(_basis_reason(fill,[eod],[event]),'NEW_PRICE_BASIS_UNVERIFIED')
+        future=dict(eod,effective_date='2024-01-05')
+        self.assertEqual(_basis_reason(fill,[future],[event]),'NEW_PRICE_BASIS_UNVERIFIED')
 
     def test_equivalent_cutoff_timezones_preserve_wire(self):
         with tempfile.TemporaryDirectory() as temp:

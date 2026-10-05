@@ -149,16 +149,20 @@ def _identity(wire):
 
 def _basis_reason(fill, run_events, data_events):
     sid, day = fill["security_id"], fill["session"]
-    originals = {e["event_id"]:e for e in run_events if e["security_id"] == sid and day >= e["effective_date"]}
+    originals = {e["event_id"]:e for e in run_events if e["security_id"] == sid}
+    relevant = {key for key,event in originals.items() if day >= event["effective_date"]}
     observed = {}
     for event in data_events:
         if event.get("security_id") != sid or event.get("event_type") != "unit_split": continue
         if not event.get("effective_date"): return "NEW_PRICE_BASIS_UNVERIFIED"
         if day >= event["effective_date"]: observed[event["event_id"]] = event
-    for event_id in originals.keys() | observed.keys():
+    for event_id in relevant | observed.keys():
         original, current = originals.get(event_id), observed.get(event_id)
         effective = (original or current)["effective_date"]
         if current is not None and current["effective_date"] != effective:
+            return "NEW_PRICE_BASIS_UNVERIFIED"
+        if original is not None and current is not None and current.get("new_price_basis_session") is not None and \
+                current["new_price_basis_session"] != original.get("new_price_basis_session"):
             return "NEW_PRICE_BASIS_UNVERIFIED"
         # An explicit EOD phase leaves the actual same-day open in old units.
         if day == effective and ((current or {}).get("effective_phase") == "end_of_day" or
