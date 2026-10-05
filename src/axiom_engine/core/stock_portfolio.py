@@ -1,5 +1,5 @@
 """Pure weekly TopK planning over unchanged, saved Research predictions."""
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Context, Decimal, ROUND_HALF_UP, localcontext
 import re
 
@@ -34,28 +34,58 @@ def source_ref(value):
     require(type(value) is str and re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", value), "invalid owner source ref")
 
 
+def _prediction_clock_v2(row, cutoff, available):
+    feature_cutoff = instant(row["feature_knowledge_cutoff"])
+    model_available = instant(row["simulated_model_available_at"])
+    start = instant(row["session"] + "T00:00:00+08:00")
+    require(start <= feature_cutoff < start + timedelta(days=1) and
+            start <= cutoff < start + timedelta(days=1), "prediction/feature clock belongs to another session")
+    require(available == cutoff and feature_cutoff <= cutoff and model_available < cutoff,
+            "v2 simulated prediction clock conflict")
+    feature_available = row["feature_available_at"]
+    require(feature_available is not None or row["valid"] is False, "valid prediction lacks Feature availability")
+    if feature_available is not None:
+        require(instant(feature_available) <= feature_cutoff, "Feature dependency unavailable at its original cutoff")
+    return feature_cutoff, model_available
+
+
 def validate_stock_predictions(frame):
+    """Validate saved v1/v2 neutral predictions; account admission is separate."""
     wire = frame.to_dict()
-    fields(wire, "contract_version signal_run_ref signal_stage score_semantics score_unit feature_ref model_ref limitations universe rows")
-    require(wire["contract_version"] == "stock_prediction_run_v1" and wire["signal_stage"] == "prediction_raw" and
+    v2 = wire.get("contract_version") == "stock_prediction_run_v2"
+    fields(wire, "contract_version signal_run_ref signal_stage score_semantics score_unit feature_ref model_ref limitations universe rows" +
+           (" fold_spec_ref clock_basis" if v2 else ""))
+    require(wire["contract_version"] in ("stock_prediction_run_v1", "stock_prediction_run_v2") and wire["signal_stage"] == "prediction_raw" and
             wire["score_semantics"] == "forward_5_session_cs_zscore_prediction" and wire["score_unit"] == "dimensionless",
             "unsupported stock prediction semantics")
     for name in ("signal_run_ref", "feature_ref", "model_ref"):
         digest(wire[name])
+    if v2:
+        digest(wire["fold_spec_ref"])
+        require(wire["clock_basis"] == "declared_simulation", "unsupported prediction clock basis")
     require(type(wire["limitations"]) is list and all(type(x) is str for x in wire["limitations"]), "prediction limitations required")
     universe = wire["universe"]
     require(type(universe) is list and bool(universe) and len(set(universe)) == len(universe), "explicit prediction union required")
     for security in universe:
         text(security)
     require(type(wire["rows"]) is list and bool(wire["rows"]), "prediction rows required")
-    indexed, groups = {}, {}
+    indexed, groups, clocks = {}, {}, {}
+    model_clock = None
     for row in wire["rows"]:
-        fields(row, "security_id session knowledge_cutoff available_at score valid invalid_reason source_refs member")
+        fields(row, "security_id session knowledge_cutoff available_at score valid invalid_reason source_refs member" +
+               (" feature_knowledge_cutoff feature_available_at simulated_model_available_at" if v2 else ""))
         require(row["security_id"] in universe, "prediction outside union")
         session(row["session"])
         cutoff, available = instant(row["knowledge_cutoff"]), instant(row["available_at"])
-        require(cutoff == instant(row["session"] + "T20:30:00+08:00") and available <= cutoff,
-                "prediction clock conflict")
+        if v2:
+            feature_cutoff, model_available = _prediction_clock_v2(row, cutoff, available)
+            clock = (feature_cutoff, cutoff)
+            require(clocks.setdefault(row["session"], clock) == clock and
+                    (model_clock is None or model_clock == model_available), "inconsistent saved prediction clocks")
+            model_clock = model_available
+        else:
+            require(cutoff == instant(row["session"] + "T20:30:00+08:00") and available <= cutoff,
+                    "prediction clock conflict")
         require(type(row["valid"]) is bool and type(row["member"]) is bool, "explicit validity/member flags required")
         if row["valid"]:
             number(row["score"])
@@ -66,6 +96,9 @@ def validate_stock_predictions(frame):
         require(type(row["source_refs"]) is list and bool(row["source_refs"]), "prediction source refs required")
         for ref in row["source_refs"]:
             source_ref(ref)
+        if v2:
+            require(all(wire[name] in row["source_refs"] for name in ("feature_ref", "model_ref")),
+                    "v2 prediction lacks Feature/model source refs")
         key = row["session"], row["security_id"]
         require(key not in indexed, "duplicate prediction key")
         indexed[key] = row
@@ -82,6 +115,8 @@ def plan_stock_portfolio(frame, *, account, context, top_k=None):
 
 def _plan(frame, account, context, top_k):
     wire, rows = validate_stock_predictions(frame)
+    require(wire["contract_version"] == "stock_prediction_run_v1",
+            "v2 neutral predictions only; account clock consumption is not admitted")
     fields(context, "trade_session feature_session decision_time knowledge_cutoff reference_prices lot_size commission_rate minimum_commission_minor slippage_bps account_state_version supported_security_ids supported_universe_ref")
     session(context["trade_session"]); session(context["feature_session"])
     cutoff, decision = instant(context["knowledge_cutoff"]), instant(context["decision_time"])
