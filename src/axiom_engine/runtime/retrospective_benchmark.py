@@ -32,9 +32,14 @@ def retrospective_sse_benchmark(*, native_batch_text, receipt, run_key):
         context["snapshot_id"]==receipt["snapshot_id"] and receipt["identity"]=="000001.SH" and
         receipt["unit"]=="index points" and receipt["series_kind"]=="price_index" and
         query["fields"]==["close"] and query["symbols"]==["000001.SH"] and
-        query["purpose"]=="historical_exploration" and query["pit_policy"]=="operational_pit_v1",
+        query["purpose"]=="historical_exploration" and query["pit_policy"]=="operational_pit_v1" and
+        query["price_basis"]=="unadjusted" and all(query[key] is None for key in
+            ("adjustment_anchor","universe_id","policy_by_session")),
         "unsupported retrospective native SSE scope")
     for key in ("contract_id","source_profile_id","reader_version"):text(context[key])
+    fields(binding["context"],"domain snapshot_id contract_id reader_version")
+    require(all(binding["context"][key]==context[key] for key in binding["context"]),
+        "native SSE receipt context differs")
     days=query["sessions"]
     require(days and days==sorted(set(days)) and set(query["cutoff_by_session"])==set(days),"native SSE session query differs")
     for day in days:session(day)

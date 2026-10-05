@@ -21,7 +21,8 @@ def native(base, values=None):
     context=dict(contract_version='data_batch_v1',snapshot_id='s_new_observation',domain='benchmark_daily',
         contract_id='synthetic.benchmark/1',source_profile_id='synthetic.index_daily/1',reader_version='synthetic_reader/1',
         query=dict(fields=['close'],symbols=['000001.SH'],sessions=days,purpose='historical_exploration',
-            pit_policy='operational_pit_v1',cutoff_by_session={d:cutoff for d in days}))
+            pit_policy='operational_pit_v1',price_basis='unadjusted',adjustment_anchor=None,universe_id=None,
+            policy_by_session=None,cutoff_by_session={d:cutoff for d in days}))
     batch=dict(context=context,records=[dict(security_id='000001.SH',session=d,close=v) for d,v in zip(days,values)],
         field_meta={'close':dict(dtype='float64',unit='index points',by_key=[dict(security_id='000001.SH',session=d,
             revision_id='synthetic:'+d,raw_batch_id='raw',usable_from=observed if v is not None else None,
@@ -73,11 +74,16 @@ class RetrospectiveBenchmarkTests(unittest.TestCase):
         changes=[lambda b:b['field_meta']['close'].update(unit='CNY'),
             lambda b:b['context']['query'].update(purpose='market_replay'),
             lambda b:b['context']['query'].update(pit_policy='best_effort_vendor_v1'),
+            lambda b:b['context']['query'].update(price_basis='common_anchor_adjusted_v1',adjustment_anchor='2026-09-30'),
+            lambda b:b['context']['query'].update(universe_id='different'),
+            lambda b:b['context']['query'].update(policy_by_session={}),
             lambda b:b['field_meta']['close']['by_key'][0].update(usable_from='2026-10-06T00:00:00Z'),
             lambda b:b['records'].append(deepcopy(b['records'][0]))]
         for change in changes:
             value=deepcopy(self.batch);change(value)
             with self.assertRaises(ContractError):admitted(value,self.receipt)
+        receipt=deepcopy(self.receipt);receipt['runs']['test']['context']['snapshot_id']='different'
+        with self.assertRaises(ContractError):admitted(self.batch,receipt)
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'native.json';path.write_text(bench['native_batch_text'])
             self.assertEqual(read_sse_benchmark(path,receipt=bench['receipt'],run_key='test').identity,
@@ -124,7 +130,7 @@ class RetrospectiveBenchmarkTests(unittest.TestCase):
         batch,receipt=native(self.base_wire,[None,110,120,130])
         original=self.report(admitted(batch,receipt)).to_dict()
         with tempfile.TemporaryDirectory() as temp:
-            for i,case in enumerate(('no_percent','invent_norm','complete','anchor')):
+            for i,case in enumerate(('no_percent','invent_norm','complete','anchor','relative','clock')):
                 wire=deepcopy(original);sse=wire['benchmark_comparisons']['SSE_COMPOSITE']
                 if case=='no_percent':
                     for point in [*sse['native_series'],*sse['series']]:point.pop('benchmark_cumulative_return')
@@ -132,7 +138,9 @@ class RetrospectiveBenchmarkTests(unittest.TestCase):
                     for point in [*sse['native_series'],*sse['series']]:
                         point['normalized_index']='1';point['benchmark_cumulative_return']='0'
                 elif case=='complete':sse['status']='COMPLETE'
-                else:sse.update(anchor_session='2019-01-01',anchor_close='100')
+                elif case=='anchor':sse.update(anchor_session='2019-01-01',anchor_close='100')
+                elif case=='relative':sse['series'][0].update(account_relative_wealth='0.25',relative_status='PRICE_INDEX_PROXY')
+                else:sse['clock_scope']='HISTORICAL_EXECUTION_VISIBLE'
                 with self.subTest(case=case),self.assertRaises(ContractError):
                     save_backtest_evaluation(rehash_report(wire),Path(temp)/str(i))
 

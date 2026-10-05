@@ -372,7 +372,8 @@ def _validate_outputs(wire, base):
     require(wire["status"] == expected,"saved analysis completeness status mismatch")
     for key,comparison in wire["benchmark_comparisons"].items():
         require(comparison["input_ref"] == wire["benchmark_refs"][key] and
-            comparison["status"] in ("COMPLETE","PARTIAL","SOURCE_UNAVAILABLE"), "saved comparison input/status mismatch")
+            comparison["status"] in ("COMPLETE","PARTIAL","SOURCE_UNAVAILABLE") and
+            comparison["clock_scope"] == "RETROSPECTIVE_LOCAL_SESSION", "saved comparison input/status/clock mismatch")
         if comparison["status"] == "SOURCE_UNAVAILABLE":
             require(wire["benchmark_inputs"][key] is None and comparison["native_series"] == [] and comparison["series"] == [],
                     "unavailable benchmark cannot contain observations")
@@ -421,8 +422,11 @@ def _validate_outputs(wire, base):
                     all(point[name] == (None if row is None else row[name]) for name in ("close","available_at")) and
                     point["source_refs"] == ([] if row is None else row["source_refs"]),
                     "saved comparison projected native observations mismatch")
-                if comparison["currency"] != "CNY":
-                    require(point["account_relative_wealth"] is None,"FX evidence is required for CNY comparison")
+                relative_status=("MISSING_BOUNDARY" if anchor_close is None else "MISSING_OBSERVATION") if missing else (
+                    "PRICE_INDEX_PROXY" if comparison["currency"] == "CNY" else "FX_REQUIRED")
+                require(point["relative_status"]==relative_status and
+                    (point["account_relative_wealth"] is None)==(missing or comparison["currency"] != "CNY"),
+                    "saved relative wealth raw boundary/status differs")
                 for name in ("close","normalized_index","account_relative_wealth"): _nullable_decimal(point[name])
             complete=anchor_close is not None and all(indexed.get(p["session"]) is not None and
                 indexed[p["session"]]["close"] is not None for p in base["series"])
