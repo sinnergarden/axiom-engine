@@ -20,14 +20,18 @@ from test_stocks import request, SNAPSHOT
 def files(directory, run, *, unit="CNY/share", scale=0.25, mutate=None):
     saved = run.to_dict();market=saved['plan']['market_replay']
     days=market['calendar'];cutoff='2026-10-05T06:17:55+00:00'
+    query=dict(sessions=days,symbols=market['universe'],purpose='historical_exploration',price_basis='unadjusted',
+        cutoff_by_session={d:cutoff for d in days})
     context=dict(usage='retrospective_review',snapshot_id=SNAPSHOT,anchor_session=days[-1],
         knowledge_cutoff=cutoff,pit_policy='operational_pit_v1',default_price_basis='common_anchor_adjusted_v1',
-        native_price_basis='unadjusted',derivation=dict(price_query=dict(sessions=days,symbols=market['universe'],
-        purpose='historical_exploration',price_basis='unadjusted',cutoff_by_session={d:cutoff for d in days})))
+        native_price_basis='unadjusted',derivation=dict(price_query=query,factor_query=deepcopy(query),anchor_session=days[-1]))
     rows=[dict(security_id=r['security_id'],session=r['session'],native_open=float(r['open']),display_scale=scale)
         for r in market['rows']]
+    def provenance(sid,day):
+        return dict(security_id=sid,session=day,raw_batch_id='synthetic_factor',revision_id='synthetic:'+day,
+            usable_from=cutoff,first_observed_at=cutoff,missing_reason=None)
     meta=[dict(security_id=r['security_id'],session=r['session'],missing_reason=None if scale is not None else 'missing_factor',
-        factor_provenance={'raw_batch_id':'synthetic_factor'},anchor_factor_provenance={'raw_batch_id':'synthetic_anchor'}) for r in rows]
+        factor_provenance=provenance(r['security_id'],r['session']),anchor_factor_provenance=provenance(r['security_id'],days[-1])) for r in rows]
     ohlcv=dict(contract_version='review_display_v1',context=context,records=rows,
         field_meta={'native_open':{'unit':unit},'open':{'unit':unit},
         'display_scale':{'unit':'dimensionless','dtype':'float64','by_key':meta}})
@@ -109,6 +113,18 @@ class FillDisplayTests(unittest.TestCase):
         self.assertIsNone(_basis_reason(fill,[event],[event]))
         self.assertIsNone(_basis_reason(dict(fill,session='2024-01-03'),[event],[]))
 
+    def test_equivalent_cutoff_timezones_preserve_wire(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for i,cutoff in enumerate(('2026-10-05T06:17:55+00:00','2026-10-05T14:17:55+08:00','2026-10-05T06:17:55Z')):
+                def change(w):
+                    for name in ('price_query','factor_query'):
+                        q=w['context']['derivation'][name]
+                        q['cutoff_by_session']={d:cutoff for d in q['sessions']}
+                with self.subTest(cutoff=cutoff):
+                    display=files(Path(temp)/str(i),self.account,mutate=change)
+                    self.assertEqual(build_fill_display(self.account,display=display).to_dict()['status'],'COMPLETE')
+                    self.assertEqual(display._content['manifest']['context']['derivation']['price_query']['cutoff_by_session']['2024-01-02'],cutoff)
+
     def test_reader_decimal_context_and_rehashed_link_rejection(self):
         with tempfile.TemporaryDirectory() as temp:
             report=build_fill_display(self.account,display=files(Path(temp)/'data',self.account))
@@ -120,6 +136,31 @@ class FillDisplayTests(unittest.TestCase):
             finally:setcontext(prior)
             wire=report.to_dict();wire['coordinates'][0]['session']='2024-01-05'
             with self.assertRaises(ContractError):save_fill_display(rehash(wire),Path(temp)/'bad.json')
+
+    def test_rehashed_manifest_units_and_provenance_eligibility(self):
+        from axiom_engine.runtime.fill_display import _identity
+        with tempfile.TemporaryDirectory() as temp:
+            original=build_fill_display(self.account,display=files(Path(temp)/'data',self.account)).to_dict()
+            for i,change in enumerate(('anchor','cutoff','unit','provenance')):
+                wire=deepcopy(original);inputs=wire['consumed_input']
+                if change in ('anchor','cutoff'):
+                    manifest=json.loads(wire['manifest_text']);ctx=manifest['context']
+                    if change=='anchor':ctx['anchor_session']='2024-01-03'
+                    else:ctx['derivation']['price_query']['cutoff_by_session']['2024-01-02']='2024-01-02T12:00:00Z'
+                    raw=json.dumps(manifest,indent=2)+'\n';wire['manifest_text']=raw
+                    wire['display_ref']='sha256:'+sha256(raw.encode()).hexdigest()
+                    wire['manifest_file_ref']=dict(uri='manifest.json',sha256=wire['display_ref'][7:],bytes=len(raw.encode()))
+                elif change=='unit':
+                    inputs['account_unit']=inputs['source_unit']=inputs['target_unit']='USD/share'
+                    for c in wire['coordinates']:c['source_unit']=c['target_unit']='USD/share'
+                else:
+                    fact=inputs['facts'][0];fact['scale_meta']['factor_provenance']['session']='2020-01-02'
+                    for c in wire['coordinates']:
+                        if (c['security_id'],c['session'])==(fact['security_id'],fact['session']):c['input_fact_ref']=Document.from_dict(fact).identity
+                wire['consumed_input_ref']=Document.from_dict(inputs).identity
+                wire['display_result_ref']=_identity(wire)
+                with self.subTest(change=change),self.assertRaises(ContractError):
+                    save_fill_display(rehash(wire),Path(temp)/str(i))
 
 
 if __name__=='__main__':unittest.main()
