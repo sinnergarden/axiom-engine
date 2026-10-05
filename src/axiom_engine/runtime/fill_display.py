@@ -117,7 +117,7 @@ def _verified_display(display):
 
 def _units(saved):
     profile = saved["plan"]["profile"]
-    if saved["contract_version"] == "backtest_run_v3":
+    if saved["contract_version"] in ("backtest_run_v3", "backtest_run_v4"):
         require(saved["price_unit"] == "CNY/share" and saved["quantity_unit"] == "shares",
                 "stock account unit differs")
         return "CNY/share"
@@ -133,8 +133,8 @@ def _unit_contract(saved):
 
 def _contract_unit(contract):
     fields(contract, "backtest_contract_version profile_contract_version quantity_unit price_unit")
-    stock = contract["backtest_contract_version"] == "backtest_run_v3"
-    require(contract["backtest_contract_version"] in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3") and
+    stock = contract["backtest_contract_version"] in ("backtest_run_v3", "backtest_run_v4")
+    require(contract["backtest_contract_version"] in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4") and
         contract["profile_contract_version"] == ("stock_daily_open_profile_v1" if stock else "daily_open_profile_v1"),
         "unsupported saved account unit contract")
     require((contract["quantity_unit"], contract["price_unit"]) == (("shares", "CNY/share") if stock else (None, None)),

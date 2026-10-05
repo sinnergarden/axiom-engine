@@ -235,7 +235,7 @@ def stock_dividend_scope(run):
     """Freeze observed stock record-date evidence; never infer unknown PAY."""
     from .evaluation import DividendScope
     wire = run.to_dict()
-    require(wire["contract_version"] == "backtest_run_v3", "stock saved run required")
+    require(wire["contract_version"] in ("backtest_run_v3", "backtest_run_v4"), "stock saved run required")
     plan, market = wire["plan"], wire["plan"]["market_replay"]
     evidence = [entry for entry in market["source_evidence"] if entry["batch"]["context"]["domain"] == "corporate_actions"]
     scope = {"contract_version": "dividend_scope_v2", "start_session": plan["start_session"],

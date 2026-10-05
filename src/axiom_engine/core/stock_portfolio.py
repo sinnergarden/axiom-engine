@@ -113,16 +113,27 @@ def plan_stock_portfolio(frame, *, account, context, top_k=None):
         return _plan(frame, account, context, top_k)
 
 
-def _plan(frame, account, context, top_k):
-    wire, rows = validate_stock_predictions(frame)
-    require(wire["contract_version"] == "stock_prediction_run_v1",
-            "v2 neutral predictions only; account clock consumption is not admitted")
-    fields(context, "trade_session feature_session decision_time knowledge_cutoff reference_prices lot_size commission_rate minimum_commission_minor slippage_bps account_state_version supported_security_ids supported_universe_ref")
+def _plan_admitted_stock_portfolio(wire, rows, *, account, context, top_k):
+    """Runtime-private reuse after its full entry admission; no public bypass tag."""
+    with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
+        return _plan(None, account, context, top_k, admitted=(wire, rows))
+
+
+def _plan(frame, account, context, top_k, admitted=None):
+    wire, rows = validate_stock_predictions(frame) if admitted is None else admitted
+    v2 = wire["contract_version"] == "stock_prediction_run_v2"
+    if v2:
+        require(top_k is not None and "feature_knowledge_cutoff" in context,
+                "v2 neutral predictions only; account clock consumption is not admitted without explicit TopK and feature clock")
+    fields(context, "trade_session feature_session decision_time knowledge_cutoff reference_prices lot_size commission_rate minimum_commission_minor slippage_bps account_state_version supported_security_ids supported_universe_ref" +
+           (" feature_knowledge_cutoff" if v2 else ""))
     session(context["trade_session"]); session(context["feature_session"])
     cutoff, decision = instant(context["knowledge_cutoff"]), instant(context["decision_time"])
     require(context["feature_session"] < context["trade_session"] and
-            cutoff == instant(context["feature_session"] + "T20:30:00+08:00") and
+            cutoff == instant(context["feature_session"] + ("T21:00:00+08:00" if v2 else "T20:30:00+08:00")) and
             decision == instant(context["trade_session"] + "T08:55:00+08:00"), "invalid stock decision clock")
+    feature_cutoff = instant(context["feature_knowledge_cutoff"]) if v2 else cutoff
+    require(feature_cutoff == instant(context["feature_session"] + "T20:30:00+08:00"), "invalid stock Feature cutoff")
     supported = context["supported_security_ids"]
     require(type(supported) is list and bool(supported) and len(set(supported)) == len(supported) and
             set(supported) <= set(wire["universe"]), "explicit supported prediction subset required")
@@ -150,6 +161,9 @@ def _plan(frame, account, context, top_k):
     for row in batch:
         require(instant(row["knowledge_cutoff"]) == cutoff and instant(row["available_at"]) <= decision,
                 "future/inconsistent prediction cutoff")
+        if v2:
+            require(instant(row["feature_knowledge_cutoff"]) == feature_cutoff and
+                    instant(row["simulated_model_available_at"]) < cutoff, "inconsistent v2 decision clock")
     eligible = [row for row in batch if row["member"] and row["security_id"] in supported]
     result = {"contract_version": version, "feature_session": context["feature_session"],
         "trade_session": context["trade_session"], "signal_ref": wire["signal_run_ref"],
@@ -157,6 +171,12 @@ def _plan(frame, account, context, top_k):
         "status": "DECISION_COMPLETE", "selected_security_ids": [], "targets": {}, "intents": [], "trace": []}
     if not legacy:
         result["top_k"] = k
+    if v2:
+        result["prediction_clock"] = {"clock_basis": wire["clock_basis"],
+            "feature_knowledge_cutoff": batch[0]["feature_knowledge_cutoff"],
+            "inference_cutoff": batch[0]["knowledge_cutoff"],
+            "simulated_model_available_at": batch[0]["simulated_model_available_at"],
+            "model_ref": wire["model_ref"], "fold_spec_ref": wire["fold_spec_ref"]}
     invalid = [row for row in eligible if not row["valid"]]
     valid_count = len(eligible) if legacy else sum(row["valid"] for row in eligible)
     if invalid or valid_count < k:
@@ -174,7 +194,7 @@ def _plan(frame, account, context, top_k):
         quote = context["reference_prices"].get(security)
         require(quote is not None, "missing stock previous-close reference")
         fields(quote, "price session available_at source_refs")
-        require(quote["session"] == context["feature_session"] and instant(quote["available_at"]) <= cutoff,
+        require(quote["session"] == context["feature_session"] and instant(quote["available_at"]) <= feature_cutoff,
                 "future or stale stock sizing reference")
         require(type(quote["source_refs"]) is list and bool(quote["source_refs"]), "reference provenance required")
         for ref in quote["source_refs"]:

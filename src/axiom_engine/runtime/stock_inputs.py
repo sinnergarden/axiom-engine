@@ -56,18 +56,31 @@ def applicable_blocks(market, security, day):
 
 def _validate_pair_proof(evidence, signal, universe, calendar, batches):
     """Verify the saved owner's complete admission closure, without repeating Data queries."""
-    require(evidence.get("contract_version") == "stock_snapshot_pair_admission_v1" and
-            evidence.get("listing_identity_equal_all_83") is True and
-            evidence["scope"].get("membership_security_ids") == signal["universe"], "incomplete stock identity/member proof")
+    v2 = signal["contract_version"] == "stock_prediction_schedule_v1"
+    if v2:
+        identity = evidence.get("listing_identity_checks", {})
+        require(evidence.get("contract_version") == "stock_snapshot_pair_admission_v2" and
+                identity.get("checked_rows") == len(universe) and identity.get("paired_rows") == len(universe) and
+                identity.get("mismatches") == [], "incomplete dynamic stock listing identity proof")
+    else:
+        require(evidence.get("contract_version") == "stock_snapshot_pair_admission_v1" and
+                evidence.get("listing_identity_equal_all_83") is True, "incomplete stock identity/member proof")
+    require(evidence["scope"].get("membership_security_ids") == signal["universe"], "incomplete stock identity/member proof")
+    row_count = sum(len(f["prediction_frame"]["rows"]) for f in signal["folds"]) if v2 else len(signal["rows"])
     member = evidence.get("prediction_membership", {})
-    require(member.get("compared") == len(signal["rows"]) and member.get("saved_prediction_rows") == len(signal["rows"]) and
+    require(member.get("compared") == row_count and member.get("saved_prediction_rows") == row_count and
             member.get("model_mismatch") == [] and member.get("execution_mismatch") == [], "incomplete saved prediction/member pairing")
     count = len(universe) * len(calendar)
     basis = evidence.get("previous_close_basis_checks", {})
-    require(all(basis.get(name) is True for name in ("all_available_at_feature_knowledge_cutoff", "all_available_before_decision",
-            "equal_all_83_23", "listing_suffix_and_SZSE_identity_all_83")) and
+    require(all(basis.get(name) is True for name in ("all_available_at_feature_knowledge_cutoff", "all_available_before_decision")) and
             basis.get("paired_rows_per_root") == count and basis.get("checked_rows_both_roots") == 2 * count,
             "incomplete previous-close basis pairing")
+    if v2:
+        require(basis.get("equal_rows") == count and basis.get("listing_identity_checked_rows") == count and
+                basis.get("listing_identity_mismatches") == [], "incomplete dynamic previous-close identity pairing")
+    else:
+        require(basis.get("equal_all_83_23") is True and basis.get("listing_suffix_and_SZSE_identity_all_83") is True,
+                "incomplete previous-close basis pairing")
     artifact = evidence.get("previous_close_basis_artifact", {})
     for name in ("basis_ref", "canonical_content_digest", "file_digest"):
         digest(artifact.get(name))
@@ -114,13 +127,19 @@ def _validate_pair_proof(evidence, signal, universe, calendar, batches):
 
 
 def validate_stock_request(plan, *, legacy_saved_top5=False):
-    fields(plan, "contract_version account_id start_session end_session signal_frame market_replay initial_account profile prediction_universe execution_universe supported_universe_ref portfolio_policy admission_ref admission_evidence stock_action_policy")
-    require(plan["contract_version"] == "backtest_request_v3" and plan["stock_action_policy"] == ACTION_POLICY,
+    v4 = plan.get("contract_version") == "backtest_request_v4"
+    fields(plan, "contract_version account_id start_session end_session market_replay initial_account profile prediction_universe execution_universe supported_universe_ref portfolio_policy admission_ref admission_evidence stock_action_policy " +
+           ("prediction_schedule" if v4 else "signal_frame"))
+    require(plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4") and plan["stock_action_policy"] == ACTION_POLICY,
             "unsupported stock request/action policy")
     text(plan["account_id"]); session(plan["start_session"]); session(plan["end_session"])
-    signal, signals = validate_stock_predictions(StockPredictionFrame.from_dict(plan["signal_frame"]))
-    require(signal["contract_version"] == "stock_prediction_run_v1",
-            "v2 neutral predictions only; account clock consumption is not admitted")
+    if v4:
+        from .stock_schedule import _admit_schedule
+        signal, signals = _admit_schedule(plan["prediction_schedule"], plan["market_replay"]["calendar"])
+    else:
+        signal, signals = validate_stock_predictions(StockPredictionFrame.from_dict(plan["signal_frame"]))
+        require(signal["contract_version"] == "stock_prediction_run_v1",
+                "v2 neutral predictions only; account clock consumption is not admitted")
     universe = plan["execution_universe"]
     require(plan["prediction_universe"] == signal["universe"] and universe == supported_universe(signal["universe"]),
             "stock prediction/execution scope mismatch")
@@ -136,9 +155,16 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
     recorded = evidence.pop("admission_ref", None)
     require(recorded == plan["admission_ref"] and Document.from_dict(evidence).identity == recorded,
             "stock input-pair evidence identity mismatch")
-    require(evidence["signal_run_ref"] == signal["signal_run_ref"] and
-            evidence["feature_ref"] == signal["feature_ref"] and evidence["model_ref"] == signal["model_ref"] and
-            evidence["scope"]["execution_security_ids"] == universe and
+    if v4:
+        refs = [{"fold_ref": f["fold_ref"], **{name: f["prediction_frame"][name] for name in
+                ("fold_spec_ref", "signal_run_ref", "feature_ref", "model_ref")}} for f in signal["folds"]]
+        require(evidence.get("prediction_schedule_ref") == signal["schedule_ref"] and evidence.get("prediction_refs") == refs and
+                not any(name in evidence for name in ("signal_run_ref", "feature_ref", "model_ref")), "Stock schedule admission refs mismatch")
+    else:
+        require(evidence["signal_run_ref"] == signal["signal_run_ref"] and
+                evidence["feature_ref"] == signal["feature_ref"] and evidence["model_ref"] == signal["model_ref"],
+                "stock input-pair admission scope mismatch")
+    require(evidence["scope"]["execution_security_ids"] == universe and
             evidence["status"] == "NUMERIC_POLICY_IDENTITY_PAIR_PASS", "stock input-pair admission scope mismatch")
     profile = plan["profile"]
     require(profile == stock_daily_open_profile(unknown_status_policy=profile.get("unknown_status_policy")),
@@ -167,8 +193,12 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
                 context["snapshot_id"] == evidence["execution"]["snapshot"], "stock market purpose/Snapshot mismatch")
     require(calendar == evidence["scope"]["initial_sessions"], "stock admitted calendar mismatch")
     required_features = calendar[calendar.index(plan["start_session"]) - 1:calendar.index(plan["end_session"])]
-    require(all((day, security) in signals for day in required_features for security in signal["universe"]),
-            "missing required previous-session prediction group")
+    if v4:
+        require(all(day in signals for day in calendar[calendar.index(plan["start_session"]):calendar.index(plan["end_session"])+1]),
+                "missing required stock trade schedule group")
+    else:
+        require(all((day, security) in signals for day in required_features for security in signal["universe"]),
+                "missing required previous-session prediction group")
     from .stock_market import _stock_market_wire
     # Verify frozen native projections, without Data access or account execution.
     require(len(batches) == 6, "complete stock native closure required")
@@ -230,13 +260,30 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
 def validate_saved_stock_core(wire):
     """Check saved version tuples and decisions, without replaying the planner."""
     version = wire["core_version"]
+    v4 = wire["contract_version"] == "backtest_run_v4"
+    require(not v4 or version == "axiom.stock_portfolio/2", "v4 saved stock Core must use explicit TopK")
     k = wire["plan"]["portfolio_policy"]["top_k"]
     require(version in ("axiom.stock_portfolio/1", "axiom.stock_portfolio/2"), "unsupported saved stock Core")
     if version == "axiom.stock_portfolio/1":
         require(type(k) is int and k == 5, "legacy stock Core only supports Top5")
     require(type(wire["decisions"]) is list, "saved decisions required")
+    if v4:
+        schedule = wire["plan"]["prediction_schedule"]
+        require(wire["signal_ref"] == schedule["schedule_ref"], "Saved run/schedule identity mismatch")
+        frames = {f["prediction_frame"]["signal_run_ref"]: f["prediction_frame"] for f in schedule["folds"]}
+        trades = {t["trade_session"]: t for t in schedule["trade_schedule"]}
     for decision in wire["decisions"]:
         require(decision.get("contract_version") == version, "saved decision/Core version mismatch")
         if version == "axiom.stock_portfolio/2":
             require(type(decision.get("top_k")) is int and decision["top_k"] == k,
                     "saved decision/portfolio top_k mismatch")
+        if v4:
+            trade = trades.get(decision.get("trade_session"))
+            require(trade is not None and trade["signal_run_ref"] == decision.get("signal_ref") and
+                    trade["feature_session"] == decision.get("feature_session"), "Saved decision differs from admitted trade mapping")
+            frame = frames[trade["signal_run_ref"]]
+            original = next((r for r in frame["rows"] if r["session"] == decision["feature_session"]), None)
+            require(original is not None and decision.get("prediction_clock") == {
+                "clock_basis": frame["clock_basis"], "feature_knowledge_cutoff": original["feature_knowledge_cutoff"],
+                "inference_cutoff": original["knowledge_cutoff"], "simulated_model_available_at": original["simulated_model_available_at"],
+                "model_ref": frame["model_ref"], "fold_spec_ref": frame["fold_spec_ref"]}, "Saved decision clock differs from original prediction")
