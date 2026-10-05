@@ -106,7 +106,8 @@ class FillDisplayTests(unittest.TestCase):
                     build_fill_display(self.account,display=files(Path(temp)/str(i),self.account,mutate=change))
 
     def test_no_inferred_unit_basis_session(self):
-        event=dict(event_id='e',security_id='s',effective_date='2024-01-03',new_price_basis_session='2024-01-08')
+        event=dict(event_id='e',security_id='s',event_type='unit_split',effective_date='2024-01-03',
+            effective_phase='end_of_day',new_price_basis_session='2024-01-08',new_price_basis_basis='explicit native evidence')
         fill=dict(security_id='s',session='2024-01-08')
         self.assertEqual(_basis_reason(fill,[event],[]),'NEW_PRICE_BASIS_UNVERIFIED')
         self.assertEqual(_basis_reason(fill,[event],[dict(event,new_price_basis_session=None)]),'NEW_PRICE_BASIS_UNVERIFIED')
@@ -120,6 +121,17 @@ class FillDisplayTests(unittest.TestCase):
         _event_scope([],[event,dict(event,security_id='another')],'2026-10-05T06:00:00Z')
         self.assertEqual(_basis_reason(dict(security_id='s',session='2024-01-08'),[],[event]),'NEW_PRICE_BASIS_UNVERIFIED')
         with self.assertRaises(ContractError):_event_scope([event],[],'2026-10-05T06:00:00Z')
+
+    def test_same_day_basis_is_explicit_or_unavailable(self):
+        fill=dict(security_id='s',session='2024-01-03')
+        event=dict(event_id='e',security_id='s',event_type='unit_split',effective_date='2024-01-03',
+            effective_phase='not_stated',new_price_basis_session='2024-01-03',new_price_basis_basis='source states native basis date')
+        self.assertIsNone(_basis_reason(fill,[],[event]))  # explicit same-day new native unit
+        eod=dict(event,effective_phase='end_of_day',new_price_basis_session='2024-01-08')
+        self.assertIsNone(_basis_reason(fill,[eod],[eod]))  # explicit EOD: old-unit open
+        for missing in (dict(event,effective_phase=None),dict(event,new_price_basis_session=None)):
+            self.assertEqual(_basis_reason(fill,[],[missing]),'NEW_PRICE_BASIS_UNVERIFIED')
+        self.assertEqual(_basis_reason(fill,[eod],[event]),'NEW_PRICE_BASIS_UNVERIFIED')
 
     def test_equivalent_cutoff_timezones_preserve_wire(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -149,7 +161,7 @@ class FillDisplayTests(unittest.TestCase):
         from axiom_engine.runtime.fill_display import _identity
         with tempfile.TemporaryDirectory() as temp:
             original=build_fill_display(self.account,display=files(Path(temp)/'data',self.account)).to_dict()
-            for i,change in enumerate(('anchor','cutoff','unit','provenance')):
+            for i,change in enumerate(('anchor','cutoff','unit','provenance','account_start')):
                 wire=deepcopy(original);inputs=wire['consumed_input']
                 if change in ('anchor','cutoff'):
                     manifest=json.loads(wire['manifest_text']);ctx=manifest['context']
@@ -161,6 +173,7 @@ class FillDisplayTests(unittest.TestCase):
                 elif change=='unit':
                     inputs['account_unit']=inputs['source_unit']=inputs['target_unit']='USD/share'
                     for c in wire['coordinates']:c['source_unit']=c['target_unit']='USD/share'
+                elif change=='account_start':inputs['account_scope']['start_session']='2024-01-08'
                 else:
                     fact=inputs['facts'][0];fact['scale_meta']['factor_provenance']['session']='2020-01-02'
                     for c in wire['coordinates']:

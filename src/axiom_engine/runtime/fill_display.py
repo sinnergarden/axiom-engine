@@ -148,20 +148,28 @@ def _identity(wire):
 
 
 def _basis_reason(fill, run_events, data_events):
-    relevant = [e for e in run_events if e["security_id"] == fill["security_id"] and
-                fill["session"] > e["effective_date"]]
-    for event in relevant:
-        matches = [e for e in data_events if e.get("event_id") == event["event_id"] and
-                   e.get("security_id") == event["security_id"]]
-        if len(matches) != 1 or not matches[0].get("new_price_basis_session") or \
-                matches[0]["new_price_basis_session"] != event.get("new_price_basis_session"):
-            return "NEW_PRICE_BASIS_UNVERIFIED"
-        if fill["session"] < event["new_price_basis_session"]:
-            return "NEW_PRICE_BASIS_UNVERIFIED"
-    known = {e["event_id"] for e in relevant}
+    sid, day = fill["security_id"], fill["session"]
+    originals = {e["event_id"]:e for e in run_events if e["security_id"] == sid and day >= e["effective_date"]}
+    observed = {}
     for event in data_events:
-        if event.get("event_type") == "unit_split" and event.get("security_id") == fill["security_id"] and \
-                event.get("effective_date") and fill["session"] > event["effective_date"] and event.get("event_id") not in known:
+        if event.get("security_id") != sid or event.get("event_type") != "unit_split": continue
+        if not event.get("effective_date"): return "NEW_PRICE_BASIS_UNVERIFIED"
+        if day >= event["effective_date"]: observed[event["event_id"]] = event
+    for event_id in originals.keys() | observed.keys():
+        original, current = originals.get(event_id), observed.get(event_id)
+        effective = (original or current)["effective_date"]
+        if current is not None and current["effective_date"] != effective:
+            return "NEW_PRICE_BASIS_UNVERIFIED"
+        # An explicit EOD phase leaves the actual same-day open in old units.
+        if day == effective and ((current or {}).get("effective_phase") == "end_of_day" or
+                (current is None and (original or {}).get("effective_phase") == "end_of_day")):
+            continue
+        if current is None or not current.get("new_price_basis_session") or not current.get("new_price_basis_basis"):
+            return "NEW_PRICE_BASIS_UNVERIFIED"
+        basis = current["new_price_basis_session"]
+        if day == effective and (current.get("effective_phase") != "not_stated" or basis != day):
+            return "NEW_PRICE_BASIS_UNVERIFIED"
+        if basis > day or (original is not None and original.get("new_price_basis_session") != basis):
             return "NEW_PRICE_BASIS_UNVERIFIED"
     return None
 
@@ -337,6 +345,7 @@ def _verify_report(report):
     require(scope["snapshot_id"] == manifest["context"]["snapshot_id"] and
         scope["start_session"] <= scope["end_session"] == inputs["anchor_session"] and
         scope["sessions"] == sorted(set(scope["sessions"])) and set(scope["sessions"]) <= set(query["sessions"]) and
+        all(scope["start_session"] <= d <= scope["end_session"] for d in scope["sessions"]) and
         set(scope["universe"]) == set(query["symbols"]), "saved account/display scope differs")
     _event_scope(inputs["run_unit_events"],inputs["data_unit_events"],inputs["knowledge_cutoff"])
     for fact in inputs["facts"]:
