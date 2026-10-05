@@ -1,4 +1,4 @@
-"""Pure weekly Top5 planning over unchanged, saved Research predictions."""
+"""Pure weekly TopK planning over unchanged, saved Research predictions."""
 from datetime import datetime
 from decimal import Context, Decimal, ROUND_HALF_UP, localcontext
 import re
@@ -7,7 +7,13 @@ from .contracts import Document, digest, fields, integer, number, require, sessi
 from .portfolio import PortfolioDecision, decimal, minor
 
 STOCK_PORTFOLIO_VERSION = "axiom.stock_portfolio/1"
+TOPK_PORTFOLIO_VERSION = "axiom.stock_portfolio/2"
 BUDGET_BASIS = "available_cash_plus_previous_close_positions_excluding_receivables"
+
+
+def validate_top_k(top_k, supported):
+    require(type(top_k) is int and 1 <= top_k <= len(supported),
+            "top_k must be a positive integer within the frozen execution universe")
 
 
 class StockPredictionFrame(Document):
@@ -68,13 +74,13 @@ def validate_stock_predictions(frame):
     return wire, indexed
 
 
-def plan_stock_portfolio(frame, *, account, context):
+def plan_stock_portfolio(frame, *, account, context, top_k=None):
     """Equal deployable-wealth targets; no execution facts, receivables or I/O."""
     with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
-        return _plan(frame, account, context)
+        return _plan(frame, account, context, top_k)
 
 
-def _plan(frame, account, context):
+def _plan(frame, account, context, top_k):
     wire, rows = validate_stock_predictions(frame)
     fields(context, "trade_session feature_session decision_time knowledge_cutoff reference_prices lot_size commission_rate minimum_commission_minor slippage_bps account_state_version supported_security_ids supported_universe_ref")
     session(context["trade_session"]); session(context["feature_session"])
@@ -86,6 +92,11 @@ def _plan(frame, account, context):
     require(type(supported) is list and bool(supported) and len(set(supported)) == len(supported) and
             set(supported) <= set(wire["universe"]), "explicit supported prediction subset required")
     digest(context["supported_universe_ref"])
+    legacy = top_k is None
+    k = 5 if legacy else top_k
+    if not legacy:
+        validate_top_k(k, supported)
+    version = STOCK_PORTFOLIO_VERSION if legacy else TOPK_PORTFOLIO_VERSION
     fields(account, "cash_minor positions version")
     integer(account["cash_minor"]); integer(account["version"])
     require(account["version"] == context["account_state_version"], "account version conflict")
@@ -105,18 +116,22 @@ def _plan(frame, account, context):
         require(instant(row["knowledge_cutoff"]) == cutoff and instant(row["available_at"]) <= decision,
                 "future/inconsistent prediction cutoff")
     eligible = [row for row in batch if row["member"] and row["security_id"] in supported]
-    result = {"contract_version": STOCK_PORTFOLIO_VERSION, "feature_session": context["feature_session"],
+    result = {"contract_version": version, "feature_session": context["feature_session"],
         "trade_session": context["trade_session"], "signal_ref": wire["signal_run_ref"],
         "supported_universe_ref": context["supported_universe_ref"], "expected_account_version": account["version"],
         "status": "DECISION_COMPLETE", "selected_security_ids": [], "targets": {}, "intents": [], "trace": []}
+    if not legacy:
+        result["top_k"] = k
     invalid = [row for row in eligible if not row["valid"]]
-    if invalid or len(eligible) < 5:
+    valid_count = len(eligible) if legacy else sum(row["valid"] for row in eligible)
+    if invalid or valid_count < k:
         result["status"] = "NO_DECISION"
         result["trace"] = [{"reason": "INVALID_SIGNAL", "security_id": row["security_id"], "detail": row["invalid_reason"]} for row in invalid]
-        if len(eligible) < 5:
-            result["trace"].append({"reason": "INSUFFICIENT_ELIGIBLE_MEMBERS", "count": len(eligible)})
+        if valid_count < k:
+            result["trace"].append({"reason": "INSUFFICIENT_ELIGIBLE_MEMBERS", "count": valid_count,
+                                    **({} if legacy else {"top_k": k})})
         return PortfolioDecision.from_dict(result)
-    selected = [row["security_id"] for row in sorted(eligible, key=lambda row: (-row["score"], row["security_id"]))[:5]]
+    selected = [row["security_id"] for row in sorted(eligible, key=lambda row: (-row["score"], row["security_id"]))[:k]]
     result["selected_security_ids"] = selected
     needed = set(selected) | set(account["positions"])
     prices = {}
@@ -134,7 +149,7 @@ def _plan(frame, account, context):
     budget = Decimal(account["cash_minor"]) + sum(Decimal(position["quantity"]) * prices[security] * 100
                                                   for security, position in account["positions"].items())
     for security in sorted(needed):
-        result["targets"][security] = int(budget / 5 / (prices[security] * 100)) // 100 * 100 if security in selected else 0
+        result["targets"][security] = int(budget / k / (prices[security] * 100)) // 100 * 100 if security in selected else 0
     for security, position in sorted(account["positions"].items()):
         reduction = max(0, position["quantity"] - result["targets"].get(security, 0))
         quantity = min(reduction, position["sellable_quantity"])
@@ -147,10 +162,12 @@ def _plan(frame, account, context):
         quantity = max(0, result["targets"][security] - current) // 100 * 100
         if quantity:
             result["intents"].append({"security_id": security, "side": "BUY", "quantity": quantity})
-    result["trace"].append({"reason": "RAW_TOP5", "eligible_count": len(eligible), "tie_break": "security_id_asc",
+    result["trace"].append({"reason": "RAW_TOP5" if legacy else "RAW_TOP_K", "eligible_count": len(eligible),
+        **({} if legacy else {"top_k": k}), "tie_break": "security_id_asc",
         "budget_basis": BUDGET_BASIS, "reference_budget_minor": minor(budget), "sizing": "previous_native_close",
         "score_semantics": wire["score_semantics"], "cash_check": "actual_fill_cash"})
-    identity = Document.from_dict({"contract": STOCK_PORTFOLIO_VERSION, "frame": wire, "context": context, "account": account}).identity
+    identity = Document.from_dict({"contract": version, "frame": wire, "context": context, "account": account,
+                                  **({} if legacy else {"top_k": k})}).identity
     for index, intent in enumerate(result["intents"]):
         intent.update(intent_id=identity + ":" + str(index), expected_account_version=account["version"], valid_until=context["trade_session"])
     return PortfolioDecision.from_dict(result)

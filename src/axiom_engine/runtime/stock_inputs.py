@@ -2,7 +2,7 @@
 import re
 
 from ..core.contracts import Document, digest, fields, integer, require, session, text
-from ..core.stock_portfolio import BUDGET_BASIS, StockPredictionFrame, instant, validate_stock_predictions
+from ..core.stock_portfolio import BUDGET_BASIS, StockPredictionFrame, instant, validate_stock_predictions, validate_top_k
 from ..core.portfolio import decimal
 from .profiles import stock_daily_open_profile
 from .stock_evidence import native_batches, native_ref
@@ -10,6 +10,16 @@ from .stock_evidence import native_batches, native_ref
 ELIGIBILITY_ID = "sz_main_a_000_002_003_v1"
 ACTION_POLICY = "observed_implemented_only"
 TAX_CONVENTION = "gross_before_tax_no_personal_tax_model"
+
+
+def stock_portfolio_policy(*, top_k: int, execution_universe: list[str]) -> dict:
+    """Pure explicit TopK configuration; never read members, prices or predictions."""
+    require(type(execution_universe) is list and bool(execution_universe) and
+            execution_universe == supported_universe(execution_universe) and
+            len(set(execution_universe)) == len(execution_universe), "frozen supported execution universe required")
+    validate_top_k(top_k, execution_universe)
+    return {"eligibility_id": ELIGIBILITY_ID, "top_k": top_k,
+            "rebalance": "weekly_first_trading_session", "budget_basis": BUDGET_BASIS}
 
 
 def supported_universe(universe):
@@ -113,8 +123,9 @@ def validate_stock_request(plan):
     require(plan["prediction_universe"] == signal["universe"] and universe == supported_universe(signal["universe"]),
             "stock prediction/execution scope mismatch")
     require(bool(universe) and plan["supported_universe_ref"] == support_ref(universe), "stock support identity mismatch")
-    require(plan["portfolio_policy"] == {"eligibility_id": ELIGIBILITY_ID, "top_k": 5,
-            "rebalance": "weekly_first_trading_session", "budget_basis": BUDGET_BASIS}, "unsupported stock portfolio policy")
+    policy = plan["portfolio_policy"]
+    require(policy == stock_portfolio_policy(top_k=policy.get("top_k"), execution_universe=universe),
+            "unsupported stock portfolio policy")
     digest(plan["admission_ref"])
     evidence = dict(plan["admission_evidence"])
     recorded = evidence.pop("admission_ref", None)
