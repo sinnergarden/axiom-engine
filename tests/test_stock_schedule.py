@@ -326,6 +326,18 @@ class StockScheduleTests(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "budget exceeded: max_input_bytes"):
                 run_backtest(request, limits=limits)
 
+    def test_resource_budget_reuses_one_decoded_request_without_skipping_admission(self):
+        request = scheduled_request()
+        limits = {"max_folds": 2, "max_prediction_rows": 60, "max_market_rows": 66,
+                  "max_input_bytes": len(request.payload.encode("utf-8"))}
+        from axiom_engine.runtime import stock_inputs
+        with patch.object(BacktestRequest, "to_dict", autospec=True, side_effect=BacktestRequest.to_dict) as decode, \
+             patch.object(stock_inputs, "validate_stock_request", wraps=stock_inputs.validate_stock_request) as admission:
+            result = run_backtest(request, limits=limits)
+        self.assertEqual(decode.call_count, 1)
+        self.assertEqual(admission.call_count, 1)
+        self.assertEqual(result.to_dict()["status"], "COMPLETE")
+
     def test_v4_membership_query_keeps_complete_original_feature_cutoffs(self):
         for side in ("model", "execution"):
             for mutation in ("late", "missing", "extra"):

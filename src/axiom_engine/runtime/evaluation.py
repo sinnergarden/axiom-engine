@@ -62,7 +62,7 @@ def long_history_evaluation_spec():
 def _verify_run(run):
     require(isinstance(run, BacktestRun), "saved BacktestRun required")
     wire = run.to_dict()
-    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4") and wire.get("status") == "COMPLETE",
+    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4", "backtest_run_v5") and wire.get("status") == "COMPLETE",
             "complete saved account result required")
     recorded = wire.pop("content_digest", None)
     require(recorded == Document.from_dict(wire).identity, "saved result content digest mismatch")
@@ -77,6 +77,9 @@ def _verify_run(run):
                 "saved v2 tuple mismatch")
         _validate(BacktestRequest.from_dict(wire["plan"]))
         validate_saved_applications(wire)
+    if wire["contract_version"] == "backtest_run_v5":
+        from .etf_inputs import validate_saved_v5
+        validate_saved_v5(wire)
     if wire["contract_version"] in ("backtest_run_v3", "backtest_run_v4"):
         from .stock_inputs import validate_stock_request, validate_saved_stock_core
         require(wire["runtime_version"] == ("axiom.backtest/4" if wire["contract_version"] == "backtest_run_v4" else "axiom.backtest/3") and
@@ -178,10 +181,11 @@ def _validate_scope(scope, run, snapshots):
         for action in wire["actions"]:
             validate_cash_action(action, wire["universe"], wire["source_refs"])
         return wire
+    universe = plan["market_replay"]["universe"] if plan["contract_version"] == "backtest_request_v5" else plan["signal_frame"]["universe"]
     require(wire["contract_version"] == "dividend_scope_v1" and wire["coverage"] == "observed_records_only" and
             wire["start_session"] == plan["start_session"] and wire["end_session"] == plan["end_session"] and
-            set(wire["universe"]) == set(plan["signal_frame"]["universe"]) and
-            len(wire["universe"]) == len(plan["signal_frame"]["universe"]), "dividend observation scope mismatch")
+            set(wire["universe"]) == set(universe) and
+            len(wire["universe"]) == len(universe), "dividend observation scope mismatch")
     timestamp(wire["knowledge_cutoff"])
     require(wire["knowledge_cutoff"] == plan["end_session"] + "T12:30:00Z", "frozen end knowledge cutoff required")
     observed_snapshots = _provenance(wire)

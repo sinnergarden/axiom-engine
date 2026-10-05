@@ -14,7 +14,7 @@ PRESERVED = ("input_run_ref", "signal_ref", "market_ref", "profile_ref", "series
              "benchmark_ref", "benchmark_input", "dividend_scope_ref", "dividend_scope")
 
 
-def analysis_evaluation_spec(*, risk_free):
+def analysis_evaluation_spec(*, risk_free, benchmark_projection_version="benchmark_comparison_v1"):
     """A required explicit CNY effective annual rate, including a named assumption."""
     from .evaluation import EvaluationSpec, long_history_evaluation_spec
     fields(risk_free, "currency annual_effective_rate source")
@@ -28,6 +28,10 @@ def analysis_evaluation_spec(*, risk_free):
         "interval":"left_closed_right_open", "minimum_episodes":10},
         benchmark_keys=list(BENCHMARK_KEYS), benchmark_alignment="exact_native_session_date_no_fill",
         cross_currency_relative_policy="null_without_fx", cross_market_clock="retrospective_local_session")
+    require(benchmark_projection_version in ("benchmark_comparison_v1", "benchmark_comparison_v2"),
+            "unsupported benchmark projection version")
+    if benchmark_projection_version == "benchmark_comparison_v2":
+        spec["benchmark_projection_version"] = benchmark_projection_version
     return EvaluationSpec.from_dict(spec)
 
 
@@ -217,8 +221,9 @@ def _evaluate(run, base_report, benchmarks, spec):
             "base evaluation belongs to a different saved account")
     require(isinstance(spec,EvaluationSpec), "EvaluationSpec required")
     sw = spec.to_dict()
-    require(sw == analysis_evaluation_spec(risk_free=sw.get("risk_free")).to_dict(), "unsupported analysis spec")
-    comparisons, inputs, refs = benchmark_comparisons(base,benchmarks)
+    projection = sw.get("benchmark_projection_version", "benchmark_comparison_v1")
+    require(sw == analysis_evaluation_spec(risk_free=sw.get("risk_free"), benchmark_projection_version=projection).to_dict(), "unsupported analysis spec")
+    comparisons, inputs, refs = benchmark_comparisons(base,benchmarks,projection_version=projection)
     returns = _returns(base)
     wire = {k:v for k,v in base.items() if k not in ("content_digest","evaluation_ref")}
     wire.update(contract_version="evaluation_report_v3",evaluation_version=ANALYSIS_VERSION,
@@ -247,7 +252,8 @@ def verify_analysis_wire(wire):
         wire["base_evaluation_content_digest"] == base["content_digest"], "unbound saved base evaluation")
     require(all(wire[k] == base[k] for k in PRESERVED), "saved v2 facts changed inside analysis")
     spec=wire["spec"]
-    require(spec == analysis_evaluation_spec(risk_free=spec.get("risk_free")).to_dict() and
+    require(spec == analysis_evaluation_spec(risk_free=spec.get("risk_free"),
+        benchmark_projection_version=spec.get("benchmark_projection_version", "benchmark_comparison_v1")).to_dict() and
         wire["spec_ref"] == EvaluationSpec.from_dict(spec).identity and wire["evaluation_version"] == ANALYSIS_VERSION,
         "saved analysis spec/version mismatch")
     fields(wire["benchmark_inputs"]," ".join(BENCHMARK_KEYS));fields(wire["benchmark_refs"]," ".join(BENCHMARK_KEYS))
@@ -256,7 +262,7 @@ def verify_analysis_wire(wire):
         if k == "NASDAQ100" or (k == "SSE_COMPOSITE" and native is None):
             require(native is None and wire["benchmark_refs"][k] is None and
                     wire["benchmark_comparisons"][k]["status"] == "SOURCE_UNAVAILABLE",
-                    "new benchmark native contract awaits the Data owner handoff")
+                    "direct Nasdaq input unsupported or unavailable saved comparison differs")
         elif k == "SSE_COMPOSITE":
             from .retrospective_benchmark import validate_sse_for_base
             validate_sse_for_base(native,base)
@@ -431,3 +437,43 @@ def _validate_outputs(wire, base):
             complete=anchor_close is not None and all(indexed.get(p["session"]) is not None and
                 indexed[p["session"]]["close"] is not None for p in base["series"])
             require(comparison["status"]==("COMPLETE" if complete else "PARTIAL"),"saved benchmark missing/status differs")
+    _validate_drawdown_projection(wire, base)
+
+
+def _validate_drawdown_projection(wire, base):
+    """Validate saved fields and owner links without calculating drawdowns."""
+    v2 = wire["spec"].get("benchmark_projection_version") == "benchmark_comparison_v2"
+    for key, comparison in wire["benchmark_comparisons"].items():
+        points = [*comparison["native_series"], *comparison["series"]]
+        if not v2:
+            require("projection_version" not in comparison and "max_drawdown" not in comparison and
+                    all("benchmark_drawdown" not in p for p in points), "unbound benchmark projection version")
+            continue
+        require(comparison.get("projection_version") == "benchmark_comparison_v2" and "max_drawdown" in comparison and
+                all("benchmark_drawdown" in p for p in points), "incomplete saved drawdown projection")
+        _nullable_decimal(comparison["max_drawdown"])
+        require(comparison["max_drawdown"] is None or -1 < decimal(comparison["max_drawdown"]) <= 0,
+                "invalid benchmark maximum drawdown")
+        if comparison["status"] == "SOURCE_UNAVAILABLE":
+            require(comparison["max_drawdown"] is None, "unavailable benchmark has drawdown")
+            continue
+        if key == "CSI300":
+            owner = {comparison["anchor_session"]: "0" if comparison["anchor_close"] is not None else None,
+                     **{p["session"]: p["drawdown"] for p in base["benchmark"]["series"]}}
+            require(comparison["max_drawdown"] == base["benchmark"]["max_drawdown"], "CSI owner drawdown changed")
+        else:
+            owner, missing = {}, comparison["anchor_close"] is None
+            for point in comparison["native_series"]:
+                missing = missing or point["close"] is None
+                value = point["benchmark_drawdown"]
+                require((value is None) == missing, "saved drawdown gap or anchor differs")
+                _nullable_decimal(value)
+                require(value is None or -1 < decimal(value) <= 0, "invalid saved benchmark drawdown")
+                if point["native_session"] == comparison["anchor_session"]:
+                    require(value is None or decimal(value).is_zero(), "anchor drawdown differs")
+                owner[point["native_session"]] = value
+            require((comparison["max_drawdown"] is None) == missing, "saved maximum drawdown eligibility differs")
+        for point in comparison["native_series"]:
+            require(point["benchmark_drawdown"] == owner[point["native_session"]], "native owner drawdown differs")
+        for point in comparison["series"]:
+            require(point["benchmark_drawdown"] == owner.get(point["account_session"]), "projected owner drawdown differs")

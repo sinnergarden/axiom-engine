@@ -44,7 +44,35 @@ def _project_native(base, native, input_ref):
         native_series=native_series,series=projected)
 
 
-def benchmark_comparisons(base, benchmarks):
+def _add_drawdowns(base, comparison, key):
+    """Copy CSI authority; calculate SSE once from the admitted native prices."""
+    anchor = comparison["anchor_session"]
+    if key == "CSI300":
+        values = {anchor: "0" if comparison["anchor_close"] is not None else None,
+                  **{p["session"]: p["drawdown"] for p in base["benchmark"]["series"]}}
+        worst = base["benchmark"]["max_drawdown"]
+    else:
+        peak = None if comparison["anchor_close"] is None else decimal(comparison["anchor_close"])
+        values, worst, complete = {}, Decimal(0), peak is not None
+        for point in comparison["native_series"]:
+            close = None if point["close"] is None else decimal(point["close"])
+            if close is None:
+                peak, complete = None, False
+            value = None
+            if peak is not None:
+                peak = max(peak, close)
+                value = close / peak - 1
+                worst = min(worst, value)
+            values[point["native_session"]] = None if value is None else str(value)
+        worst = str(worst) if complete else None
+    comparison.update(projection_version="benchmark_comparison_v2", max_drawdown=worst)
+    for point in comparison["native_series"]:
+        point["benchmark_drawdown"] = values[point["native_session"]]
+    for point in comparison["series"]:
+        point["benchmark_drawdown"] = values.get(point["account_session"])
+
+
+def benchmark_comparisons(base, benchmarks, *, projection_version="benchmark_comparison_v1"):
     from .evaluation import BenchmarkSeries, _validate_benchmark_wire
     fields(benchmarks," ".join(BENCHMARK_KEYS))
     anchor=base["period_metrics"]["window"]["anchor_session"]
@@ -59,6 +87,8 @@ def benchmark_comparisons(base, benchmarks):
                 native_calendar=None,timezone=None,clock_scope="RETROSPECTIVE_LOCAL_SESSION",
                 status="SOURCE_UNAVAILABLE",unavailable_reason="OWNER_NATIVE_INPUT_NOT_SUPPLIED",
                 anchor_session=anchor,anchor_close=None,native_series=[],series=[])
+            if projection_version == "benchmark_comparison_v2":
+                comparisons[key].update(projection_version=projection_version, max_drawdown=None)
             continue
         require(isinstance(value,BenchmarkSeries),"BenchmarkSeries required")
         native=value.to_dict()
@@ -67,11 +97,13 @@ def benchmark_comparisons(base, benchmarks):
                     "original CSI300 benchmark cannot be replaced")
             _validate_benchmark_wire(native,days,set())
         else:
-            require(key == "SSE_COMPOSITE", "new benchmark native contract awaits the Data owner handoff")
+            require(key == "SSE_COMPOSITE", "direct Nasdaq input unsupported; use the independent saved ETF account")
             from .retrospective_benchmark import validate_sse_for_base
             validate_sse_for_base(native,base)
         inputs[key],refs[key]=native,value.identity
         comparisons[key]=_project_native(base,{**native,"currency":"CNY","timezone":"Asia/Shanghai"},value.identity)
+        if projection_version == "benchmark_comparison_v2":
+            _add_drawdowns(base, comparisons[key], key)
         if key == "SSE_COMPOSITE":
             comparisons[key].update(observation_snapshot_id=native["snapshot_id"],observation_cutoff=native["knowledge_cutoff"],
                 observation_pit_policy=native["pit_policy"],observation_purpose=native["purpose"])
