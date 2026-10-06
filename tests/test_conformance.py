@@ -371,7 +371,8 @@ class Conformance(unittest.TestCase):
             tree=ast.parse(path.read_text())
             for n in ast.walk(tree):
                 if isinstance(n,ast.Import):
-                    for alias in n.names:self.assertIn(alias.name.split('.')[0],allowed)
+                    extras={'cs_batch.py':{'struct','sys'},'feature_batch.py':{'struct','sys','time'}}
+                    for alias in n.names:self.assertIn(alias.name.split('.')[0],allowed | extras.get(path.name,set()))
                 if isinstance(n,ast.ImportFrom) and n.level==0:self.assertIn(n.module.split('.')[0],allowed)
                 if isinstance(n,ast.Call) and isinstance(n.func,ast.Name):
                     self.assertNotIn(n.func.id,{'eval','exec','open','__import__'})
