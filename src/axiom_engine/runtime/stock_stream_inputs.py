@@ -8,12 +8,19 @@ from array import array
 from dataclasses import dataclass
 import hashlib
 import json
+import re
 from pathlib import Path
+from time import perf_counter
 from typing import Iterator
 from urllib.parse import unquote, urlparse
 
 from ..core.contracts import (ContractError, Document, canonical, digest, fields,
                               integer, require, session, _pairs)
+
+
+# C regex searches the existing bounded buffer by position; no suffix slice.
+_STRING_BOUNDARY = re.compile(rb'["\\]')
+_SCALAR_BOUNDARY = re.compile(rb'[,\]}]')
 
 
 def _hash(raw):
@@ -38,6 +45,7 @@ class _DecodedMemory:
         self.globals = {}
         self.global_bytes = 0
         self.temporary_bytes = 0
+        self.peak_bytes = 0
 
     @property
     def available(self):
@@ -49,11 +57,13 @@ class _DecodedMemory:
             return
         require(size <= self.available, "Stock cumulative decoded budget exceeded before cache allocation")
         self.globals[key] = size; self.global_bytes += size
+        self.peak_bytes = max(self.peak_bytes, self.global_bytes + self.temporary_bytes)
 
     def replace_global(self, key, size):
         old = self.globals.get(key, 0)
         require(size-old <= self.available, "Stock cumulative decoded budget exceeded before state growth")
         self.globals[key] = size; self.global_bytes += size-old
+        self.peak_bytes = max(self.peak_bytes, self.global_bytes + self.temporary_bytes)
 
     def release_global(self, key):
         self.global_bytes -= self.globals.pop(key, 0)
@@ -70,6 +80,8 @@ class _DecodedStage:
     def reserve(self, size):
         require(size <= self.memory.available, "Stock cumulative decoded budget exceeded before temporary growth")
         self.memory.temporary_bytes += size; self.used += size
+        self.memory.peak_bytes = max(self.memory.peak_bytes,
+                                     self.memory.global_bytes + self.memory.temporary_bytes)
 
     def release(self, size):
         require(0 <= size <= self.used, "Invalid decoded reservation release")
@@ -148,6 +160,16 @@ class _CanonicalIndex:
         self._object_headers = {}
         self._whole_value = None
         self.size = self.path.stat().st_size
+        self.statistics = {"file_bytes": self.size, "scan_seconds": 0.0,
+            "read_calls": 0, "scan_read_bytes": 0, "read_seconds": 0.0, "hash_seconds": 0.0,
+            "content_hash_bytes": 0, "file_hash_bytes": 0,
+            "scalar_count": 0, "scalar_batches": 0, "scalar_bytes": 0,
+            "scalar_decode_seconds": 0.0, "scalar_canonical_seconds": 0.0,
+            "row_decode_count": 0, "row_decode_seconds": 0.0,
+            "reread_bytes": 0, "reread_calls": 0,
+            "local_decode_count": 0, "local_decode_seconds": 0.0,
+            "span_identity_count": 0, "span_identity_seconds": 0.0,
+            "unsigned_identity_count": 0, "unsigned_identity_seconds": 0.0}
         stat = self.path.stat()
         self._stat = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
         self._header_hashes = {}
@@ -173,6 +195,7 @@ class _CanonicalIndex:
         self._metadata_fields = None
         self._array_counts = {}
         self._indexed_rows = 0
+        scan_started = perf_counter()
         with self._memory.stage() as self._scan_stage:
             with self.path.open("rb", buffering=0) as self._stream:
                 require(self._peek() == 123, "Stock artifact must be a canonical JSON object")
@@ -182,6 +205,7 @@ class _CanonicalIndex:
                     self._take()
                 require(self._peek() is None, "Trailing or noncanonical stock artifact bytes")
             self._buffer = b""
+        self.statistics["scan_seconds"] = perf_counter() - scan_started
         self.unchanged()
         self.content_digest = "sha256:" + self._hash.hexdigest()
         self.file_digest = "sha256:" + self._file_hash.hexdigest()
@@ -209,14 +233,22 @@ class _CanonicalIndex:
             count = min(65536, self.budget["max_read_bytes"], self._memory.available)
             require(count > 0, "Stock cumulative decoded budget exceeded before scan buffer allocation")
             self._scan_stage.reserve(count)
+            reading = perf_counter()
             self._buffer = self._stream.read(count)
+            self.statistics["read_seconds"] += perf_counter() - reading
+            self.statistics["read_calls"] += 1
+            self.statistics["scan_read_bytes"] += len(self._buffer)
             self._scan_stage.release(count-len(self._buffer))
+            hashing = perf_counter()
             self._file_hash.update(self._buffer)
             # A single terminal LF is delivery formatting.  The original
             # canonical identity excludes it; the actual file hash retains it.
             last = self._stream.tell() == self.size and self._buffer.endswith(b"\n")
             self._terminal_lf = self._terminal_lf or last
             self._hash.update(memoryview(self._buffer)[:-1] if last else self._buffer)
+            self.statistics["hash_seconds"] += perf_counter() - hashing
+            self.statistics["file_hash_bytes"] += len(self._buffer)
+            self.statistics["content_hash_bytes"] += len(self._buffer) - int(last)
             self._cursor = 0
         return self._buffer[self._cursor] if self._buffer else None
 
@@ -236,31 +268,59 @@ class _CanonicalIndex:
     def _scalar(self):
         stage = self._memory.stage()
         raw = bytearray()
-        def take():
-            stage.reserve(1)
-            raw.append(self._take())
+        self.statistics["scalar_count"] += 1
+        def take(count):
+            # Reserve both growing destinations before copying or advancing.
+            # A view of this read chunk is retired before the next _peek.
+            require(0 < count <= len(self._buffer)-self._cursor, "Invalid bounded scalar span")
+            stage.reserve(count)
+            if self._capture is not None:
+                self._capture_stage.reserve(count)
+            with memoryview(self._buffer) as whole:
+                with whole[self._cursor:self._cursor+count] as piece:
+                    raw.extend(piece)
+                    if self._capture is not None:
+                        self._capture.extend(piece)
+            self._cursor += count; self._position += count
+            self.statistics["scalar_batches"] += 1
+            self.statistics["scalar_bytes"] += count
         try:
             if self._peek() == 34:
-                take(); escape = False
+                take(1); escape = False
                 while True:
                     byte = self._peek()
                     require(byte is not None, "Truncated stock JSON string")
-                    take()
-                    if byte == 34 and not escape:
+                    if escape:
+                        take(1); escape = False
+                        continue
+                    boundary = _STRING_BOUNDARY.search(self._buffer, self._cursor)
+                    if boundary is None:
+                        take(len(self._buffer)-self._cursor)
+                        continue
+                    count = boundary.start()-self._cursor+1
+                    closing = self._buffer[boundary.start()] == 34
+                    take(count)
+                    if closing:
                         break
-                    escape = byte == 92 and not escape
+                    escape = True
             else:
                 while self._peek() not in (None, 44, 93, 125):
-                    take()
+                    boundary = _SCALAR_BOUNDARY.search(self._buffer, self._cursor)
+                    count = (boundary.start() if boundary is not None else len(self._buffer))-self._cursor
+                    take(count)
             size = len(raw)
             # Raw, decoded scalar, canonical text and encoded comparison can
             # coexist. Reserve that growth before invoking either decoder.
             stage.reserve(3*size)
             try:
+                decoding = perf_counter()
                 value = json.loads(raw, object_pairs_hook=_pairs)
+                self.statistics["scalar_decode_seconds"] += perf_counter()-decoding
             except (ValueError, UnicodeError) as exc:
                 raise ContractError("Malformed stock JSON scalar") from exc
+            encoding = perf_counter()
             require(canonical(value).encode() == raw, "Noncanonical stock JSON scalar")
+            self.statistics["scalar_canonical_seconds"] += perf_counter()-encoding
             raw = None
             stage.release(3*size)
             return value, stage
@@ -401,7 +461,10 @@ class _CanonicalIndex:
                                 # text alive until the result graph returns.
                                 capture_stage.reserve(2*len(raw))
                                 try:
+                                    decoding = perf_counter()
                                     row = json.loads(raw, object_pairs_hook=_pairs)
+                                    self.statistics["row_decode_count"] += 1
+                                    self.statistics["row_decode_seconds"] += perf_counter()-decoding
                                 except (ValueError, UnicodeError) as exc:
                                     raise ContractError("Malformed stock JSON row") from exc
                                 require(type(row) is dict, "Stock artifact row must be an object")
@@ -452,6 +515,8 @@ class _CanonicalIndex:
             require(len(raw) + size + retained <= budget["max_decoded_bytes"],
                     "Stock decoded budget exceeded before span growth")
             chunk = stream.read(size)
+            self.statistics["reread_calls"] += 1
+            self.statistics["reread_bytes"] += len(chunk)
             require(len(chunk) == size, "Fixed stock artifact truncated after admission")
             raw.extend(chunk)
             chunk = None
@@ -471,7 +536,10 @@ class _CanonicalIndex:
             require(self._header_hashes.setdefault(path, reference) == reference,
                     "Stock artifact header changed after admission")
             try:
+                decoding = perf_counter()
                 value = json.loads(raw, object_pairs_hook=_pairs)
+                self.statistics["local_decode_count"] += 1
+                self.statistics["local_decode_seconds"] += perf_counter()-decoding
             except (ValueError, UnicodeError) as exc:
                 raise ContractError("Stock artifact header changed after admission") from exc
             raw = None
@@ -528,7 +596,10 @@ class _CanonicalIndex:
                         retained += len(raw)
                         hashed.update(raw)
                         try:
+                            decoding = perf_counter()
                             result.append(json.loads(raw, object_pairs_hook=_pairs))
+                            self.statistics["local_decode_count"] += 1
+                            self.statistics["local_decode_seconds"] += perf_counter()-decoding
                         except (ValueError, UnicodeError) as exc:
                             raise ContractError("Stock artifact segment changed after admission") from exc
                         raw = None
@@ -582,13 +653,18 @@ class _CanonicalIndex:
                 raw = self._read_span(stream, 0, self._canonical_size, budget)
             self.unchanged()
             require(_hash(raw) == self.content_digest, "Small stock artifact replaced after admission")
+            decoding = perf_counter()
             self._whole_value = json.loads(raw, object_pairs_hook=_pairs)
+            self.statistics["local_decode_count"] += 1
+            self.statistics["local_decode_seconds"] += perf_counter()-decoding
             raw = None
         return self._whole_value
 
     def span_digest(self, path):
         """Hash an original selected value without decoding its parent graph."""
         require(path in self.spans, "Missing original saved fold selector")
+        self.statistics["span_identity_count"] += 1
+        started = perf_counter()
         self.unchanged()
         hashed = hashlib.sha256()
         with self.path.open("rb", buffering=0) as stream:
@@ -599,14 +675,19 @@ class _CanonicalIndex:
                     require(count > 0, "Stock cumulative decoded budget exceeded before hash buffer allocation")
                     scratch.reserve(count)
                     raw = stream.read(count)
+                    self.statistics["reread_calls"] += 1
+                    self.statistics["reread_bytes"] += len(raw)
                     require(len(raw) == count, "Fixed stock artifact truncated during selected identity admission")
                     hashed.update(raw); length -= count; raw = None
         self.unchanged()
+        self.statistics["span_identity_seconds"] += perf_counter() - started
         return "sha256:" + hashed.hexdigest()
 
     def unsigned_digest(self, excluded):
         """Original canonical object identity with its self-reference removed."""
         hashed = hashlib.sha256(); hashed.update(b"{")
+        self.statistics["unsigned_identity_count"] += 1
+        started = perf_counter()
         self.unchanged()
         names = sorted(path[0] for path in self.spans if len(path) == 1 and path[0] != excluded)
         with self.path.open("rb", buffering=0) as stream:
@@ -622,10 +703,13 @@ class _CanonicalIndex:
                         require(count > 0, "Stock cumulative decoded budget exceeded before hash buffer allocation")
                         scratch.reserve(count)
                         raw = stream.read(count)
+                        self.statistics["reread_calls"] += 1
+                        self.statistics["reread_bytes"] += len(raw)
                         require(len(raw) == count, "Fixed stock artifact truncated during identity admission")
                         hashed.update(raw); length -= count; raw = None
         hashed.update(b"}")
         self.unchanged()
+        self.statistics["unsigned_identity_seconds"] += perf_counter() - started
         return "sha256:" + hashed.hexdigest()
 
     def object_header(self, excluded=()):
