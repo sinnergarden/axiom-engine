@@ -1,12 +1,14 @@
 """Small native saved-artifact source admission; no Data or Research runs."""
 from copy import deepcopy
 from array import array
+from dataclasses import replace
 import hashlib
 import json
 import sys
 from pathlib import Path
 import tempfile
 import unittest
+import weakref
 from unittest.mock import patch
 
 from axiom_engine.core.contracts import ContractError, Document, canonical
@@ -15,6 +17,7 @@ from axiom_engine.runtime.stock_schedule import CLOCK_POLICY
 from axiom_engine.runtime.stock_inputs import validate_stock_request
 from axiom_engine.runtime.stock_stream_contracts import logical_ref, read_budget
 from axiom_engine.runtime.stock_stream_inputs import StockInputSource, _CanonicalIndex
+from axiom_engine.runtime import stock_stream_inputs as stream_inputs
 from test_csi300_runtime import full_request
 from test_csi300 import REF
 import test_stocks as legacy
@@ -148,6 +151,112 @@ def nested_fold_fixture(root, *, spec_version=None, wrapper_version=None):
 
 
 class StockStreamInputTests(unittest.TestCase):
+    def test_native_and_audit_views_retire_before_next_decode_and_reservation_close(self):
+        class WeakMap(dict):
+            pass
+        class WeakList(list):
+            pass
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, _ = source_fixture(Path(tmp)); source = StockInputSource()
+            tracked = {}; retired = []; prediction_checks = []; view_stages = {}; active_stages = []
+            def watch(stage, label, value):
+                tracked.setdefault(id(stage), []).append((label, weakref.ref(value)))
+                return value
+            original_native = source._native
+            original_block = source._block
+            original_grid = stream_inputs._grid
+            original_rows = _CanonicalIndex.rows
+            original_close = stream_inputs._DecodedStage.close
+            original_enter = stream_inputs._DecodedStage.__enter__
+            original_exit = stream_inputs._DecodedStage.__exit__
+            from axiom_engine.core import stock_portfolio
+            original_validate = stock_portfolio.validate_stock_predictions
+            def native(role, kind, days, budget, *, reservation=None):
+                view, used, bindings = original_native(role, kind, days, budget, reservation=reservation)
+                wrapped = watch(reservation, "native:"+kind, WeakMap(view))
+                view_stages[id(wrapped)] = reservation
+                wrapped["records"] = watch(reservation, "records:"+kind, WeakList(view["records"]))
+                wrapped["field_meta"] = {name: {**field, "by_key": watch(reservation, "by_key:"+kind, WeakList(field["by_key"]))}
+                                         for name, field in view["field_meta"].items()}
+                return wrapped, used, bindings
+            def grid(batch, days, universe):
+                records, metadata = original_grid(batch, days, universe); stage = view_stages[id(batch)]
+                records = watch(stage, "grid:records", WeakMap({key: watch(stage, "grid:row", WeakMap(row)) for key, row in records.items()}))
+                metadata = watch(stage, "grid:metadata", WeakMap({name: {key: watch(stage, "grid:fact", WeakMap(row)) for key, row in rows.items()}
+                                                                for name, rows in metadata.items()}))
+                return records, metadata
+            def validate(frame):
+                wire, checked = original_validate(frame); stage = active_stages[-1]
+                rows = {key: watch(stage, "checked:row", WeakMap(row)) for key, row in checked.items()}
+                wire = watch(stage, "checked:wire", WeakMap({**wire, "rows": list(rows.values())}))
+                checked = watch(stage, "checked:index", WeakMap(rows))
+                return wire, checked
+            def block(manifest, days, budget):
+                value = original_block(manifest, days, budget); stage = value._reservation
+                market = watch(stage, "block:market", WeakMap({key: watch(stage, "block:market_row", WeakMap(row))
+                                                              for key, row in value.market_rows.items()}))
+                signals = {day: (header, watch(stage, "block:prediction_index", WeakMap(indexed)))
+                           for day, (header, indexed) in value.signals.items()}
+                return replace(value, market_rows=market, signals=signals)
+            def rows(index, path, days, budget=None, *, reservation=None):
+                if path == ("rows",):
+                    labels = [(label, ref()) for label, ref in tracked.get(id(reservation), []) if label.startswith(("native:", "records:", "by_key:"))]
+                    self.assertTrue(labels)
+                    self.assertTrue(all(value is None for _, value in labels), labels)
+                    prediction_checks.append(len(labels))
+                return original_rows(index, path, days, budget, reservation=reservation)
+            def close(stage):
+                refs = tracked.pop(id(stage), [])
+                self.assertTrue(all(ref() is None for _, ref in refs), [label for label, ref in refs if ref() is not None])
+                retired.extend(label for label, _ in refs)
+                return original_close(stage)
+            def enter(stage):
+                active_stages.append(stage)
+                return original_enter(stage)
+            def exit(stage, *args):
+                try:
+                    return original_exit(stage, *args)
+                finally:
+                    self.assertIs(active_stages.pop(), stage)
+            with patch.object(source, "_native", new=native), patch.object(source, "_block", new=block), \
+                    patch.object(stream_inputs, "_grid", new=grid), patch.object(stock_portfolio, "validate_stock_predictions", new=validate), \
+                    patch.object(_CanonicalIndex, "rows", new=rows), patch.object(stream_inputs._DecodedStage, "close", new=close), \
+                    patch.object(stream_inputs._DecodedStage, "__enter__", new=enter), patch.object(stream_inputs._DecodedStage, "__exit__", new=exit):
+                admitted(source, manifest)
+            self.assertTrue(prediction_checks)
+            self.assertIn("native:membership", retired)
+            self.assertIn("checked:row", retired)
+            self.assertIn("block:prediction_index", retired)
+            self.assertEqual(tracked, {})
+            self.assertEqual(active_stages, [])
+            self.assertEqual(source._memory.temporary_bytes, 0)
+
+    def test_fold_identity_proof_has_scratch_and_profile_physical_size_is_bound(self):
+        from axiom_engine.runtime import stock_schedule
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, _ = source_fixture(Path(tmp)); source = StockInputSource()
+            profile_path = Path(manifest["profile_input"]["artifact"]["manifest_uri"])
+            profile_path.write_bytes(profile_path.read_bytes()+b"\n")
+            verify = stock_schedule._verify_model; observations = []
+            def checked(model):
+                frame = sys._getframe(1)
+                while frame is not None and frame.f_code.co_name != "_frames":
+                    frame = frame.f_back
+                self.assertIsNotNone(frame)
+                expected = 3*(stream_inputs._encoded_size(frame.f_locals["spec"])+stream_inputs._encoded_size(model))
+                self.assertEqual(source._memory.temporary_bytes, expected)
+                observations.append(expected)
+                return verify(model)
+            with patch.object(stock_schedule, "_verify_model", side_effect=checked):
+                audit = admitted(source, manifest)
+            self.assertTrue(observations)
+            self.assertEqual(audit.globals["profile_bytes"], profile_path.stat().st_size)
+            self.assertNotIn("profile_bytes", audit.receipt)
+            # The iteration entry checks even a cached, already admitted profile.
+            profile_path.write_bytes(profile_path.read_bytes()+b"\n")
+            with self.assertRaisesRegex(ContractError, "changed after admission"):
+                next(source.iter_blocks(manifest, block_sessions=2, read_budget=read_budget(LIMITS)))
+
     def test_nested_original_v1_v2_wrappers_require_the_matching_spec_version(self):
         for wrapper, spec, accepted in (("stock_ml_fold_v1", "stock_ml_fold_spec_v1", True),
                                         ("stock_ml_fold_v2", "stock_ml_fold_spec_v2", True),

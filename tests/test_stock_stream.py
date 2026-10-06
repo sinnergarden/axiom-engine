@@ -1,11 +1,14 @@
 """The bounded adapters preserve the existing account's exact business facts."""
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
+import weakref
 
-from axiom_engine.core.contracts import ContractError
+from axiom_engine.core.contracts import ContractError, canonical
 from axiom_engine.runtime.backtest import BacktestRequest, run_backtest, save_backtest_run
 from axiom_engine.runtime.accounting import AccountLedger
 from axiom_engine.runtime.stock_stream import run_stock_backtest, stock_run_id
@@ -51,6 +54,88 @@ def map_run_ids(value, old, new):
 
 
 class StockStreamTests(unittest.TestCase):
+    def test_runtime_retires_block_borrowers_before_next_source_decode(self):
+        class Tracked(dict):
+            pass
+
+        test = self
+        class ProbeSource(StockInputSource):
+            probing = False
+
+            def __init__(self):
+                super().__init__()
+                self.borrowers = []
+                self.probes = 0
+
+            def iter_blocks(self, *args, **kwargs):
+                self.probing = True
+                try:
+                    yield from super().iter_blocks(*args, **kwargs)
+                finally:
+                    self.probing = False
+
+            def _block(self, *args, **kwargs):
+                if self.probing:
+                    test.assertTrue(all(ref() is None for ref in self.borrowers),
+                                    "previous block still live before next source decode")
+                    self.probes += 1
+                block = super()._block(*args, **kwargs)
+                if not self.probing:
+                    return block
+
+                def track(value):
+                    value = Tracked(value)
+                    self.borrowers.append(weakref.ref(value))
+                    return value
+
+                return replace(block,
+                    market_rows={key: track(row) for key, row in block.market_rows.items()},
+                    signals={day: (header, track({key: track(row) for key, row in indexed.items()}))
+                             for day, (header, indexed) in block.signals.items()})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); manifest, legacy = source_fixture(root)
+            source = ProbeSource()
+            sink = StockResultSink(root / "parts", run_id=stock_run_id(manifest))
+            run = run_stock_backtest(BacktestRequest.from_dict(manifest), source=source,
+                sink=sink, block_sessions=1, limits=LIMITS).to_dict()
+            self.assertEqual(source.probes, len(manifest["scope"]["calendar"]))
+            self.assertTrue(all(ref() is None for ref in source.borrowers))
+            old = run_backtest(BacktestRequest.from_dict(legacy)).to_dict()
+            self.assertEqual(run["final_account"], old["final_account"])
+            self.assertEqual(run["metrics"], old["metrics"])
+
+    def test_total_result_budget_closes_before_seal_and_loads_at_exact_boundary(self):
+        for profile_lf in (False, True):
+            with self.subTest(profile_lf=profile_lf), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); manifest, _ = source_fixture(root)
+                profile = Path(manifest["profile_input"]["artifact"]["manifest_uri"])
+                if profile_lf:
+                    with profile.open("ab") as saved:
+                        saved.write(b"\n")
+                output = root / "out"
+                wire, _, sink = execute(output, manifest)
+                parts_bytes = sink.total_bytes
+                total = parts_bytes + (output / "run.json").stat().st_size + profile.stat().st_size
+                self.assertEqual((output / "run.json").stat().st_size,
+                    len(canonical(wire).encode("utf-8")) + 1)
+                for maximum in (total, total - 1, parts_bytes):
+                    with self.subTest(maximum=maximum):
+                        shutil.rmtree(output)
+                        limits = {**LIMITS, "max_result_bytes": maximum}
+                        if maximum == total:
+                            loaded, projection, _ = execute(output, manifest, limits=limits)
+                            self.assertEqual(loaded, wire)
+                            self.assertEqual(projection.wire, wire)
+                        else:
+                            failed_sink = StockResultSink(output / "parts", run_id=stock_run_id(manifest))
+                            with patch("axiom_engine.runtime.stock_stream.BacktestRun.from_dict") as seal:
+                                with self.assertRaisesRegex(ContractError, "before run seal"):
+                                    run_stock_backtest(BacktestRequest.from_dict(manifest), source=StockInputSource(),
+                                        sink=failed_sink, block_sessions=2, limits=limits)
+                                seal.assert_not_called()
+                            self.assertFalse((output / "run.json").exists())
+
     def test_two_blocks_match_v6_and_other_layouts_exactly(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); manifest, legacy = source_fixture(root)

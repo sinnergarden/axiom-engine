@@ -483,6 +483,10 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                     append_output("orders", order)
                     if streaming:
                         storage.observe_order(order)
+                if streaming:
+                    # These borrow the current source block or pending output.
+                    # Drop them before a later session can advance that block.
+                    active = active_rows = first = context = decision = intent = order = None
             for action in market["cash_dividends"]:
                 if action["record_session"] == day:
                     entitlements[action["event_id"]] = ledger.positions.get(action["security_id"], {"quantity": 0})["quantity"]
@@ -501,6 +505,8 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                 quotes[security] = quote
                 marks[security] = quote
                 mark_basis[security] = None
+        if streaming:
+            row = None
         if day < plan["start_session"]:
             continue
         for item in sorted(splits, key=lambda i: i["event"]["event_id"]):
@@ -532,6 +538,8 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
             if v6:
                 point["stale_reason"] = rows[day, security]["_stock_close_missing_reason"] if mark["session"] != day else None
             append_output("positions", point)
+        if streaming:
+            point = None
         receivable = sum(ledger.receivables.values())
         total = ledger.cash + value + receivable
         append_output("nav", {"session": day, "cash_minor": ledger.cash, "market_value_minor": value,

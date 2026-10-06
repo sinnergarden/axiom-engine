@@ -532,7 +532,11 @@ def _load_stock_backtest_projection(path, *, artifact_reader, limits):
     from .stock_stream_contracts import validate_limits
     validate_limits(limits)
     require(callable(artifact_reader), "local artifact locator required")
-    wire, run_bytes, _ = _bounded_object(path, maximum=limits["max_block_bytes"],
+    # The run is itself charged once to the physical result budget, including
+    # the public saver's terminal LF. Its known size can reject before parsing.
+    run_size = Path(path).stat().st_size
+    require(0 < run_size <= limits["max_result_bytes"], "saved projection exceeds total result budget")
+    wire, run_bytes, _ = _bounded_object(path, maximum=min(limits["max_block_bytes"], limits["max_result_bytes"]),
                                         read_size=limits["max_read_bytes"])
     request = _run_header(wire)
     profile_artifact = request["profile_input"]["artifact"]

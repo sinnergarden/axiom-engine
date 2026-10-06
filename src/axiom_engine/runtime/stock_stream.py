@@ -214,6 +214,7 @@ class _StreamStorage:
             self.metrics["total_fees_minor"] += fill["fee_minor"]
             self.metrics["turnover_minor"] += fill["gross_minor"]
             self.metrics["fill_count"] += 1
+        fill = None
         for receipt in self.sink.append(session=day, phase=phase, rows=self._rows(),
                                         committed_sequence=sequence, write_budget=self.budget):
             self._ack(receipt, day, sequence)
@@ -243,7 +244,13 @@ class _StreamStorage:
             "account_events_ref": Document.from_dict(self.account_events).identity}
         # The complete header is small by contract. Measure its canonical
         # stream before Document creates a full JSON string or decoded copy.
-        canonical_size({**result, "content_digest": "sha256:" + "0" * 64}, self.header_budget)
+        header_bytes = canonical_size({**result, "content_digest": "sha256:" + "0" * 64}, self.header_budget)
+        require(header_bytes + 1 <= self.header_budget, "saved run header exceeds decoded budget")
+        # The saved projection needs the existing small profile once, the
+        # canonical parts, and the public saver's final run header plus LF.
+        # Reject before hashing or returning a sealed BacktestRun.
+        require(self.sink.total_bytes + header_bytes + 1 + self.audit.globals["profile_bytes"] <=
+                self.budget["max_total_bytes"], "total saved result budget exceeded before run seal")
         result["content_digest"] = Document.from_dict(result).identity
         return BacktestRun.from_dict(result)
 

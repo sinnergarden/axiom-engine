@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from axiom_engine.core import ContractError
 from axiom_engine.core.contracts import Document, canonical
-from axiom_engine.runtime import run_backtest
+from axiom_engine.runtime import BacktestRun, run_backtest, save_backtest_run
 from axiom_engine.runtime.stock_inputs import ACTION_POLICY
 from axiom_engine.runtime.stock_schedule import CLOCK_POLICY
 from axiom_engine.runtime.stock_stream_contracts import logical_ref
@@ -221,6 +221,45 @@ class ProjectionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ContractError, "total result budget"):
                     load_stock_backtest_projection(path, artifact_reader=lambda ref: ref["manifest_uri"], limits=low)
             self.assertFalse(any("part-" in name for name in opened))
+
+    def test_physical_total_includes_public_run_lf_and_external_profile_once(self):
+        for profile_lf in (False, True):
+            with self.subTest(profile_lf=profile_lf), tempfile.TemporaryDirectory() as folder:
+                _, wire, _ = fixture(folder)
+                profile_path = Path(wire["request_manifest"]["profile_input"]["artifact"]["manifest_uri"])
+                canonical_profile_size = profile_path.stat().st_size
+                if profile_lf:
+                    with profile_path.open("ab") as saved:
+                        saved.write(b"\n")
+                path = Path(folder) / "public-run.json"
+                save_backtest_run(BacktestRun.from_dict(wire), path)
+                self.assertEqual(path.read_bytes(), canonical(wire).encode() + b"\n")
+                self.assertEqual(profile_path.stat().st_size, canonical_profile_size + profile_lf)
+                part_bytes = sum(Path(ref["artifact"]["manifest_uri"]).stat().st_size
+                                 for ref in wire["result_parts"])
+                total = path.stat().st_size + profile_path.stat().st_size + part_bytes
+                exact = {**LIMITS, "max_result_bytes": total}
+                view = load_stock_backtest_projection(path, artifact_reader=lambda ref: ref["manifest_uri"], limits=exact)
+                self.assertEqual(view.wire, wire)
+                opened = []
+                real_open = Path.open
+                def observe(target, *args, **kwargs):
+                    opened.append(str(target))
+                    return real_open(target, *args, **kwargs)
+                with patch.object(Path, "open", observe):
+                    with self.assertRaisesRegex(ContractError, "total result budget"):
+                        load_stock_backtest_projection(path, artifact_reader=lambda ref: ref["manifest_uri"],
+                                                       limits={**exact, "max_result_bytes": total - 1})
+                self.assertFalse(any("part-" in name for name in opened))
+                self.assertNotIn(str(profile_path), opened)
+
+    def test_run_alone_exceeding_total_budget_rejects_before_open_or_parse(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path, _, _ = fixture(folder)
+            with patch.object(Path, "open", side_effect=AssertionError("payload opened before known budget check")):
+                with self.assertRaisesRegex(ContractError, "total result budget"):
+                    load_stock_backtest_projection(path, artifact_reader=lambda ref: ref["manifest_uri"],
+                                                   limits={**LIMITS, "max_result_bytes": path.stat().st_size - 1})
 
     def test_rehashed_row_count_and_saved_cash_corruption_rejected(self):
         with tempfile.TemporaryDirectory() as folder:

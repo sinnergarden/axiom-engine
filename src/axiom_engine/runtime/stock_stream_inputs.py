@@ -760,8 +760,9 @@ class StockInputSource:
             try:
                 yield block
             finally:
-                block._reservation.close()
+                reservation = block._reservation
                 block = None
+                reservation.close()
         for index in self._indexes.values():
             index.unchanged()
 
@@ -796,7 +797,7 @@ class StockInputSource:
             row_bytes = sum(_encoded_size(row) for row in rows)
             require(row_bytes <= upper, "Stock projection exceeds reserved decoded growth bound")
             stage.release(upper); stage.reserve(row_bytes)
-            del batches
+            del batches, batch
             # Byte bindings remain owned by this block; the native row views do not.
             binding_bytes = sum(_encoded_size(binding) for binding in bindings)
             stage.release(native_used - binding_bytes)
@@ -965,12 +966,15 @@ def _frames(source, manifest, budget):
                     frame_index.file_digest == descriptor["files"]["predictions.json"], "Original saved fold stage bytes mismatch")
         header = frame_index.object_header(("rows",))
         require(spec["contract_version"] in ("stock_ml_fold_spec_v1", "stock_ml_fold_spec_v2"), "Saved fold spec required")
-        _verify_model(model)
+        with source._memory.stage() as proof_stage:
+            proof_stage.reserve(3*(_encoded_size(spec)+_encoded_size(model)))
+            _verify_model(model)
+            spec_identity = Document.from_dict(spec).identity
         fields(header, "contract_version signal_run_ref signal_stage score_semantics score_unit feature_ref model_ref limitations universe fold_spec_ref clock_basis")
         require(header["contract_version"] == "stock_prediction_run_v2" and
                 frame_index.unsigned_digest("signal_run_ref") == header["signal_run_ref"], "Original saved v2 signal identity mismatch")
         require(header["universe"] == manifest["scope"]["prediction_universe"], "Saved fold prediction union mismatch")
-        require(Document.from_dict(spec).identity == item["fold_spec_ref"] == header["fold_spec_ref"] and
+        require(spec_identity == item["fold_spec_ref"] == header["fold_spec_ref"] and
                 model["model_ref"] == item["model_ref"] == header["model_ref"] and
                 model["feature_ref"] == item["feature_ref"] == header["feature_ref"] and
                 item["signal_run_ref"] == header["signal_run_ref"] and
@@ -1132,28 +1136,34 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
                     elif row["_stock_listed"] and (not row["_stock_factor_valid"] or
                             any(row[name] is None for name in ("open", "close", "volume_shares", "limit_up", "limit_down"))):
                         lifecycle["member_gap" if row["_stock_member"] else "listed_nonmember_gap"] += 1
+                row = None
                 for trade, (header, indexed) in block.signals.items():
                     feature = trade_map[trade][1]
                     with source._memory.stage() as stage:
                         validation_bytes = 3*(_encoded_size(header) + sum(_encoded_size(row) for row in indexed.values()) + 32)
                         stage.reserve(validation_bytes)
                         # Reading view only; the original parent identity was checked above.
-                        _, checked = validate_stock_predictions(StockPredictionFrame.from_dict({**header, "rows": list(indexed.values())}))
-                        require(len(checked) == len(universe), "Incomplete original saved prediction date group")
-                        membership, _, member_bindings = source._native("execution", "membership", [feature], budget, reservation=stage)
-                        members, _ = _grid(membership, [feature], universe)
-                        for key, row in checked.items():
-                            require(row["member"] == members[key]["is_member"] and
-                                    instant(row["feature_knowledge_cutoff"]) == instant(feature+"T20:30:00+08:00") and
-                                    instant(row["knowledge_cutoff"]) == instant(row["available_at"]) == instant(feature+"T21:00:00+08:00") and
-                                    instant(row["simulated_model_available_at"]) == instant(trade_map[trade][0]["model"]["simulated_available_at"]),
-                                    "Saved prediction membership/fixed clock mismatch")
-                        prediction_rows += len(checked)
-                        require(prediction_rows <= limits["max_prediction_rows"], "Stock prediction row budget exceeded")
-                        del membership, members, checked, member_bindings
+                        validated_wire = checked = membership = members = member_metadata = member_bindings = None
+                        try:
+                            validated_wire, checked = validate_stock_predictions(StockPredictionFrame.from_dict({**header, "rows": list(indexed.values())}))
+                            require(len(checked) == len(universe), "Incomplete original saved prediction date group")
+                            membership, _, member_bindings = source._native("execution", "membership", [feature], budget, reservation=stage)
+                            members, member_metadata = _grid(membership, [feature], universe)
+                            for key, row in checked.items():
+                                require(row["member"] == members[key]["is_member"] and
+                                        instant(row["feature_knowledge_cutoff"]) == instant(feature+"T20:30:00+08:00") and
+                                        instant(row["knowledge_cutoff"]) == instant(row["available_at"]) == instant(feature+"T21:00:00+08:00") and
+                                        instant(row["simulated_model_available_at"]) == instant(trade_map[trade][0]["model"]["simulated_available_at"]),
+                                        "Saved prediction membership/fixed clock mismatch")
+                            prediction_rows += len(checked)
+                            require(prediction_rows <= limits["max_prediction_rows"], "Stock prediction row budget exceeded")
+                        finally:
+                            validated_wire = checked = membership = members = member_metadata = member_bindings = row = None
             finally:
-                block._reservation.close()
-                del block
+                row = header = indexed = None
+                reservation = block._reservation
+                block = None
+                reservation.close()
         warmup = manifest["market_input"]["warmup_sessions"]
         for day in warmup:
             for kind, names in (("market", ("open", "high", "low", "close", "volume_shares", "amount_cny")), ("factor", ("factor",))):
@@ -1189,7 +1199,7 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
                    "limitations": limitations}
         source._memory.reserve_global(("projected", "audit_receipt"), _encoded_size(receipt))
         return StockSourceAudit(receipt=receipt, globals={"profile": profile, "market_header": market_header,
-            "calendar": calendar, "rules_index": rules_index,
+            "calendar": calendar, "rules_index": rules_index, "profile_bytes": profile_index.size,
             "signal_limitations": sorted({value for frame in frames for value in frame["header"]["limitations"]})},
             lifecycle=lifecycle, manifest=manifest,
             segment_index={index.content_digest: index for index in source._indexes.values()})
