@@ -450,7 +450,7 @@ def _run(request, *, decoded_plan=None):
                     if scheduled:
                         context["feature_knowledge_cutoff"] = first["feature_knowledge_cutoff"]
                         decision = _plan_admitted_stock_portfolio(active, active_rows, account=ledger.account(),
-                            context=context, top_k=plan["portfolio_policy"]["top_k"]).to_dict()
+                            context=context, top_k=plan["portfolio_policy"]["top_k"], rules_index=rules_index).to_dict()
                     else:
                         decision = plan_stock_portfolio(StockPredictionFrame.from_dict(signal), account=ledger.account(),
                             context=context, top_k=plan["portfolio_policy"]["top_k"]).to_dict()
@@ -559,6 +559,9 @@ def _run(request, *, decoded_plan=None):
         if v6:
             result["stock_execution_rules_ref"] = plan["stock_execution_rules_ref"]
             result["lifecycle_admission"] = lifecycle
+            result["metrics"].update(unsubmitted_order_count=sum(o["unsubmitted_quantity"] > 0 for o in orders),
+                unsubmitted_quantity=sum(o["unsubmitted_quantity"] for o in orders),
+                incomplete_order_count=sum(o["unsubmitted_quantity"] + o["unfilled_quantity"] > 0 for o in orders))
         result["limitations"] += signal["limitations"]
         result["limitations"].insert(0, profile["limitation"])
         result["limitations"] = [value.replace("split or delisting support", "general stock quantity-action or delisting support")

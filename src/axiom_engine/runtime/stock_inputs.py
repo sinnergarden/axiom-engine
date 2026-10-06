@@ -416,3 +416,13 @@ def _validate_saved_v6_execution(wire):
                 gross - commission - stamp - transfer), "saved stock fill cash/fee mismatch")
         filled[fill["order_id"]] = fill
     require(all(bool(o["filled_quantity"]) == (key in filled) for key, o in orders.items()), "saved stock order lacks actual fill")
+    # Earlier saved v6 candidates lacked these counters; preserve their wire on read.
+    names = {"unsubmitted_order_count", "unsubmitted_quantity", "incomplete_order_count"}
+    if names & set(wire["metrics"]):
+        require(names <= set(wire["metrics"]), "incomplete saved stock submission counters")
+        expected = dict(unsubmitted_order_count=sum(o["unsubmitted_quantity"] > 0 for o in orders.values()),
+            unsubmitted_quantity=sum(o["unsubmitted_quantity"] for o in orders.values()),
+            incomplete_order_count=sum(o["unsubmitted_quantity"] + o["unfilled_quantity"] > 0 for o in orders.values()))
+        require(all(type(wire["metrics"][name]) is int and wire["metrics"][name] == expected[name] for name in names) and
+                wire["metrics"]["unfilled_order_count"] == sum(o["unfilled_quantity"] > 0 for o in orders.values()),
+                "saved stock submission counters differ from recorded orders")

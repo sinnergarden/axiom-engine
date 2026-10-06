@@ -1,5 +1,6 @@
 """Synthetic v6 ledger and immutable native/PIT admission boundaries."""
 from copy import deepcopy
+from contextlib import ExitStack
 from decimal import Decimal
 from pathlib import Path
 import tempfile
@@ -18,6 +19,7 @@ from axiom_engine.runtime import (evaluate_backtest, long_history_evaluation_spe
 from axiom_engine.runtime.accounting import AccountLedger
 from axiom_engine.runtime.backtest import _simulate, _fee_components
 from axiom_engine.runtime.evaluation import _verify_run
+from axiom_engine.runtime.analysis_evaluation import _execution_trace
 from axiom_engine.runtime.stock_evidence import native_ref
 from test_csi300 import rules_for, fees_for, DAYS, BOARD_IDS, REF
 from test_stock_schedule import fold, seal
@@ -117,6 +119,154 @@ def simulation(security, quantity, *, cash=1000000000, volume=1000000, held=0, s
 
 
 class FullRuntimeTests(unittest.TestCase):
+    def test_full_rule_admission_count_does_not_grow_with_rebalances(self):
+        from axiom_engine.core import stock_portfolio as core_portfolio, stock_rules as core_rules
+        from axiom_engine.runtime import stock_rules, stock_market, stock_inputs
+        from axiom_engine.runtime.backtest import _plan_admitted_stock_portfolio
+        from types import SimpleNamespace
+        plan = full_request().to_dict()
+        short = deepcopy(plan); short["end_session"] = DAYS[1]
+        counts = []
+        outputs = []
+        original_validate = core_rules.validate_execution_rules
+        original_document = core_portfolio.Document
+        for current, decisions in ((short,1),(plan,2)):
+            calls = []; hashes = []
+            def counted(*args, **kwargs):
+                calls.append(1)
+                return original_validate(*args, **kwargs)
+            def core_document(value):
+                if value.get("contract_version") == "stock_execution_rules_v1": hashes.append(1)
+                return original_document.from_dict(value)
+            with ExitStack() as stack:
+                for module in (core_rules, core_portfolio, stock_rules, stock_market, stock_inputs):
+                    stack.enter_context(patch.object(module,"validate_execution_rules",side_effect=counted))
+                planner = stack.enter_context(patch.object(core_portfolio,"validate_execution_rules",side_effect=counted))
+                stack.enter_context(patch.object(core_portfolio,"Document",SimpleNamespace(from_dict=core_document)))
+                result = run_backtest(BacktestRequest.from_dict(current))
+                self.assertEqual(planner.call_count,0)
+            outputs.append(result); counts.append(len(calls))
+            self.assertEqual(len(result.to_dict()["decisions"]),decisions)
+            self.assertEqual(hashes,[])
+        # Factories/projection keep their entry checks; none are repeated by weekly Core calls.
+        self.assertEqual(counts,[5,5])
+        def uncached(*args,**kwargs):
+            kwargs.pop("rules_index",None)
+            return _plan_admitted_stock_portfolio(*args,**kwargs)
+        with patch("axiom_engine.runtime.backtest._plan_admitted_stock_portfolio",side_effect=uncached):
+            self.assertEqual(run_backtest(BacktestRequest.from_dict(plan)).payload,outputs[-1].payload)
+
+    def test_public_core_still_fully_validates_each_independent_call(self):
+        from axiom_engine.core import StockPredictionFrame, plan_stock_portfolio, stock_portfolio
+        from test_csi300 import frame_for, core_context
+        rules = rules_for(); context = core_context(rules,3)
+        frame = StockPredictionFrame.from_dict(frame_for(rules))
+        account = dict(cash_minor=50000000,positions={},version=0)
+        with patch.object(stock_portfolio,"validate_execution_rules",wraps=stock_portfolio.validate_execution_rules) as validator:
+            first = plan_stock_portfolio(frame,account=account,context=context,top_k=3)
+            self.assertEqual(plan_stock_portfolio(frame,account=account,context=context,top_k=3).payload,first.payload)
+            self.assertEqual(validator.call_count,2)
+            damaged = deepcopy(context); damaged["stock_execution_rules"]["quantity_rules"][0]["board"] = "UNKNOWN"
+            with self.assertRaises(ContractError):plan_stock_portfolio(frame,account=account,context=damaged,top_k=3)
+            self.assertEqual(validator.call_count,3)
+
+    def test_cash_partial_and_rejected_orders_reconcile_summary_and_five_quantities(self):
+        star = BOARD_IDS["SSE_STAR"]
+        def top_star(frame):
+            for row in frame["rows"]:
+                if row["security_id"] == star: row["score"] = 100
+        def capacity(batches,membership):
+            for row in batches[1]["records"]:
+                if row["security_id"] == star: row["volume_shares"] = 1990
+        def suspended(batches,membership):
+            for row in batches[0]["records"]:
+                if row["security_id"] == star: row["market_state"] = "suspended"
+        names = ("requested_quantity","submitted_quantity","unsubmitted_quantity","filled_quantity","unfilled_quantity")
+        for case,cash,mutation,wanted in (("cash",200000,None,(200,0,200,0,0)),
+                ("volume",200502,capacity,(200,200,0,199,1)),("cash_volume",201000,capacity,(201,200,1,199,1)),
+                ("rejected",200502,suspended,(200,0,200,0,0))):
+            with self.subTest(case=case):
+                plan = full_request(k=1,cash=cash,mutate_native=mutation,mutate_frame=top_star).to_dict()
+                plan["end_session"] = DAYS[1]
+                run = run_backtest(BacktestRequest.from_dict(plan)); saved = run.to_dict()
+                order = saved["orders"][0]; traced = _execution_trace(saved)[0]["intent_links"][0]["orders"][0]
+                self.assertEqual(tuple(order[n] for n in names),wanted)
+                self.assertEqual(tuple(traced[n] for n in names),wanted)
+                self.assertEqual(wanted[0],wanted[1]+wanted[2]);self.assertEqual(wanted[1],wanted[3]+wanted[4])
+                metrics = saved["metrics"]
+                self.assertEqual((metrics["unsubmitted_order_count"],metrics["unsubmitted_quantity"],
+                    metrics["unfilled_order_count"],metrics["incomplete_order_count"]),
+                    (int(wanted[2]>0),wanted[2],int(wanted[4]>0),1))
+                self.assertEqual(_verify_run(run),saved)
+                for field in ("unsubmitted_order_count","unsubmitted_quantity","incomplete_order_count"):
+                    damaged = deepcopy(saved); damaged["metrics"][field] += 1
+                    with self.assertRaises(ContractError):_verify_run(BacktestRun.from_dict(seal(damaged,"content_digest")))
+                # The earlier saved v6 counter shape remains readable without a migration.
+                old = deepcopy(saved)
+                for field in ("unsubmitted_order_count","unsubmitted_quantity","incomplete_order_count"):old["metrics"].pop(field)
+                old_run = BacktestRun.from_dict(seal(old,"content_digest"))
+                with tempfile.TemporaryDirectory() as temp:
+                    path=Path(temp)/"old-v6.json";save_backtest_run(old_run,path)
+                    self.assertEqual(load_backtest_run(path).payload,old_run.payload)
+
+    def test_one_security_lifecycle_prelisting_nonmember_member_and_held_after_exit(self):
+        calendar = ["2023-12-29","2024-01-02","2024-01-03","2024-01-05", "2024-01-08",
+                    "2024-01-09","2024-01-10","2024-01-11"]
+        security = "cnstock.688200.SH.20240102"
+        rules = rules_for({BOARD_IDS["SSE_MAIN"]:"SSE_MAIN",security:"SSE_STAR"},days=calendar)
+        member_days = set(calendar[3:6])
+        def frame(wire):
+            for row in wire["rows"]:
+                if row["security_id"] == security:
+                    member = row["session"] in member_days
+                    row.update(member=member,valid=member,score=100 if member else None,
+                               invalid_reason=None if member else "NOT_MEMBER")
+        for case in ("valuation","factor","action"):
+            def native(batches,membership):
+                for row in membership["records"]:
+                    if row["security_id"] == security:row["is_member"] = row["session"] in member_days
+                for row in batches[1]["records"]:
+                    if row["security_id"] == security and row["session"] == calendar[6]:
+                        row.update(open=10.5,high=10.5,low=10.5,close=10.5)
+                        if case == "valuation":row["close"] = None
+                if case == "valuation":
+                    for meta in batches[1]["field_meta"]["close"]["by_key"]:
+                        if meta["security_id"] == security and meta["session"] == calendar[6]:
+                            meta.update(missing_reason="source_gap",usable_from=None)
+                if case == "factor":
+                    for row in batches[3]["records"]:
+                        if row["security_id"] == security and row["session"] == calendar[7]:row["factor"] = None
+                    for meta in batches[3]["field_meta"]["factor"]["by_key"]:
+                        if meta["security_id"] == security and meta["session"] == calendar[7]:
+                            meta.update(missing_reason="source_gap",usable_from=None)
+                if case == "action":
+                    event = {**legacy.cash_event(),"security_id":security,"record_date":calendar[6],"ex_date":calendar[7],
+                             "bonus_shares_per_share":1.0,"implementation_announcement_date":calendar[3]}
+                    with patch.object(legacy,"DAYS",calendar),patch.object(legacy,"SECURITIES",rules["universe"]):
+                        for index,time_field in ((4,"ex_date"),(5,"record_date")):
+                            batches[index] = legacy.batch("corporate_actions",legacy.STOCK_EVENT_FIELDS,[deepcopy(event)],
+                                {"cash_dividend_before_tax_per_share":"CNY/share","bonus_shares_per_share":"shares/share",
+                                 "capital_transfer_shares_per_share":"shares/share"},time_field=time_field)
+                            for field in batches[index]["field_meta"].values():
+                                for meta in field["by_key"]:meta["usable_from"] = calendar[3]+"T12:00:00Z"
+            with self.subTest(case=case):
+                request = full_request(rules=rules,k=1,mutate_native=native,mutate_frame=frame)
+                original = request.payload; result = run_backtest(request).to_dict()
+                self.assertEqual(request.payload,original)
+                rows = {r["session"]:r for r in result["plan"]["market_replay"]["rows"] if r["security_id"] == security}
+                self.assertEqual((rows[calendar[0]]["market_state"],rows[calendar[0]]["close"]),("not_listed",None))
+                self.assertFalse(any(f["security_id"] == security and f["session"] < calendar[4] for f in result["fills"]))
+                self.assertTrue(any(f["security_id"] == security and f["side"] == "BUY" and f["session"] == calendar[4] for f in result["fills"]))
+                position = next(p for p in result["positions"] if p["security_id"] == security and p["session"] == calendar[6])
+                self.assertGreater(position["quantity"],0)
+                if case == "valuation":
+                    self.assertEqual((result["status"],position["mark_session"],position["stale_reason"]),("COMPLETE",calendar[5],"source_gap"))
+                else:
+                    self.assertEqual((position["mark_session"],position["mark_price"],position["is_stale"]),(calendar[6],"10.5",False))
+                    expected = "HELD_MISSING_STOCK_LIFECYCLE_CAPABILITY" if case == "factor" else "HELD_UNSUPPORTED_STOCK_ACTION"
+                    self.assertEqual((result["status"],result["stopped"]["session"],result["stopped"]["reason"]),("BLOCKED",calendar[7],expected))
+                self.assertGreater(result["final_account"]["positions"][security]["quantity"],0)
+
     def test_one_account_top_k_identity_and_exact_saved_v6_loader(self):
         request = full_request(k=3); original = request.payload
         three = run_backtest(request)

@@ -190,6 +190,9 @@ def _execution_trace(saved):
                     requested_quantity=order.get("requested_quantity", order.get("quantity")),filled_quantity=order.get("filled_quantity"),
                     unfilled_quantity=order.get("unfilled_quantity"),execution_admission=order.get("execution_admission"),
                     committed_sequence=order.get("committed_sequence"),fill_ids=[f.get("fill_id") for f in actual],fills=actual))
+                if saved.get("contract_version") == "backtest_run_v6":
+                    matched[-1].update(submitted_quantity=order.get("submitted_quantity"),
+                                       unsubmitted_quantity=order.get("unsubmitted_quantity"))
             linked.append(dict(intent_id=intent.get("intent_id"),intent=intent,orders=matched))
         trace.append(dict(decision_index=index,trade_session=decision.get("trade_session"),
             feature_session=decision.get("feature_session"),status=decision.get("status"),
@@ -369,7 +372,15 @@ def _validate_outputs(wire, base):
             fields(link,"intent_id intent orders")
             require(link["intent_id"] == link["intent"].get("intent_id"), "saved intent trace link mismatch")
             for order in link["orders"]:
-                fields(order,"order_id status reason requested_quantity filled_quantity unfilled_quantity execution_admission committed_sequence fill_ids fills")
+                extended = "submitted_quantity" in order or "unsubmitted_quantity" in order
+                fields(order,"order_id status reason requested_quantity filled_quantity unfilled_quantity execution_admission committed_sequence fill_ids fills" +
+                       (" submitted_quantity unsubmitted_quantity" if extended else ""))
+                if extended:
+                    for name in ("requested_quantity", "submitted_quantity", "unsubmitted_quantity", "filled_quantity", "unfilled_quantity"):
+                        integer(order[name])
+                    require(order["requested_quantity"] == order["submitted_quantity"] + order["unsubmitted_quantity"] and
+                            order["submitted_quantity"] == order["filled_quantity"] + order["unfilled_quantity"],
+                            "saved submission trace quantities do not reconcile")
                 require(order["fill_ids"] == [f.get("fill_id") for f in order["fills"]] and
                     all(f.get("order_id") == order["order_id"] for f in order["fills"]), "saved order/fill trace link mismatch")
     fields(wire["benchmark_comparisons"]," ".join(BENCHMARK_KEYS))

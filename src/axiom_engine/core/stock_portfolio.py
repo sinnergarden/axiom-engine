@@ -116,16 +116,17 @@ def plan_stock_portfolio(frame, *, account, context, top_k=None):
         return _plan(frame, account, context, top_k)
 
 
-def _plan_admitted_stock_portfolio(wire, rows, *, account, context, top_k):
+def _plan_admitted_stock_portfolio(wire, rows, *, account, context, top_k, rules_index=None):
     """Runtime-private reuse after its full entry admission; no public bypass tag."""
     with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
-        return _plan(None, account, context, top_k, admitted=(wire, rows))
+        return _plan(None, account, context, top_k, admitted=(wire, rows), admitted_rules=rules_index)
 
 
-def _plan(frame, account, context, top_k, admitted=None):
+def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
     wire, rows = validate_stock_predictions(frame) if admitted is None else admitted
     v2 = wire["contract_version"] == "stock_prediction_run_v2"
     full = "stock_execution_rules" in context
+    require(admitted_rules is None or (admitted is not None and full), "validated rules require private Runtime admission")
     if full and admitted is None and not v2:
         unsigned = dict(wire); reference = unsigned.pop("signal_run_ref")
         require(Document.from_dict(unsigned).identity == reference, "Saved prediction identity mismatch")
@@ -151,10 +152,13 @@ def _plan(frame, account, context, top_k, admitted=None):
     digest(context["supported_universe_ref"])
     rules, rule_index = (context["stock_execution_rules"], None) if full else (None, None)
     if full:
-        rule_index = validate_execution_rules(rules)
+        # Only the Runtime-private caller may reuse this invocation's fully admitted index.
+        # The public Core entry always validates the complete rule and native identity closure.
+        rule_index = validate_execution_rules(rules) if admitted_rules is None else admitted_rules
+        digest(context["stock_execution_rules_ref"])
         require(supported == wire["universe"] == rules["universe"] and
                 context["supported_universe_ref"] == csi300_support_ref(supported) and
-                context["stock_execution_rules_ref"] == Document.from_dict(rules).identity,
+                (admitted_rules is not None or context["stock_execution_rules_ref"] == Document.from_dict(rules).identity),
                 "complete CSI300 rules/union identity required")
         require(context["portfolio_policy"] == {"eligibility_id": CSI300_ELIGIBILITY, "top_k": top_k,
             "rebalance": "weekly_first_trading_session", "budget_basis": BUDGET_BASIS,
