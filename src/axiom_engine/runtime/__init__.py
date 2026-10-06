@@ -17,6 +17,10 @@ from .analysis_evaluation import analysis_evaluation_spec, evaluate_saved_analys
 from .retrospective_benchmark import retrospective_sse_benchmark, read_sse_benchmark
 from .fill_display import (SavedReviewDisplay, FillDisplayReport, read_review_display,
                           build_fill_display, save_fill_display, load_fill_display)
+from .stock_stream import run_stock_backtest, audit_stock_backtest_source, stock_run_id
+from .stock_stream_inputs import StockInputSource
+from .stock_stream_outputs import StockResultSink
+from .stock_stream_projection import SavedRunProjection, load_stock_backtest_projection
 
 __all__ = ["BatchReference", "DecisionBatchGate", "InputGateError", "stale_price_mark",
            "BacktestRequest", "BacktestRun", "MarketReplay", "run_backtest",
@@ -29,4 +33,6 @@ __all__ = ["BatchReference", "DecisionBatchGate", "InputGateError", "stale_price
            "stock_portfolio_policy", "StockPredictionSchedule", "stock_prediction_schedule", "analysis_evaluation_spec", "evaluate_saved_analysis",
            "retrospective_sse_benchmark", "read_sse_benchmark",
            "SavedReviewDisplay", "FillDisplayReport", "read_review_display",
-           "build_fill_display", "save_fill_display", "load_fill_display"]
+           "build_fill_display", "save_fill_display", "load_fill_display",
+           "run_stock_backtest", "audit_stock_backtest_source", "stock_run_id",
+           "StockInputSource", "StockResultSink", "SavedRunProjection", "load_stock_backtest_projection"]

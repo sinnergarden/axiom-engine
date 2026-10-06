@@ -142,6 +142,33 @@ def _validate_pair_proof(evidence, signal, universe, calendar, batches, *, lifec
                 entry["reader_version"] == batch["context"]["reader_version"], "stock execution facts differ from admitted batches")
 
 
+def _validate_stock_market_row(row, *, universe, calendar, refs, full):
+    """Shared v6 numerical, clock and provenance checks for one admitted row."""
+    fields(row, "security_id session open close volume_shares limit_up limit_down close_available_at market_state state_reason source_refs execution_evidence_cutoff field_available_at")
+    require(row["security_id"] in universe and row["session"] in calendar, "stock market key outside scope")
+    require(row["market_state"] in (("normal_trading", "unknown_status", "suspended", "source_gap", "not_listed", "delisted") if full else
+            ("normal_trading", "unknown_status", "suspended", "source_gap")), "invalid stock market state")
+    require(row["state_reason"] is None or type(row["state_reason"]) is str, "invalid stock state reason")
+    require(row["execution_evidence_cutoff"] == row["session"] + "T20:30:00+08:00", "stock retrospective evidence clock required")
+    require(type(row["source_refs"]) is list and bool(row["source_refs"]) and set(row["source_refs"]) <= set(refs), "stock row source closure mismatch")
+    for name in ("open", "close", "limit_up", "limit_down"):
+        if row[name] is not None:
+            require(decimal(row[name], minimum=0) > 0, "positive stock price required")
+    if row["volume_shares"] is not None:
+        integer(row["volume_shares"])
+    if row["limit_up"] is not None and row["limit_down"] is not None:
+        low, high = decimal(row["limit_down"]), decimal(row["limit_up"])
+        require(low <= high, "contradictory stock limits")
+        require(all(row[name] is None or low <= decimal(row[name]) <= high for name in ("open", "close")), "stock price outside native limits")
+    cutoff = instant(row["execution_evidence_cutoff"])
+    fields(row["field_available_at"], "open close volume_shares limit_up limit_down market_state")
+    for name, value in row["field_available_at"].items():
+        if row[name] is not None and name != "market_state":
+            require(value is not None, "observed stock value lacks availability")
+        require(value is None or instant(value) <= cutoff, "future stock execution evidence")
+    require(row["close"] is None or instant(row["close_available_at"]) == instant(row["field_available_at"]["close"]), "stock close clock mismatch")
+
+
 def validate_stock_request(plan, *, legacy_saved_top5=False):
     full = plan.get("contract_version") == "backtest_request_v6"
     v4 = plan.get("contract_version") in ("backtest_request_v4", "backtest_request_v6")
@@ -246,29 +273,7 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
             "stock market projection differs from saved native facts")
     indexed = {}
     for row in market["rows"]:
-        fields(row, "security_id session open close volume_shares limit_up limit_down close_available_at market_state state_reason source_refs execution_evidence_cutoff field_available_at")
-        require(row["security_id"] in universe and row["session"] in calendar, "stock market key outside scope")
-        require(row["market_state"] in (("normal_trading", "unknown_status", "suspended", "source_gap", "not_listed", "delisted") if full else
-                ("normal_trading", "unknown_status", "suspended", "source_gap")), "invalid stock market state")
-        require(row["state_reason"] is None or type(row["state_reason"]) is str, "invalid stock state reason")
-        require(row["execution_evidence_cutoff"] == row["session"] + "T20:30:00+08:00", "stock retrospective evidence clock required")
-        require(type(row["source_refs"]) is list and bool(row["source_refs"]) and set(row["source_refs"]) <= set(refs), "stock row source closure mismatch")
-        for name in ("open", "close", "limit_up", "limit_down"):
-            if row[name] is not None:
-                require(decimal(row[name], minimum=0) > 0, "positive stock price required")
-        if row["volume_shares"] is not None:
-            integer(row["volume_shares"])
-        if row["limit_up"] is not None and row["limit_down"] is not None:
-            low, high = decimal(row["limit_down"]), decimal(row["limit_up"])
-            require(low <= high, "contradictory stock limits")
-            require(all(row[name] is None or low <= decimal(row[name]) <= high for name in ("open", "close")), "stock price outside native limits")
-        cutoff = instant(row["execution_evidence_cutoff"])
-        fields(row["field_available_at"], "open close volume_shares limit_up limit_down market_state")
-        for name, value in row["field_available_at"].items():
-            if row[name] is not None and name != "market_state":
-                require(value is not None, "observed stock value lacks availability")
-            require(value is None or instant(value) <= cutoff, "future stock execution evidence")
-        require(row["close"] is None or instant(row["close_available_at"]) == instant(row["field_available_at"]["close"]), "stock close clock mismatch")
+        _validate_stock_market_row(row, universe=universe, calendar=calendar, refs=refs, full=full)
         key = row["session"], row["security_id"]
         require(key not in indexed, "duplicate stock market key")
         indexed[key] = row

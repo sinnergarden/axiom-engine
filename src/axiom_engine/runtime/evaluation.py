@@ -60,6 +60,23 @@ def long_history_evaluation_spec():
 
 
 def _verify_run(run):
+    from .stock_stream_projection import SavedRunProjection
+    if isinstance(run, SavedRunProjection):
+        run.verify()
+        wire = run.wire
+        require(wire["status"] == "COMPLETE" and wire["stopped"] is None,
+                "complete saved account result required")
+        request = wire["request_manifest"]
+        scope = request["scope"]
+        market = {"calendar": list(run.calendar), "universe": scope["execution_universe"],
+                  "cash_dividends": wire["account_events"]["cash_dividends"],
+                  "source_refs": [item["native_ref"] for item in request["market_input"]["native_inputs"]],
+                  "limitations": request["limitations"]}
+        # A private calculation view keeps the original v7/run identity; it
+        # is never serialized or admitted as an old complete source contract.
+        return {**wire, **run.rows, "plan": {**request, **scope, "market_replay": market,
+                                            "profile": run.profile},
+                "quantity_unit": "shares", "price_unit": "CNY/share"}
     require(isinstance(run, BacktestRun), "saved BacktestRun required")
     wire = run.to_dict()
     require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4", "backtest_run_v5", "backtest_run_v6") and wire.get("status") == "COMPLETE",
@@ -166,6 +183,22 @@ def _validate_scope(scope, run, snapshots):
     require(isinstance(scope, DividendScope), "DividendScope required")
     wire = scope.to_dict()
     plan = run["plan"]
+    if run["contract_version"] == "backtest_run_v7":
+        fields(wire, "contract_version start_session end_session knowledge_cutoff universe coverage actions source_refs account_events_ref limitations")
+        events = run["account_events"]
+        require(wire["contract_version"] == "dividend_scope_v3" and
+                wire["coverage"] == "observed_records_only" and
+                wire["start_session"] == plan["start_session"] and wire["end_session"] == plan["end_session"] and
+                wire["knowledge_cutoff"] == plan["end_session"] + "T12:30:00Z" and
+                wire["universe"] == plan["execution_universe"] and
+                wire["account_events_ref"] == run["account_events_ref"] and
+                wire["source_refs"] == events["source_refs"] and
+                wire["actions"] == [a for a in events["cash_dividends"] if
+                    plan["start_session"] <= a["record_session"] <= plan["end_session"]],
+                "stock dividend scope differs from saved action view")
+        require(type(wire["limitations"]) is list and all(type(v) is str for v in wire["limitations"]),
+                "stock dividend scope limitations required")
+        return wire
     fields(wire, "contract_version start_session end_session knowledge_cutoff universe coverage actions source_refs source_evidence limitations" +
            (" coverage_bundle" if plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4", "backtest_request_v6") and "coverage_bundle" in wire else ""))
     if plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4", "backtest_request_v6"):
@@ -332,7 +365,10 @@ def _evaluate(run, benchmark, spec, dividend_scope):
                 "saved NAV requires an ordered frozen calendar and strict prior anchor")
     calendar, days, series = _account_series(saved)
     anchor = calendar[calendar.index(days[0]) - 1]
-    snapshots = _provenance(saved["plan"]["market_replay"])
+    if saved["contract_version"] == "backtest_run_v7":
+        snapshots = {saved["request_manifest"]["market_input"]["execution_snapshot_id"]}
+    else:
+        snapshots = _provenance(saved["plan"]["market_replay"])
     bench_input = _validate_benchmark(benchmark, [anchor, *days], snapshots)
     scope = _validate_scope(dividend_scope, saved, snapshots)
     input_ref = {key: saved[key] for key in ("run_id", "content_digest", "committed_sequence")}

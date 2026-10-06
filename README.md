@@ -39,3 +39,18 @@ positive volume and legal limits. Explicit/partial suspension remains blocked.
 Cash, commissions, holdings, dividends and NAV use fixed-point accounting. This
 release has no live broker or SQLite recovery support. Authoritative design and
 experiment conventions remain in the separate `axiom-docs` repository.
+
+The bounded stock v7 path is
+`run_stock_backtest(manifest, *, source, sink, block_sessions, limits)`, with
+`StockInputSource` reading fixed saved inputs and `StockResultSink` writing
+immutable result parts. `stock_run_id(manifest)` supplies the sink's run identity.
+Every call audits the complete fixed source before creating the same Runtime
+account used by v6. `audit_stock_backtest_source` performs that audit independently.
+The explicit limits bound input reads, decoded blocks, pending output, parts and
+total results; synthetic checks do not establish a long-window RSS guarantee.
+
+`load_stock_backtest_projection(path, *, artifact_reader, limits)` validates a
+saved v7 run, its result parts, and small profile/event views for evaluation and
+fill display. It does not reopen large Data, prediction or training parents.
+Complete projections use the existing v2/v3 evaluation and display algorithms;
+blocked accounts preserve their saved valid prefix and stopping phase.
