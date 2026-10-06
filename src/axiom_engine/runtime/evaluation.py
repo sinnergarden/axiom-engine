@@ -62,7 +62,7 @@ def long_history_evaluation_spec():
 def _verify_run(run):
     require(isinstance(run, BacktestRun), "saved BacktestRun required")
     wire = run.to_dict()
-    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4", "backtest_run_v5") and wire.get("status") == "COMPLETE",
+    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4", "backtest_run_v5", "backtest_run_v6") and wire.get("status") == "COMPLETE",
             "complete saved account result required")
     recorded = wire.pop("content_digest", None)
     require(recorded == Document.from_dict(wire).identity, "saved result content digest mismatch")
@@ -80,11 +80,12 @@ def _verify_run(run):
     if wire["contract_version"] == "backtest_run_v5":
         from .etf_inputs import validate_saved_v5
         validate_saved_v5(wire)
-    if wire["contract_version"] in ("backtest_run_v3", "backtest_run_v4"):
+    if wire["contract_version"] in ("backtest_run_v3", "backtest_run_v4", "backtest_run_v6"):
         from .stock_inputs import validate_stock_request, validate_saved_stock_core
-        require(wire["runtime_version"] == ("axiom.backtest/4" if wire["contract_version"] == "backtest_run_v4" else "axiom.backtest/3") and
-                wire["plan"]["contract_version"] == ("backtest_request_v4" if wire["contract_version"] == "backtest_run_v4" else "backtest_request_v3") and
-                wire["core_version"] in ("axiom.stock_portfolio/1", "axiom.stock_portfolio/2") and
+        full = wire["contract_version"] == "backtest_run_v6"
+        require(wire["runtime_version"] == ("axiom.backtest/6" if full else ("axiom.backtest/4" if wire["contract_version"] == "backtest_run_v4" else "axiom.backtest/3")) and
+                wire["plan"]["contract_version"] == ("backtest_request_v6" if full else ("backtest_request_v4" if wire["contract_version"] == "backtest_run_v4" else "backtest_request_v3")) and
+                wire["core_version"] in (("axiom.stock_portfolio/3",) if full else ("axiom.stock_portfolio/1", "axiom.stock_portfolio/2")) and
                 wire["stopped"] is None, "complete stock tuple required")
         validate_stock_request(wire["plan"], legacy_saved_top5=wire["core_version"] == "axiom.stock_portfolio/1")
         validate_saved_stock_core(wire)
@@ -102,8 +103,11 @@ def _provenance(wire):
         from .stock_evidence import native_batches
         batches = native_batches(wire["source_evidence"], wire["coverage_bundle"])
         require({entry["reference"] for entry in wire["source_evidence"]} == set(wire["source_refs"]), "stock provenance closure mismatch")
-        for batch in batches:
-            require(batch["context"]["query"]["purpose"] == "market_replay", "wrong-purpose evaluation evidence")
+        for entry, batch in zip(wire["source_evidence"], batches):
+            membership = (wire.get("contract_version") == "market_replay_v4" and
+                          batch["context"]["domain"] == "universe_membership" and entry["reference"] == wire.get("membership_ref"))
+            require(batch["context"]["query"]["purpose"] == ("decision_facts" if membership else "market_replay"),
+                    "wrong-purpose evaluation evidence")
             snapshots.add(batch["context"]["snapshot_id"])
         return snapshots
     for evidence in wire["source_evidence"]:
@@ -114,7 +118,10 @@ def _provenance(wire):
             context = evidence["batch"]["context"]
         else:
             context = evidence["context"]
-        require(context["query"]["purpose"] == "market_replay", "wrong-purpose evaluation evidence")
+        membership = (wire.get("contract_version") == "market_replay_v4" and
+                      context["domain"] == "universe_membership" and evidence["reference"] == wire.get("membership_ref"))
+        require(context["query"]["purpose"] == ("decision_facts" if membership else "market_replay"),
+                "wrong-purpose evaluation evidence")
         snapshots.add(context["snapshot_id"])
     return snapshots
 
@@ -160,8 +167,8 @@ def _validate_scope(scope, run, snapshots):
     wire = scope.to_dict()
     plan = run["plan"]
     fields(wire, "contract_version start_session end_session knowledge_cutoff universe coverage actions source_refs source_evidence limitations" +
-           (" coverage_bundle" if plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4") and "coverage_bundle" in wire else ""))
-    if plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4"):
+           (" coverage_bundle" if plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4", "backtest_request_v6") and "coverage_bundle" in wire else ""))
+    if plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4", "backtest_request_v6"):
         from .stock_inputs import validate_cash_action
         require(wire["contract_version"] == "dividend_scope_v2" and wire["coverage"] == "observed_records_only" and
                 wire["start_session"] == plan["start_session"] and wire["end_session"] == plan["end_session"] and

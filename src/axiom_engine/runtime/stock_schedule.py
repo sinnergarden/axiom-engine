@@ -119,7 +119,7 @@ def _resource_preflight(request, limits):
     require(input_bytes <= limits["max_input_bytes"],
             f"Stock resource budget exceeded: max_input_bytes={input_bytes} > {limits['max_input_bytes']}")
     plan = request.to_dict()
-    require(plan.get("contract_version") == "backtest_request_v4", "Resource limits require stock request v4")
+    require(plan.get("contract_version") in ("backtest_request_v4", "backtest_request_v6"), "Resource limits require scheduled stock request")
     folds = plan["prediction_schedule"]["folds"]
     counts = {"max_folds": len(folds), "max_prediction_rows": sum(len(f["prediction_frame"]["rows"]) for f in folds),
               "max_market_rows": len(plan["market_replay"]["rows"])}

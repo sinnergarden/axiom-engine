@@ -46,3 +46,25 @@ def stock_daily_open_profile(*, unknown_status_policy="block"):
         "decision_time_utc": "00:55:00Z", "execution": "open", "approximation": "retrospective_daily_volume_proxy",
         "unknown_status_policy": unknown_status_policy, "maximum_order_quantity": 1000000, "price_tick": "0.01",
         "limitation": "EXPLICIT STOCK DAILY APPROXIMATION: native UNKNOWN is retained. Observed open/volume/limits are retrospective evidence, not 09:30 knowledge or opening liquidity. Commission/minimum, transfer fee, slippage, capacity and T+1 are declared model assumptions. Gross dividends exclude personal holding-period taxes."}
+
+
+def stock_daily_open_profile_v2(*, execution_rules: dict, fee_schedule: dict,
+                              unknown_status_policy: str = "block") -> dict:
+    """Full-union source-backed quantities/fees; the same daily-open simulator."""
+    from copy import deepcopy
+    from ..core.stock_rules import validate_execution_rules, MAXIMUM_POLICY
+    from .stock_rules import validate_fee_schedule
+    validate_execution_rules(execution_rules); validate_fee_schedule(fee_schedule)
+    require(unknown_status_policy in ("block", "stock_daily_observed"), "unsupported stock status policy")
+    require(all(fee_schedule["verified_from"] <= d <= fee_schedule["verified_through"]
+                for d in execution_rules["calendar"]), "stock calendar outside verified fee window")
+    return {"contract_version": "stock_daily_open_profile_v2",
+        "stock_execution_rules_ref": Document.from_dict(execution_rules).identity,
+        "stock_execution_rules": deepcopy(execution_rules),
+        "stock_fee_schedule_ref": Document.from_dict(fee_schedule).identity,
+        "stock_fee_schedule": deepcopy(fee_schedule), "settlement_sessions": 1,
+        "commission_rate": "0.0003", "minimum_commission_minor": 500, "slippage_bps": "0",
+        "participation_rate": "0.1", "decision_time_utc": "00:55:00Z", "execution": "open",
+        "approximation": "retrospective_daily_volume_proxy", "unknown_status_policy": unknown_status_policy,
+        "maximum_quantity_policy": MAXIMUM_POLICY, "partial_fill_quantity_unit": "one_share",
+        "limitation": "EXPLICIT STOCK DAILY APPROXIMATION: frozen board rules and verified fee windows; UNKNOWN stays native. Cash first bounds a legal submitted order, then daily volume may cause one-share partial fills. No real opening-liquidity or broker cash-reservation claim. Gross dividends exclude personal holding-period taxes."}

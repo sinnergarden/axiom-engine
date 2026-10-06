@@ -6,7 +6,7 @@ import re
 
 from .._implementation import IMPLEMENTATION_REF
 from ..core import SignalFrame, plan_rotation, StockPredictionFrame, plan_stock_portfolio
-from ..core.stock_portfolio import STOCK_PORTFOLIO_VERSION, TOPK_PORTFOLIO_VERSION
+from ..core.stock_portfolio import STOCK_PORTFOLIO_VERSION, TOPK_PORTFOLIO_VERSION, CSI300_PORTFOLIO_VERSION
 from ..core.stock_portfolio import _plan_admitted_stock_portfolio
 from ..core.contracts import Document, digest, fields, integer, require, session, text, timestamp
 from ..core.portfolio import PORTFOLIO_VERSION, decimal, minor, validate_signals
@@ -32,7 +32,7 @@ class BacktestRun(Document):
 
 def _validate(request, *, decoded_plan=None):
     plan = request.to_dict() if decoded_plan is None else decoded_plan
-    if plan.get("contract_version") in ("backtest_request_v3", "backtest_request_v4"):
+    if plan.get("contract_version") in ("backtest_request_v3", "backtest_request_v4", "backtest_request_v6"):
         from .stock_inputs import validate_stock_request
         return validate_stock_request(plan)
     v5 = plan.get("contract_version") == "backtest_request_v5"
@@ -158,29 +158,53 @@ def _fees(price, quantity, side, profile):
     return gross, commission, tax
 
 
-def _fee_components(price, quantity, side, profile):
-    if profile["contract_version"] != "stock_daily_open_profile_v1":
+def _fee_components(price, quantity, side, profile, day=None):
+    full = profile["contract_version"] == "stock_daily_open_profile_v2"
+    if profile["contract_version"] not in ("stock_daily_open_profile_v1", "stock_daily_open_profile_v2"):
         return (*_fees(price, quantity, side, profile), 0)
+    if quantity == 0:
+        return 0, 0, 0, 0
+    if full:
+        from .stock_rules import fee_at
+        rates = fee_at(profile["stock_fee_schedule"], day)
+    else:
+        rates = profile
     gross = minor(price * quantity * 100)
     commission = max(profile["minimum_commission_minor"], minor(Decimal(gross) * decimal(profile["commission_rate"])))
-    stamp = minor(Decimal(gross) * decimal(profile["sell_stamp_tax_rate"])) if side == "SELL" else 0
-    transfer = minor(Decimal(gross) * decimal(profile["transfer_fee_rate"]))
+    stamp = minor(Decimal(gross) * decimal(rates["sell_stamp_tax_rate"])) if side == "SELL" else 0
+    transfer = minor(Decimal(gross) * decimal(rates["transfer_fee_rate"]))
     return gross, commission, stamp, transfer
 
 
-def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_splits=None, stock_market=None):
+def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_splits=None, stock_market=None,
+              stock_rules_index=None):
     order = {**intent, "order_id": run_id + ":order:" + str(order_index), "session": day,
              "status": "EXPIRED", "filled_quantity": 0, "unfilled_quantity": intent["quantity"],
              "reason": None, "execution": "daily_open_approximation"}
     order["market_state"] = row["market_state"]
     order["state_reason"] = row["state_reason"]
     order["execution_admission"] = "CONFIRMED_STATUS"
-    stock = profile["contract_version"] == "stock_daily_open_profile_v1"
+    full = profile["contract_version"] == "stock_daily_open_profile_v2"
+    stock = profile["contract_version"] in ("stock_daily_open_profile_v1", "stock_daily_open_profile_v2")
+    if full:
+        order.update(requested_quantity=intent["quantity"], submitted_quantity=0,
+                     unsubmitted_quantity=intent["quantity"], quantity=0, unfilled_quantity=0,
+                     stock_execution_rules_ref=profile["stock_execution_rules_ref"], quantity_rule_effective_from=None,
+                     submission_reason=None)
     volume_field = "volume_shares" if stock else "volume_units"
     if stock:
         from .stock_inputs import applicable_blocks
         order["execution_evidence_cutoff"] = row["execution_evidence_cutoff"]
         order["field_available_at"] = row["field_available_at"]
+        if full and row["_stock_listed"]:
+            from ..core.stock_rules import rule_at, legal_quantity
+            rule = rule_at(profile["stock_execution_rules"], intent["security_id"], day, validated=stock_rules_index)
+            order["quantity_rule_effective_from"] = rule["effective_from"]
+        if full and (not row["_stock_listed"] or not row["_stock_factor_valid"]):
+            order.update(execution_admission="BLOCKED", reason="MISSING_STOCK_LIFECYCLE_CAPABILITY",
+                         capability_missing_reason=row["_stock_factor_missing_reason"],
+                         capability_source_ref=row["_stock_factor_source_ref"])
+            return order
         blocks = applicable_blocks(stock_market, intent["security_id"], day)
         if blocks:
             order.update(execution_admission="BLOCKED", reason="UNSUPPORTED_STOCK_ACTION", action_blocks=blocks)
@@ -203,7 +227,7 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
     if any(row[key] is None for key in required):
         order["reason"] = "MISSING_EXECUTION_FACT"
         return order
-    if Decimal(row[volume_field]) <= 0:
+    if Decimal(row[volume_field]) <= 0 and not full:
         order["reason"] = "NO_VOLUME"
         return order
     opening = decimal(row["open"])
@@ -225,27 +249,59 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
         if price <= 0:
             order["reason"] = "INVALID_EXECUTION_PRICE"
             return order
-    if stock and price % decimal(profile["price_tick"]) != 0:
+    if stock and price % decimal(rule["price_tick"] if full else profile["price_tick"]) != 0:
         order["reason"] = "PRICE_TICK"
         return order
     if ((row["limit_up"] is not None and (price > decimal(row["limit_up"]) or (buy and price == decimal(row["limit_up"])))) or
             (row["limit_down"] is not None and (price < decimal(row["limit_down"]) or (not buy and price == decimal(row["limit_down"]))))):
         order["reason"] = "PRICE_LIMIT"
         return order
-    lot = profile["lot_size"]
     cap = int(Decimal(row[volume_field]) * decimal(profile["participation_rate"]))
-    if stock:
+    if stock and not full:
         cap = min(cap, profile["maximum_order_quantity"])
-    quantity = min(intent["quantity"], cap)
-    if buy:
-        quantity = quantity // lot * lot
-    else:
+    if full:
         held = ledger.positions.get(intent["security_id"], {"quantity": 0, "sellable_quantity": 0})
-        quantity = min(quantity, held["sellable_quantity"])
-        full_exit = (intent["quantity"] == held["quantity"] == held["sellable_quantity"] and cap >= held["quantity"])
-        if not full_exit:
+        submitted = legal_quantity(intent["quantity"], intent["side"], rule,
+            held=held["quantity"], sellable=held["sellable_quantity"])
+        if submitted < intent["quantity"]:
+            order["submission_reason"] = ("ORDER_QUANTITY_MAXIMUM" if intent["quantity"] > rule["daily_proxy_maximum"] else
+                ("T_PLUS_ONE_OR_UNSELLABLE" if not buy and held["sellable_quantity"] < intent["quantity"] else
+                 "BELOW_MINIMUM_ORDER_QUANTITY" if not submitted else "ORDER_QUANTITY_INCREMENT"))
+        if buy and submitted:
+            before_cash = submitted
+            minimum, increment = rule["buy_minimum"], rule["buy_increment"]
+            def affordable(q):
+                return sum(_fee_components(price, q, "BUY", profile, day)) <= ledger.cash
+            if not affordable(minimum):
+                submitted = 0
+            else:
+                low, high = 0, (submitted - minimum) // increment
+                while low < high:
+                    mid = (low + high + 1) // 2
+                    if affordable(minimum + mid * increment): low = mid
+                    else: high = mid - 1
+                submitted = minimum + low * increment
+            if submitted < before_cash:
+                order["submission_reason"] = "INSUFFICIENT_CASH"
+        order.update(quantity=submitted, submitted_quantity=submitted,
+                     unsubmitted_quantity=intent["quantity"] - submitted, unfilled_quantity=submitted)
+        if not submitted:
+            order["reason"] = order["submission_reason"] or "NO_LEGAL_SELLABLE_QUANTITY"
+            return order
+        # Legality applies to the submitted order; native daily capacity can produce one-share partial fills.
+        quantity = min(submitted, cap)
+    else:
+        lot = profile["lot_size"]
+        quantity = min(intent["quantity"], cap)
+        if buy:
             quantity = quantity // lot * lot
-    if buy and quantity:
+        else:
+            held = ledger.positions.get(intent["security_id"], {"quantity": 0, "sellable_quantity": 0})
+            quantity = min(quantity, held["sellable_quantity"])
+            full_exit = (intent["quantity"] == held["quantity"] == held["sellable_quantity"] and cap >= held["quantity"])
+            if not full_exit:
+                quantity = quantity // lot * lot
+    if buy and quantity and not full:
         low, high = 0, quantity // lot
         while low < high:
             mid = (low + high + 1) // 2
@@ -256,10 +312,11 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
                 high = mid - 1
         quantity = low * lot
     if not quantity:
-        order["reason"] = "INSUFFICIENT_CASH" if buy and cap >= lot else "NO_VOLUME_OR_SELLABLE_QUANTITY"
+        order["reason"] = "NO_VOLUME" if full else ("INSUFFICIENT_CASH" if buy and cap >= lot else "NO_VOLUME_OR_SELLABLE_QUANTITY")
         return order
-    gross, commission, tax, transfer = _fee_components(price, quantity, intent["side"], profile)
+    gross, commission, tax, transfer = _fee_components(price, quantity, intent["side"], profile, day)
     fee = commission + tax + transfer
+    require(not buy or gross + fee <= ledger.cash, "stock fill cash capacity mismatch")
     if not buy and ledger.cash + gross < fee:
         order["reason"] = "INSUFFICIENT_CASH_FOR_FEES"
         return order
@@ -276,10 +333,16 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
     if stock:
         fill.update(stamp_tax_minor=tax, transfer_fee_minor=transfer, quantity_unit="shares",
                     execution_evidence_cutoff=row["execution_evidence_cutoff"], field_available_at=row["field_available_at"])
+    if full:
+        from .stock_rules import fee_at
+        fill.update(stock_execution_rules_ref=profile["stock_execution_rules_ref"],
+                    quantity_rule_effective_from=rule["effective_from"], stock_fee_schedule_ref=profile["stock_fee_schedule_ref"],
+                    fee_interval_effective_from=fee_at(profile["stock_fee_schedule"], day)["effective_from"])
     ledger.apply_fill(fill)
-    order.update({"filled_quantity": quantity, "unfilled_quantity": intent["quantity"] - quantity,
-                  "status": "FILLED" if quantity == intent["quantity"] else "PARTIAL_EXPIRED",
-                  "reason": None if quantity == intent["quantity"] else "CASH_OR_VOLUME_CAP",
+    ordered = order["submitted_quantity"] if full else intent["quantity"]
+    order.update({"filled_quantity": quantity, "unfilled_quantity": ordered - quantity,
+                  "status": "FILLED" if quantity == ordered else "PARTIAL_EXPIRED",
+                  "reason": None if quantity == ordered else "CASH_OR_VOLUME_CAP",
                   "committed_sequence": ledger.sequence})
     return order
 
@@ -300,11 +363,17 @@ def _run(request, *, decoded_plan=None):
     v5 = plan["contract_version"] == "backtest_request_v5"
     v2 = plan["contract_version"] in ("backtest_request_v2", "backtest_request_v5")
     v4 = plan["contract_version"] == "backtest_request_v4"
-    stock = plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4")
+    v6 = plan["contract_version"] == "backtest_request_v6"
+    scheduled = v4 or v6
+    stock = plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4", "backtest_request_v6")
     hold = v5 and plan["portfolio_policy"]["contract_version"] == "etf_buy_and_hold_policy_v1"
     from ..core.etf_buy_hold import BUY_HOLD_VERSION, plan_etf_buy_and_hold
-    runtime = "axiom.backtest/5" if v5 else ("axiom.backtest/4" if v4 else ("axiom.backtest/3" if stock else (RUNTIME_VERSION if v2 else LEGACY_RUNTIME_VERSION)))
-    core_version = BUY_HOLD_VERSION if hold else (TOPK_PORTFOLIO_VERSION if stock else PORTFOLIO_VERSION)
+    runtime = "axiom.backtest/6" if v6 else ("axiom.backtest/5" if v5 else ("axiom.backtest/4" if v4 else ("axiom.backtest/3" if stock else (RUNTIME_VERSION if v2 else LEGACY_RUNTIME_VERSION))))
+    core_version = CSI300_PORTFOLIO_VERSION if v6 else (BUY_HOLD_VERSION if hold else (TOPK_PORTFOLIO_VERSION if stock else PORTFOLIO_VERSION))
+    rules_index = None
+    if v6:
+        from ..core.stock_rules import validate_execution_rules
+        rules_index = validate_execution_rules(profile["stock_execution_rules"])
     splits = market.get("unit_splits", [])
     run_id = Document.from_dict({"request": plan, "core": core_version, "runtime": runtime,
                                 "implementation_ref": IMPLEMENTATION_REF}).identity
@@ -315,6 +384,14 @@ def _run(request, *, decoded_plan=None):
     nav, positions, orders, decisions = [], [], [], []
     initial_value = None
     stopped = None
+    lifecycle = None
+    if v6:
+        lifecycle = dict(pre_listing_null=0, listed_nonmember_gap=0, member_gap=0, held_gap=0)
+        for row in rows.values():
+            gap = not row["_stock_factor_valid"] or any(row[name] is None for name in
+                ("open", "close", "volume_shares", "limit_up", "limit_down"))
+            if row["market_state"] == "not_listed": lifecycle["pre_listing_null"] += 1
+            elif row["_stock_listed"] and gap: lifecycle["member_gap" if row["_stock_member"] else "listed_nonmember_gap"] += 1
     for index, day in enumerate(calendar):
         if day > plan["end_session"]:
             break
@@ -327,6 +404,19 @@ def _run(request, *, decoded_plan=None):
             ledger.advance(day)
             if stock:
                 from .stock_inputs import applicable_blocks
+                if v6:
+                    lifecycle["held_gap"] += sum(1 for security, position in ledger.positions.items() if position["quantity"] and
+                        (not rows[day, security]["_stock_listed"] or not rows[day, security]["_stock_factor_valid"] or
+                         any(rows[day, security][name] is None for name in ("open", "close", "volume_shares", "limit_up", "limit_down"))))
+                    gaps = [{"security_id": security, "listed": rows[day, security]["_stock_listed"],
+                        "factor_missing_reason": rows[day, security]["_stock_factor_missing_reason"],
+                        "factor_source_ref": rows[day, security]["_stock_factor_source_ref"]}
+                        for security, position in ledger.positions.items() if position["quantity"] and
+                        (not rows[day, security]["_stock_listed"] or not rows[day, security]["_stock_factor_valid"])]
+                    if gaps:
+                        stopped = {"session": day, "reason": "HELD_MISSING_STOCK_LIFECYCLE_CAPABILITY", "gaps": gaps,
+                                   "committed_sequence": ledger.sequence}
+                        break
                 blocking = [block for security, position in ledger.positions.items() if position["quantity"]
                             for block in applicable_blocks(market, security, day)]
                 if blocking:
@@ -340,10 +430,11 @@ def _run(request, *, decoded_plan=None):
             previous = calendar[index - 1]
             rebalance = day == plan["start_session"] if hold else date.fromisoformat(day).isocalendar()[:2] != date.fromisoformat(previous).isocalendar()[:2]
             if rebalance:
-                active, active_rows = signals[day] if v4 else (signal, signals)
+                active, active_rows = signals[day] if scheduled else (signal, signals)
                 context = {"trade_session": day, "decision_time": day + "T" + profile["decision_time_utc"], "reference_prices": quotes,
                            "account_state_version": ledger.sequence,
-                           **{key: profile[key] for key in ("lot_size", "commission_rate", "minimum_commission_minor", "slippage_bps")}}
+                           **{key: profile[key] for key in (("commission_rate", "minimum_commission_minor", "slippage_bps") if v6 else
+                                                          ("lot_size", "commission_rate", "minimum_commission_minor", "slippage_bps"))}}
                 if hold:
                     context.update(reference_session=previous, reference_cutoff=previous + "T12:30:00Z", tax_rate=profile["tax_rate"])
                     decision = plan_etf_buy_and_hold(plan["portfolio_policy"], account=ledger.account(), context=context).to_dict()
@@ -353,10 +444,13 @@ def _run(request, *, decoded_plan=None):
                     context.update(feature_session=previous, knowledge_cutoff=first["knowledge_cutoff"])
                 if stock:
                     context.update(supported_security_ids=plan["execution_universe"], supported_universe_ref=plan["supported_universe_ref"])
-                    if v4:
+                    if v6:
+                        context.update(portfolio_policy=plan["portfolio_policy"], stock_execution_rules=profile["stock_execution_rules"],
+                                       stock_execution_rules_ref=plan["stock_execution_rules_ref"])
+                    if scheduled:
                         context["feature_knowledge_cutoff"] = first["feature_knowledge_cutoff"]
                         decision = _plan_admitted_stock_portfolio(active, active_rows, account=ledger.account(),
-                            context=context, top_k=plan["portfolio_policy"]["top_k"]).to_dict()
+                            context=context, top_k=plan["portfolio_policy"]["top_k"], rules_index=rules_index).to_dict()
                     else:
                         decision = plan_stock_portfolio(StockPredictionFrame.from_dict(signal), account=ledger.account(),
                             context=context, top_k=plan["portfolio_policy"]["top_k"]).to_dict()
@@ -368,7 +462,7 @@ def _run(request, *, decoded_plan=None):
                 decisions.append(decision)
                 for intent in decision["intents"]:
                     orders.append(_simulate(intent, rows[day, intent["security_id"]], ledger, profile, day, run_id, len(orders),
-                                            splits if v2 else None, market if stock else None))
+                                            splits if v2 else None, market if stock else None, stock_rules_index=rules_index))
             for action in market["cash_dividends"]:
                 if action["record_session"] == day:
                     entitlements[action["event_id"]] = ledger.positions.get(action["security_id"], {"quantity": 0})["quantity"]
@@ -415,6 +509,8 @@ def _run(request, *, decoded_plan=None):
                 "committed_sequence": ledger.sequence})
             if v2:
                 positions[-1]["mark_basis_event_id"] = mark_basis.get(security)
+            if v6:
+                positions[-1]["stale_reason"] = rows[day, security]["_stock_close_missing_reason"] if mark["session"] != day else None
         receivable = sum(ledger.receivables.values())
         total = ledger.cash + value + receivable
         nav.append({"session": day, "cash_minor": ledger.cash, "market_value_minor": value,
@@ -424,8 +520,8 @@ def _run(request, *, decoded_plan=None):
     for point in nav:
         peak = max(peak, point["nav_minor"])
         drawdown = min(drawdown, Decimal(point["nav_minor"]) / peak - 1)
-    result = {"contract_version": "backtest_run_v5" if v5 else ("backtest_run_v4" if v4 else ("backtest_run_v3" if stock else ("backtest_run_v2" if v2 else "backtest_run_v1"))), "run_id": run_id, "account_id": plan["account_id"],
-        "status": "BLOCKED" if stopped else "COMPLETE", "plan": plan, "signal_ref": None if hold else (signal["schedule_ref"] if v4 else signal["signal_run_ref"]),
+    result = {"contract_version": "backtest_run_v6" if v6 else ("backtest_run_v5" if v5 else ("backtest_run_v4" if v4 else ("backtest_run_v3" if stock else ("backtest_run_v2" if v2 else "backtest_run_v1")))), "run_id": run_id, "account_id": plan["account_id"],
+        "status": "BLOCKED" if stopped else "COMPLETE", "plan": plan, "signal_ref": None if hold else (signal["schedule_ref"] if scheduled else signal["signal_run_ref"]),
         "market_ref": MarketReplay.from_dict(market).identity, "profile_ref": Document.from_dict(profile).identity,
         "core_version": core_version, "runtime_version": runtime,
         "implementation_ref": IMPLEMENTATION_REF,
@@ -460,6 +556,12 @@ def _run(request, *, decoded_plan=None):
     if stock:
         result.update(quantity_unit="shares", price_unit="CNY/share", stopped=stopped,
                       admission_ref=plan["admission_ref"], supported_universe_ref=plan["supported_universe_ref"])
+        if v6:
+            result["stock_execution_rules_ref"] = plan["stock_execution_rules_ref"]
+            result["lifecycle_admission"] = lifecycle
+            result["metrics"].update(unsubmitted_order_count=sum(o["unsubmitted_quantity"] > 0 for o in orders),
+                unsubmitted_quantity=sum(o["unsubmitted_quantity"] for o in orders),
+                incomplete_order_count=sum(o["unsubmitted_quantity"] + o["unfilled_quantity"] > 0 for o in orders))
         result["limitations"] += signal["limitations"]
         result["limitations"].insert(0, profile["limitation"])
         result["limitations"] = [value.replace("split or delisting support", "general stock quantity-action or delisting support")
@@ -486,8 +588,9 @@ def load_backtest_run(path):
     saved = BacktestRun(Path(path).read_text())
     wire = saved.to_dict()
     v4 = wire.get("contract_version") == "backtest_run_v4"
-    stock = wire.get("contract_version") in ("backtest_run_v3", "backtest_run_v4")
-    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4", "backtest_run_v5") and
+    v6 = wire.get("contract_version") == "backtest_run_v6"
+    stock = wire.get("contract_version") in ("backtest_run_v3", "backtest_run_v4", "backtest_run_v6")
+    require(wire.get("contract_version") in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4", "backtest_run_v5", "backtest_run_v6") and
             wire.get("status") in (("COMPLETE", "BLOCKED") if stock else ("COMPLETE",)), "unsupported saved result")
     recorded_digest = wire.pop("content_digest", None)
     require(recorded_digest == Document.from_dict(wire).identity, "saved result content digest mismatch")
@@ -505,9 +608,9 @@ def load_backtest_run(path):
         from .etf_inputs import validate_saved_v5
         validate_saved_v5(wire)
     if stock:
-        require(wire["runtime_version"] == ("axiom.backtest/4" if v4 else "axiom.backtest/3") and
-                wire["core_version"] in (STOCK_PORTFOLIO_VERSION, TOPK_PORTFOLIO_VERSION) and
-                wire["plan"]["contract_version"] == ("backtest_request_v4" if v4 else "backtest_request_v3"), "saved stock tuple mismatch")
+        require(wire["runtime_version"] == ("axiom.backtest/6" if v6 else ("axiom.backtest/4" if v4 else "axiom.backtest/3")) and
+                wire["core_version"] in ((CSI300_PORTFOLIO_VERSION,) if v6 else (STOCK_PORTFOLIO_VERSION, TOPK_PORTFOLIO_VERSION)) and
+                wire["plan"]["contract_version"] == ("backtest_request_v6" if v6 else ("backtest_request_v4" if v4 else "backtest_request_v3")), "saved stock tuple mismatch")
         from .stock_inputs import validate_saved_stock_core, validate_stock_request
         validate_stock_request(wire["plan"], legacy_saved_top5=wire["core_version"] == STOCK_PORTFOLIO_VERSION)
         validate_saved_stock_core(wire)

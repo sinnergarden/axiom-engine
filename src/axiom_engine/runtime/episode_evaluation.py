@@ -24,7 +24,7 @@ def _new_episode(binding, security, fill=None, initial_quantity=0):
 def _actions(run, scope):
     actions = {a["event_id"]: a for a in run["plan"]["market_replay"]["cash_dividends"]}
     if scope is not None:
-        cash_name = "cash_before_tax_per_share" if run["contract_version"] in ("backtest_run_v3", "backtest_run_v4") else "cash_per_unit"
+        cash_name = "cash_before_tax_per_share" if run["contract_version"] in ("backtest_run_v3", "backtest_run_v4", "backtest_run_v6") else "cash_per_unit"
         economic_fields = ("security_id", "record_session", "ex_session", "pay_session", cash_name)
         expected = {a["event_id"] for a in actions.values()
                     if scope["start_session"] <= a["record_session"] <= scope["end_session"]}
@@ -197,6 +197,6 @@ def evaluate_episodes(run, scope, binding):
         "mean_episode_return": None if len(valid_returns) != count or not count else str(sum(valid_returns) / count),
         "return_denominator": "cumulative_buy_cost_including_fees", "weighting": "equal_closed_episode",
         "dividend_scope_status": "COVERAGE_UNKNOWN" if scope is None else "OBSERVED_RECORDS_ONLY"}
-    if run["contract_version"] in ("backtest_run_v3", "backtest_run_v4"):
+    if run["contract_version"] in ("backtest_run_v3", "backtest_run_v4", "backtest_run_v6"):
         metrics["payment_unknown_count"] = sum(d.get("payment_status") == "UNKNOWN" for e in episodes for d in e["dividends"])
     return episodes, metrics

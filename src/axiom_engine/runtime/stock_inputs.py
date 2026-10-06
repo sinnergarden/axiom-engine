@@ -4,7 +4,9 @@ import re
 from ..core.contracts import Document, digest, fields, integer, require, session, text
 from ..core.stock_portfolio import BUDGET_BASIS, StockPredictionFrame, instant, validate_stock_predictions, validate_top_k
 from ..core.portfolio import decimal
-from .profiles import stock_daily_open_profile
+from .profiles import stock_daily_open_profile, stock_daily_open_profile_v2
+from ..core.stock_rules import validate_execution_rules, support_ref as full_support_ref, listed, LIFECYCLE_POLICY
+from .stock_rules import csi300_stock_portfolio_policy
 from .stock_evidence import native_batches, native_ref
 
 ELIGIBILITY_ID = "sz_main_a_000_002_003_v1"
@@ -54,7 +56,7 @@ def applicable_blocks(market, security, day):
             (b["effective_session"] is None or b["effective_session"] <= day) and instant(b["available_at"]) <= cutoff]
 
 
-def _validate_pair_proof(evidence, signal, universe, calendar, batches):
+def _validate_pair_proof(evidence, signal, universe, calendar, batches, *, lifecycle=False, membership_batch=None):
     """Verify the saved owner's complete admission closure, without repeating Data queries."""
     v2 = signal["contract_version"] == "stock_prediction_schedule_v1"
     if v2:
@@ -74,7 +76,8 @@ def _validate_pair_proof(evidence, signal, universe, calendar, batches):
             member.get("model_mismatch") == [] and member.get("execution_mismatch") == [], "incomplete saved prediction/member pairing")
     count = len(universe) * len(calendar)
     basis = evidence.get("previous_close_basis_checks", {})
-    require(all(basis.get(name) is True for name in ("all_available_at_feature_knowledge_cutoff", "all_available_before_decision")) and
+    require(all((type(basis.get(name)) is bool if lifecycle else basis.get(name) is True)
+                for name in ("all_available_at_feature_knowledge_cutoff", "all_available_before_decision")) and
             basis.get("paired_rows_per_root") == count and basis.get("checked_rows_both_roots") == 2 * count,
             "incomplete previous-close basis pairing")
     if v2:
@@ -130,17 +133,21 @@ def _validate_pair_proof(evidence, signal, universe, calendar, batches):
                             "stock member proof cutoff session coverage mismatch")
                     require(all(instant(cutoffs[day]) == instant(day + "T20:30:00+08:00") for day in expected_sessions),
                             "stock member proof must retain original Feature cutoff")
-    for key, batch in (("execution-states", batches[0]), ("execution-market", batches[1]), ("execution-factor", batches[3])):
+    bound = [("execution-states", batches[0]), ("execution-market", batches[1]), ("execution-factor", batches[3])]
+    if lifecycle:
+        bound.append(("execution-membership", membership_batch))
+    for key, batch in bound:
         entry = manifests[key]
         require(entry["wire_ref"] == native_ref(batch) and entry["query"] == batch["context"]["query"] and
                 entry["reader_version"] == batch["context"]["reader_version"], "stock execution facts differ from admitted batches")
 
 
 def validate_stock_request(plan, *, legacy_saved_top5=False):
-    v4 = plan.get("contract_version") == "backtest_request_v4"
+    full = plan.get("contract_version") == "backtest_request_v6"
+    v4 = plan.get("contract_version") in ("backtest_request_v4", "backtest_request_v6")
     fields(plan, "contract_version account_id start_session end_session market_replay initial_account profile prediction_universe execution_universe supported_universe_ref portfolio_policy admission_ref admission_evidence stock_action_policy " +
-           ("prediction_schedule" if v4 else "signal_frame"))
-    require(plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4") and plan["stock_action_policy"] == ACTION_POLICY,
+           ("prediction_schedule" if v4 else "signal_frame") + (" stock_execution_rules_ref" if full else ""))
+    require(plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4", "backtest_request_v6") and plan["stock_action_policy"] == ACTION_POLICY,
             "unsupported stock request/action policy")
     text(plan["account_id"]); session(plan["start_session"]); session(plan["end_session"])
     if v4:
@@ -151,14 +158,16 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
         require(signal["contract_version"] == "stock_prediction_run_v1",
                 "v2 neutral predictions only; account clock consumption is not admitted")
     universe = plan["execution_universe"]
-    require(plan["prediction_universe"] == signal["universe"] and universe == supported_universe(signal["universe"]),
+    require(plan["prediction_universe"] == signal["universe"] and universe == (signal["universe"] if full else supported_universe(signal["universe"])),
             "stock prediction/execution scope mismatch")
-    require(bool(universe) and plan["supported_universe_ref"] == support_ref(universe), "stock support identity mismatch")
+    require(bool(universe) and plan["supported_universe_ref"] == (full_support_ref(universe) if full else support_ref(universe)), "stock support identity mismatch")
     policy = plan["portfolio_policy"]
-    fields(policy, "eligibility_id top_k rebalance budget_basis")
+    fields(policy, "eligibility_id top_k rebalance budget_basis" + (" candidate_policy stock_execution_rules_ref" if full else ""))
     expected = ({"eligibility_id": ELIGIBILITY_ID, "top_k": 5,
                  "rebalance": "weekly_first_trading_session", "budget_basis": BUDGET_BASIS}
-                if legacy_saved_top5 else stock_portfolio_policy(top_k=policy.get("top_k"), execution_universe=universe))
+                if legacy_saved_top5 else (csi300_stock_portfolio_policy(top_k=policy.get("top_k"), execution_universe=universe,
+                    execution_rules=plan["profile"]["stock_execution_rules"]) if full else
+                    stock_portfolio_policy(top_k=policy.get("top_k"), execution_universe=universe)))
     require(policy == expected and type(policy["top_k"]) is int, "unsupported stock portfolio policy")
     digest(plan["admission_ref"])
     evidence = dict(plan["admission_evidence"])
@@ -177,12 +186,16 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
     require(evidence["scope"]["execution_security_ids"] == universe and
             evidence["status"] == "NUMERIC_POLICY_IDENTITY_PAIR_PASS", "stock input-pair admission scope mismatch")
     profile = plan["profile"]
-    require(profile == stock_daily_open_profile(unknown_status_policy=profile.get("unknown_status_policy")),
+    expected_profile = (stock_daily_open_profile_v2(execution_rules=profile["stock_execution_rules"],
+        fee_schedule=profile["stock_fee_schedule"], unknown_status_policy=profile.get("unknown_status_policy")) if full else
+        stock_daily_open_profile(unknown_status_policy=profile.get("unknown_status_policy")))
+    require(profile == expected_profile,
             "stock profile parameters differ from frozen contract")
     market = plan["market_replay"]
     fields(market, "contract_version price_basis calendar universe rows cash_dividends action_diagnostics action_blocks source_refs source_evidence limitations" +
-           (" coverage_bundle" if "coverage_bundle" in market else ""))
-    require(market["contract_version"] == "market_replay_v3" and market["price_basis"] == "unadjusted" and
+           (" coverage_bundle" if "coverage_bundle" in market else "") +
+           (" stock_execution_rules_ref membership_ref lifecycle_policy" if full else ""))
+    require(market["contract_version"] == ("market_replay_v4" if full else "market_replay_v3") and market["price_basis"] == "unadjusted" and
             market["universe"] == universe, "stock native market scope required")
     calendar = market["calendar"]
     require(type(calendar) is list and calendar == sorted(set(calendar)) and bool(calendar), "ordered stock calendar required")
@@ -197,9 +210,10 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
     require(type(market["source_evidence"]) is list and
             {entry["reference"] for entry in market["source_evidence"]} == set(refs), "stock evidence closure mismatch")
     batches = native_batches(market["source_evidence"], market.get("coverage_bundle", []))
-    for batch in batches:
+    require(len(batches) == (7 if full else 6), "complete stock native closure required")
+    for i, batch in enumerate(batches):
         context = batch["context"]
-        require(context["query"]["purpose"] == "market_replay" and
+        require(context["query"]["purpose"] == ("decision_facts" if full and i == 6 else "market_replay") and
                 context["snapshot_id"] == evidence["execution"]["snapshot"], "stock market purpose/Snapshot mismatch")
     require(calendar == evidence["scope"]["initial_sessions"], "stock admitted calendar mismatch")
     required_features = calendar[calendar.index(plan["start_session"]) - 1:calendar.index(plan["end_session"])]
@@ -211,16 +225,31 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
                 "missing required previous-session prediction group")
     from .stock_market import _stock_market_wire
     # Verify frozen native projections, without Data access or account execution.
-    require(len(batches) == 6, "complete stock native closure required")
-    _validate_pair_proof(evidence, signal, universe, calendar, batches)
-    require(len(batches) == 6 and market == _stock_market_wire(batches=batches, universe=universe, calendar=calendar,
-            saved_evidence=market["source_evidence"], coverage_bundle=market.get("coverage_bundle", [])),
+    projection = {}
+    if full:
+        rules = profile["stock_execution_rules"]
+        identities, _ = validate_execution_rules(rules)
+        require(rules["calendar"] == calendar and plan["stock_execution_rules_ref"] == profile["stock_execution_rules_ref"] ==
+                market["stock_execution_rules_ref"] == policy["stock_execution_rules_ref"] and
+                market["membership_ref"] == native_ref(batches[6]) and market["lifecycle_policy"] == LIFECYCLE_POLICY,
+                "stock rule/member identity mismatch")
+        from .stock_market import _membership_index
+        member_rows = _membership_index(batches[6], universe=universe, calendar=calendar, identities=identities)
+        for fold in signal["folds"]:
+            require(all(row["member"] == member_rows[row["session"], row["security_id"]]["is_member"]
+                        for row in fold["prediction_frame"]["rows"]), "saved prediction differs from original PIT membership")
+        projection = dict(execution_rules=rules, membership_batch=batches[6])
+    _validate_pair_proof(evidence, signal, universe, calendar, batches[:6], lifecycle=full,
+                         membership_batch=batches[6] if full else None)
+    require(market == _stock_market_wire(batches=batches[:6], universe=universe, calendar=calendar,
+            saved_evidence=market["source_evidence"], coverage_bundle=market.get("coverage_bundle", []), **projection),
             "stock market projection differs from saved native facts")
     indexed = {}
     for row in market["rows"]:
         fields(row, "security_id session open close volume_shares limit_up limit_down close_available_at market_state state_reason source_refs execution_evidence_cutoff field_available_at")
         require(row["security_id"] in universe and row["session"] in calendar, "stock market key outside scope")
-        require(row["market_state"] in ("normal_trading", "unknown_status", "suspended", "source_gap"), "invalid stock market state")
+        require(row["market_state"] in (("normal_trading", "unknown_status", "suspended", "source_gap", "not_listed", "delisted") if full else
+                ("normal_trading", "unknown_status", "suspended", "source_gap")), "invalid stock market state")
         require(row["state_reason"] is None or type(row["state_reason"]) is str, "invalid stock state reason")
         require(row["execution_evidence_cutoff"] == row["session"] + "T20:30:00+08:00", "stock retrospective evidence clock required")
         require(type(row["source_refs"]) is list and bool(row["source_refs"]) and set(row["source_refs"]) <= set(refs), "stock row source closure mismatch")
@@ -244,6 +273,16 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
         require(key not in indexed, "duplicate stock market key")
         indexed[key] = row
     require(set(indexed) == {(day, security) for day in calendar for security in universe}, "incomplete stock execution-union coverage")
+    if full:
+        factors = {(r["session"], r["security_id"]): r["factor"] for r in batches[3]["records"]}
+        factor_meta = {(r["session"], r["security_id"]): r for r in batches[3]["field_meta"]["factor"]["by_key"]}
+        factor_ref = native_ref(batches[3])
+        close_meta = {(r["session"], r["security_id"]): r for r in batches[1]["field_meta"]["close"]["by_key"]}
+        indexed = {key: {**row, "_stock_listed": listed(identities[key[1]], key[0]),
+            "_stock_factor_valid": factors[key] is not None,
+            "_stock_factor_missing_reason": factor_meta[key].get("missing_reason"),
+            "_stock_factor_source_ref": factor_ref, "_stock_close_missing_reason": close_meta[key].get("missing_reason"),
+            "_stock_member": member_rows[key]["is_member"]} for key, row in indexed.items()}
     seen = set()
     for action in market["cash_dividends"]:
         validate_cash_action(action, universe, refs)
@@ -270,10 +309,12 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
 def validate_saved_stock_core(wire):
     """Check saved version tuples and decisions, without replaying the planner."""
     version = wire["core_version"]
-    v4 = wire["contract_version"] == "backtest_run_v4"
-    require(not v4 or version == "axiom.stock_portfolio/2", "v4 saved stock Core must use explicit TopK")
+    full = wire["contract_version"] == "backtest_run_v6"
+    v4 = wire["contract_version"] in ("backtest_run_v4", "backtest_run_v6")
+    require(not full or version == "axiom.stock_portfolio/3", "v6 saved stock Core required")
+    require(not v4 or version == ("axiom.stock_portfolio/3" if full else "axiom.stock_portfolio/2"), "saved stock schedule/Core mismatch")
     k = wire["plan"]["portfolio_policy"]["top_k"]
-    require(version in ("axiom.stock_portfolio/1", "axiom.stock_portfolio/2"), "unsupported saved stock Core")
+    require(version in ("axiom.stock_portfolio/1", "axiom.stock_portfolio/2", "axiom.stock_portfolio/3"), "unsupported saved stock Core")
     if version == "axiom.stock_portfolio/1":
         require(type(k) is int and k == 5, "legacy stock Core only supports Top5")
     require(type(wire["decisions"]) is list, "saved decisions required")
@@ -284,9 +325,12 @@ def validate_saved_stock_core(wire):
         trades = {t["trade_session"]: t for t in schedule["trade_schedule"]}
     for decision in wire["decisions"]:
         require(decision.get("contract_version") == version, "saved decision/Core version mismatch")
-        if version == "axiom.stock_portfolio/2":
+        if version in ("axiom.stock_portfolio/2", "axiom.stock_portfolio/3"):
             require(type(decision.get("top_k")) is int and decision["top_k"] == k,
                     "saved decision/portfolio top_k mismatch")
+        if full:
+            require(decision.get("stock_execution_rules_ref") == wire["plan"]["stock_execution_rules_ref"],
+                    "saved decision/rule identity mismatch")
         if v4:
             trade = trades.get(decision.get("trade_session"))
             require(trade is not None and trade["signal_run_ref"] == decision.get("signal_ref") and
@@ -298,3 +342,87 @@ def validate_saved_stock_core(wire):
                 "clock_basis": frame["clock_basis"], "feature_knowledge_cutoff": original["feature_knowledge_cutoff"],
                 "inference_cutoff": original["knowledge_cutoff"], "simulated_model_available_at": original["simulated_model_available_at"],
                 "model_ref": frame["model_ref"], "fold_spec_ref": frame["fold_spec_ref"]}, "Saved decision clock differs from original prediction")
+    if full:
+        _validate_saved_v6_execution(wire)
+
+
+def _validate_saved_v6_execution(wire):
+    """Verify recorded submission and actual fee provenance; do not execute an account."""
+    from ..core.stock_rules import rule_at
+    from .stock_rules import fee_at
+    from .backtest import _fee_components
+    profile = wire["plan"]["profile"]
+    reference = profile["stock_execution_rules_ref"]
+    require(wire.get("stock_execution_rules_ref") == reference, "saved stock rule identity mismatch")
+    validated = validate_execution_rules(profile["stock_execution_rules"])
+    fields(wire.get("lifecycle_admission", {}), "pre_listing_null listed_nonmember_gap member_gap held_gap")
+    for count in wire["lifecycle_admission"].values():
+        integer(count)
+    intents = {}
+    for decision in wire["decisions"]:
+        for intent in decision["intents"]:
+            require(intent["intent_id"] not in intents, "duplicate saved stock intent")
+            intents[intent["intent_id"]] = (decision["trade_session"], intent)
+    market_rows = {(r["session"], r["security_id"]): r for r in wire["plan"]["market_replay"]["rows"]}
+    seen_intents = set()
+    orders = {}
+    for order in wire["orders"]:
+        require(order["order_id"] not in orders and order.get("stock_execution_rules_ref") == reference,
+                "saved order/rule identity mismatch")
+        linked = intents.get(order.get("intent_id"))
+        require(linked is not None and order["intent_id"] not in seen_intents and order["session"] == linked[0] and
+                order["requested_quantity"] == linked[1]["quantity"] and
+                all(order.get(name) == linked[1][name] for name in
+                    ("security_id", "side", "expected_account_version", "valid_until")), "saved stock order differs from original intent")
+        seen_intents.add(order["intent_id"])
+        for name in ("requested_quantity", "submitted_quantity", "unsubmitted_quantity", "filled_quantity", "unfilled_quantity", "quantity"):
+            integer(order.get(name))
+        require(order["requested_quantity"] == order["submitted_quantity"] + order["unsubmitted_quantity"] and
+                order["quantity"] == order["submitted_quantity"] == order["filled_quantity"] + order["unfilled_quantity"],
+                "saved stock submission quantities do not reconcile")
+        if order["submitted_quantity"]:
+            rule = rule_at(profile["stock_execution_rules"], order["security_id"], order["session"], validated=validated)
+            require(order.get("quantity_rule_effective_from") == rule["effective_from"] and
+                    order["submitted_quantity"] <= rule["daily_proxy_maximum"], "saved stock submitted quantity rule mismatch")
+            if order["side"] == "BUY":
+                require(order["submitted_quantity"] >= rule["buy_minimum"] and
+                        (order["submitted_quantity"] - rule["buy_minimum"]) % rule["buy_increment"] == 0,
+                        "saved stock illegal buy submission")
+        orders[order["order_id"]] = order
+    require(seen_intents == set(intents), "saved stock intent lacks its order")
+    filled = {}
+    for fill in wire["fills"]:
+        order = orders.get(fill["order_id"])
+        require(order is not None and fill["order_id"] not in filled and fill["session"] == order["session"] and
+                fill["security_id"] == order["security_id"] and fill["side"] == order["side"] and
+                type(fill["quantity"]) is int and 0 < fill["quantity"] == order["filled_quantity"], "saved stock fill/order mismatch")
+        interval = fee_at(profile["stock_fee_schedule"], fill["session"])
+        rule = rule_at(profile["stock_execution_rules"], fill["security_id"], fill["session"], validated=validated)
+        require(fill.get("stock_execution_rules_ref") == reference and
+                fill.get("quantity_rule_effective_from") == rule["effective_from"] and
+                fill.get("stock_fee_schedule_ref") == profile["stock_fee_schedule_ref"] and
+                fill.get("fee_interval_effective_from") == interval["effective_from"], "saved stock fill provenance mismatch")
+        row = market_rows[fill["session"], fill["security_id"]]
+        require(row["open"] is not None and decimal(fill["price"]) == decimal(row["open"]) and
+                decimal(fill["reference_open"]) == decimal(row["open"]) and fill["source_refs"] == row["source_refs"] and
+                fill["execution_evidence_cutoff"] == row["execution_evidence_cutoff"] and
+                fill["field_available_at"] == row["field_available_at"] and
+                (fill["market_state"], fill["state_reason"]) == (row["market_state"], row["state_reason"]),
+                "saved stock fill differs from original native execution facts")
+        gross, commission, stamp, transfer = _fee_components(decimal(fill["price"]), fill["quantity"], fill["side"], profile, fill["session"])
+        require((fill["gross_minor"], fill["commission_minor"], fill["tax_minor"], fill["stamp_tax_minor"], fill["transfer_fee_minor"], fill["fee_minor"]) ==
+                (gross, commission, stamp, stamp, transfer, commission + stamp + transfer), "saved stock actual-fill fee mismatch")
+        require(fill["cash_delta_minor"] == (-gross - commission - stamp - transfer if fill["side"] == "BUY" else
+                gross - commission - stamp - transfer), "saved stock fill cash/fee mismatch")
+        filled[fill["order_id"]] = fill
+    require(all(bool(o["filled_quantity"]) == (key in filled) for key, o in orders.items()), "saved stock order lacks actual fill")
+    # Earlier saved v6 candidates lacked these counters; preserve their wire on read.
+    names = {"unsubmitted_order_count", "unsubmitted_quantity", "incomplete_order_count"}
+    if names & set(wire["metrics"]):
+        require(names <= set(wire["metrics"]), "incomplete saved stock submission counters")
+        expected = dict(unsubmitted_order_count=sum(o["unsubmitted_quantity"] > 0 for o in orders.values()),
+            unsubmitted_quantity=sum(o["unsubmitted_quantity"] for o in orders.values()),
+            incomplete_order_count=sum(o["unsubmitted_quantity"] + o["unfilled_quantity"] > 0 for o in orders.values()))
+        require(all(type(wire["metrics"][name]) is int and wire["metrics"][name] == expected[name] for name in names) and
+                wire["metrics"]["unfilled_order_count"] == sum(o["unfilled_quantity"] > 0 for o in orders.values()),
+                "saved stock submission counters differ from recorded orders")

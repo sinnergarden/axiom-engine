@@ -4,6 +4,7 @@ from ..core.portfolio import decimal
 from ..core.stock_portfolio import instant
 from .stock_inputs import TAX_CONVENTION
 from .stock_evidence import native_ref, pack_stock_batches, scoped_bundle
+from ..core.stock_rules import validate_execution_rules, listed, LIFECYCLE_POLICY
 
 STOCK_EVENT_FIELDS = ("implementation_announcement_date", "record_date", "ex_date",
     "cash_dividend_before_tax_per_share", "bonus_shares_per_share", "capital_transfer_shares_per_share",
@@ -45,16 +46,53 @@ def _visible(meta, cutoff):
             meta.get("usable_from") is not None and instant(meta["usable_from"]) <= instant(cutoff))
 
 
-def stock_market_from_batches(*, batches, universe, calendar):
+def _membership_index(batch, *, universe, calendar, identities):
+    """Admit original PIT flags; membership is never inferred from prices or listing."""
+    context, query = batch["context"], batch["context"]["query"]
+    require(context["contract_version"] == "data_batch_v1" and context["domain"] == "universe_membership" and
+            query["purpose"] == "decision_facts" and query["pit_policy"] == "best_effort_vendor_v1" and
+            query["fields"] == ["is_member"] and query["symbols"] == universe and query["sessions"] == calendar and
+            query["universe_id"] == "csi300" and set(query["cutoff_by_session"]) == set(calendar),
+            "original PIT stock membership query required")
+    require(all(instant(query["cutoff_by_session"][d]) == instant(d + "T20:30:00+08:00") for d in calendar),
+            "stock membership must retain original Feature cutoff")
+    rows, meta = {}, {}
+    for native in batch["records"]:
+        key = native["session"], native["security_id"]
+        require(key not in rows and type(native["is_member"]) is bool, "duplicate or missing PIT stock member flag")
+        rows[key] = native
+    for entry in batch["field_meta"]["is_member"]["by_key"]:
+        key = entry["session"], entry["security_id"]
+        require(key not in meta, "duplicate PIT stock membership metadata")
+        meta[key] = entry
+    expected = {(d, s) for d in calendar for s in universe}
+    require(set(rows) == set(meta) == expected, "incomplete PIT stock membership grid")
+    for (day, security), row in rows.items():
+        require(_visible(meta[day, security], query["cutoff_by_session"][day]), "unavailable PIT stock member flag")
+        require(not row["is_member"] or listed(identities[security], day), "PIT member outside listing lifecycle")
+    return rows
+
+
+def stock_market_from_batches(*, batches, universe, calendar, execution_rules=None, membership_batch=None):
     """Preserve complete native batches, including nonimplemented uncertainty."""
     from .backtest import MarketReplay
-    return MarketReplay.from_dict(_stock_market_wire(batches=batches, universe=universe, calendar=calendar))
+    return MarketReplay.from_dict(_stock_market_wire(batches=batches, universe=universe, calendar=calendar,
+        execution_rules=execution_rules, membership_batch=membership_batch))
 
 
-def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, coverage_bundle=None):
+def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, coverage_bundle=None,
+                      execution_rules=None, membership_batch=None):
     require(len(batches) == 6, "stock states/prices/limits/factors/two action queries required")
     states, prices, limits, factors, ex_actions, record_actions = batches
     snapshot = prices["context"]["snapshot_id"]
+    full = execution_rules is not None
+    require(full == (membership_batch is not None), "stock rules and original PIT membership must be supplied together")
+    if full:
+        identities, _ = validate_execution_rules(execution_rules)
+        require(execution_rules["universe"] == universe and execution_rules["calendar"] == calendar,
+                "stock execution rules scope mismatch")
+        require(membership_batch["context"]["snapshot_id"] == snapshot, "stock member Snapshot mismatch")
+        _membership_index(membership_batch, universe=universe, calendar=calendar, identities=identities)
     for batch in batches:
         require(batch["context"]["contract_version"] == "data_batch_v1" and
                 batch["context"]["snapshot_id"] == snapshot and
@@ -87,7 +125,8 @@ def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, cove
             require(key not in result, "duplicate native stock field metadata")
             result[key] = row
         return result
-    source_refs = ([native_ref(batch) for batch in batches] if saved_evidence is None else
+    all_batches = list(batches) + ([membership_batch] if full else [])
+    source_refs = ([native_ref(batch) for batch in all_batches] if saved_evidence is None else
                    [entry["reference"] for entry in saved_evidence])
     p, s, l, f = map(keyed, (prices, states, limits, factors))
     meta = {name: metadata(batch, native) for name, batch, native in
@@ -103,8 +142,18 @@ def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, cove
                                          ("limit_up", "up_limit", l), ("limit_down", "down_limit", l)):
                 require(source[key][native] is None or _visible(meta[name][key], day + "T20:30:00+08:00"),
                         "unavailable observed stock market value")
+                if full and source[key][native] is None:
+                    require(bool(meta[name][key].get("missing_reason")), "null stock fact requires native missing reason")
             reason = meta["market_state"][key]["missing_reason"]
-            require(s[key]["market_state"] in ("normal_trading", "unknown_status", "suspended", "source_gap") and
+            allowed = ("normal_trading", "unknown_status", "suspended", "source_gap")
+            if full:
+                allowed += ("not_listed", "delisted")
+                is_listed = listed(identities[security], day)
+                require((s[key]["market_state"] not in ("not_listed", "delisted")) == is_listed,
+                        "native stock state contradicts canonical listing lifecycle")
+                require(is_listed or all(p[key][n] is None for n in ("open", "close", "volume_shares")),
+                        "unlisted stock carries observed market facts")
+            require(s[key]["market_state"] in allowed and
                     not (reason or "").startswith(("identity_", "calendar_", "listing_")), "stock lifecycle/calendar admission failed")
             availability = {name: index[key].get("usable_from") for name, index in meta.items()}
             row = {"security_id": security, "session": day, "market_state": s[key]["market_state"], "state_reason": reason,
@@ -122,7 +171,7 @@ def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, cove
                 "reason": reason, "source_refs": [ref]}
         if item not in blocks:
             blocks.append(item)
-    for batch, ref in zip((ex_actions, record_actions), source_refs[-2:]):
+    for batch, ref in zip((ex_actions, record_actions), source_refs[4:6]):
         action_meta = {name: metadata(batch, name, EVENT_KEY) for name in STOCK_EVENT_FIELDS}
         seen_query = set()
         for native in batch["records"]:
@@ -186,6 +235,13 @@ def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, cove
         previous = None
         for day in calendar:
             factor = f[day, security]["factor"]
+            if full:
+                require((day, security) in factor_meta, "missing native stock factor metadata")
+                if factor is None:
+                    require(bool(factor_meta[day, security].get("missing_reason")), "null stock factor requires native missing reason")
+                    previous = None
+                    continue
+                require(listed(identities[security], day), "unlisted stock carries observed factor")
             require((day, security) in factor_meta and _visible(factor_meta[day, security], day + "T20:30:00+08:00"),
                     "unavailable stock factor capability evidence")
             require(factor is not None and decimal(str(factor), minimum=0) > 0, "missing stock factor capability evidence")
@@ -195,10 +251,10 @@ def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, cove
             previous = factor
     unique_refs = list(dict.fromkeys(source_refs))
     if saved_evidence is None:
-        evidence, coverage_bundle = pack_stock_batches([batches[source_refs.index(ref)] for ref in unique_refs], unique_refs)
+        evidence, coverage_bundle = pack_stock_batches([all_batches[source_refs.index(ref)] for ref in unique_refs], unique_refs)
     else:
         evidence = saved_evidence
-    limitations = sorted({value for batch in batches for value in batch["context"].get("limitations", [])})
+    limitations = sorted({value for batch in all_batches for value in batch["context"].get("limitations", [])})
     limitations += ["OBSERVED IMPLEMENTED ACTIONS ONLY: nonimplemented uncertainty remains diagnostic; no complete action-history claim.",
         "Stock cash source lacks PAY dates; gross-before-tax receivables remain pending until verified native payment.",
         "Native UNKNOWN and actual field availability are retained; daily open/volume/limits are retrospective execution evidence."]
@@ -209,6 +265,9 @@ def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, cove
         "source_evidence": evidence, "limitations": limitations}
     if coverage_bundle:
         wire["coverage_bundle"] = coverage_bundle
+    if full:
+        wire.update(contract_version="market_replay_v4", stock_execution_rules_ref=Document.from_dict(execution_rules).identity,
+                    membership_ref=native_ref(membership_batch), lifecycle_policy=LIFECYCLE_POLICY)
     return wire
 
 
@@ -235,7 +294,7 @@ def stock_dividend_scope(run):
     """Freeze observed stock record-date evidence; never infer unknown PAY."""
     from .evaluation import DividendScope
     wire = run.to_dict()
-    require(wire["contract_version"] in ("backtest_run_v3", "backtest_run_v4"), "stock saved run required")
+    require(wire["contract_version"] in ("backtest_run_v3", "backtest_run_v4", "backtest_run_v6"), "stock saved run required")
     plan, market = wire["plan"], wire["plan"]["market_replay"]
     evidence = [entry for entry in market["source_evidence"] if entry["batch"]["context"]["domain"] == "corporate_actions"]
     scope = {"contract_version": "dividend_scope_v2", "start_session": plan["start_session"],

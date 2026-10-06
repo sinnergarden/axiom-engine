@@ -5,9 +5,12 @@ import re
 
 from .contracts import Document, digest, fields, integer, number, require, session, text
 from .portfolio import PortfolioDecision, decimal, minor
+from .stock_rules import (validate_execution_rules, rule_at, listed, floor_quantity, legal_quantity,
+                          support_ref as csi300_support_ref, CSI300_ELIGIBILITY, CANDIDATE_POLICY)
 
 STOCK_PORTFOLIO_VERSION = "axiom.stock_portfolio/1"
 TOPK_PORTFOLIO_VERSION = "axiom.stock_portfolio/2"
+CSI300_PORTFOLIO_VERSION = "axiom.stock_portfolio/3"
 BUDGET_BASIS = "available_cash_plus_previous_close_positions_excluding_receivables"
 
 
@@ -113,22 +116,28 @@ def plan_stock_portfolio(frame, *, account, context, top_k=None):
         return _plan(frame, account, context, top_k)
 
 
-def _plan_admitted_stock_portfolio(wire, rows, *, account, context, top_k):
+def _plan_admitted_stock_portfolio(wire, rows, *, account, context, top_k, rules_index=None):
     """Runtime-private reuse after its full entry admission; no public bypass tag."""
     with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
-        return _plan(None, account, context, top_k, admitted=(wire, rows))
+        return _plan(None, account, context, top_k, admitted=(wire, rows), admitted_rules=rules_index)
 
 
-def _plan(frame, account, context, top_k, admitted=None):
+def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
     wire, rows = validate_stock_predictions(frame) if admitted is None else admitted
     v2 = wire["contract_version"] == "stock_prediction_run_v2"
+    full = "stock_execution_rules" in context
+    require(admitted_rules is None or (admitted is not None and full), "validated rules require private Runtime admission")
+    if full and admitted is None and not v2:
+        unsigned = dict(wire); reference = unsigned.pop("signal_run_ref")
+        require(Document.from_dict(unsigned).identity == reference, "Saved prediction identity mismatch")
     if v2:
         require(top_k is not None and "feature_knowledge_cutoff" in context,
                 "v2 neutral predictions only; account clock consumption is not admitted without explicit TopK and feature clock")
         if admitted is None:
             unsigned = dict(wire); reference = unsigned.pop("signal_run_ref")
             require(Document.from_dict(unsigned).identity == reference, "Saved v2 prediction identity mismatch")
-    fields(context, "trade_session feature_session decision_time knowledge_cutoff reference_prices lot_size commission_rate minimum_commission_minor slippage_bps account_state_version supported_security_ids supported_universe_ref" +
+    fields(context, "trade_session feature_session decision_time knowledge_cutoff reference_prices commission_rate minimum_commission_minor slippage_bps account_state_version supported_security_ids supported_universe_ref" +
+           (" portfolio_policy stock_execution_rules stock_execution_rules_ref" if full else " lot_size") +
            (" feature_knowledge_cutoff" if v2 else ""))
     session(context["trade_session"]); session(context["feature_session"])
     cutoff, decision = instant(context["knowledge_cutoff"]), instant(context["decision_time"])
@@ -141,11 +150,26 @@ def _plan(frame, account, context, top_k, admitted=None):
     require(type(supported) is list and bool(supported) and len(set(supported)) == len(supported) and
             set(supported) <= set(wire["universe"]), "explicit supported prediction subset required")
     digest(context["supported_universe_ref"])
+    rules, rule_index = (context["stock_execution_rules"], None) if full else (None, None)
+    if full:
+        # Only the Runtime-private caller may reuse this invocation's fully admitted index.
+        # The public Core entry always validates the complete rule and native identity closure.
+        rule_index = validate_execution_rules(rules) if admitted_rules is None else admitted_rules
+        digest(context["stock_execution_rules_ref"])
+        require(supported == wire["universe"] == rules["universe"] and
+                context["supported_universe_ref"] == csi300_support_ref(supported) and
+                (admitted_rules is not None or context["stock_execution_rules_ref"] == Document.from_dict(rules).identity),
+                "complete CSI300 rules/union identity required")
+        require(context["portfolio_policy"] == {"eligibility_id": CSI300_ELIGIBILITY, "top_k": top_k,
+            "rebalance": "weekly_first_trading_session", "budget_basis": BUDGET_BASIS,
+            "candidate_policy": CANDIDATE_POLICY, "stock_execution_rules_ref": context["stock_execution_rules_ref"]},
+            "explicit CSI300 valid-member policy required")
+        require(top_k is not None, "CSI300 policy requires explicit top_k")
     legacy = top_k is None
     k = 5 if legacy else top_k
     if not legacy:
         validate_top_k(k, supported)
-    version = STOCK_PORTFOLIO_VERSION if legacy else TOPK_PORTFOLIO_VERSION
+    version = CSI300_PORTFOLIO_VERSION if full else (STOCK_PORTFOLIO_VERSION if legacy else TOPK_PORTFOLIO_VERSION)
     fields(account, "cash_minor positions version")
     integer(account["cash_minor"]); integer(account["version"])
     require(account["version"] == context["account_state_version"], "account version conflict")
@@ -155,7 +179,8 @@ def _plan(frame, account, context, top_k, admitted=None):
         fields(position, "quantity sellable_quantity")
         integer(position["quantity"]); integer(position["sellable_quantity"])
         require(position["sellable_quantity"] <= position["quantity"], "invalid sellable quantity")
-    require(context["lot_size"] == 100, "stock buy lot must be 100 shares")
+    if not full:
+        require(context["lot_size"] == 100, "stock buy lot must be 100 shares")
     integer(context["minimum_commission_minor"])
     require(decimal(context["commission_rate"], minimum=0) <= 1, "invalid commission rate")
     require(decimal(context["slippage_bps"], minimum=0) < 10000, "invalid slippage")
@@ -167,6 +192,9 @@ def _plan(frame, account, context, top_k, admitted=None):
         if v2:
             require(instant(row["feature_knowledge_cutoff"]) == feature_cutoff and
                     instant(row["simulated_model_available_at"]) < cutoff, "inconsistent v2 decision clock")
+        if full and row["member"]:
+            require(listed(rule_index[0][row["security_id"]], context["feature_session"]),
+                    "PIT member contradicts native stock listing interval")
     eligible = [row for row in batch if row["member"] and row["security_id"] in supported]
     result = {"contract_version": version, "feature_session": context["feature_session"],
         "trade_session": context["trade_session"], "signal_ref": wire["signal_run_ref"],
@@ -174,6 +202,8 @@ def _plan(frame, account, context, top_k, admitted=None):
         "status": "DECISION_COMPLETE", "selected_security_ids": [], "targets": {}, "intents": [], "trace": []}
     if not legacy:
         result["top_k"] = k
+    if full:
+        result["stock_execution_rules_ref"] = context["stock_execution_rules_ref"]
     if v2:
         result["prediction_clock"] = {"clock_basis": wire["clock_basis"],
             "feature_knowledge_cutoff": batch[0]["feature_knowledge_cutoff"],
@@ -182,21 +212,40 @@ def _plan(frame, account, context, top_k, admitted=None):
             "model_ref": wire["model_ref"], "fold_spec_ref": wire["fold_spec_ref"]}
     invalid = [row for row in eligible if not row["valid"]]
     valid_count = len(eligible) if legacy else sum(row["valid"] for row in eligible)
-    if invalid or valid_count < k:
+    if full:
+        result["trace"].append({"reason": "VALID_MEMBER_CANDIDATES", "candidate_policy": CANDIDATE_POLICY,
+            "pit_member_count": len(eligible), "valid_candidate_count": valid_count,
+            "excluded_invalid_member_count": len(invalid), "excluded_invalid_members": [
+                {"security_id": row["security_id"], "invalid_reason": row["invalid_reason"]} for row in invalid]})
+    if (invalid and not full) or valid_count < k:
         result["status"] = "NO_DECISION"
-        result["trace"] = [{"reason": "INVALID_SIGNAL", "security_id": row["security_id"], "detail": row["invalid_reason"]} for row in invalid]
+        if not full:
+            result["trace"] = [{"reason": "INVALID_SIGNAL", "security_id": row["security_id"], "detail": row["invalid_reason"]} for row in invalid]
         if valid_count < k:
             result["trace"].append({"reason": "INSUFFICIENT_ELIGIBLE_MEMBERS", "count": valid_count,
                                     **({} if legacy else {"top_k": k})})
         return PortfolioDecision.from_dict(result)
-    selected = [row["security_id"] for row in sorted(eligible, key=lambda row: (-row["score"], row["security_id"]))[:k]]
+    candidates = [row for row in eligible if row["valid"]] if full else eligible
+    selected = [row["security_id"] for row in sorted(candidates, key=lambda row: (-row["score"], row["security_id"]))[:k]]
     result["selected_security_ids"] = selected
-    needed = set(selected) | set(account["positions"])
+    held = {s for s, p in account["positions"].items() if p["quantity"]} if full else set(account["positions"])
+    needed = set(selected) | held
     prices = {}
+    missing = []
     for security in sorted(needed):
         quote = context["reference_prices"].get(security)
+        if full and quote is None:
+            missing.append(security)
+            continue
         require(quote is not None, "missing stock previous-close reference")
         fields(quote, "price session available_at source_refs")
+        if full:
+            session(quote["session"])
+            require(quote["session"] <= context["feature_session"] and instant(quote["available_at"]) <= feature_cutoff,
+                    "future stock sizing reference")
+            if quote["session"] != context["feature_session"]:
+                missing.append(security)
+                continue
         require(quote["session"] == context["feature_session"] and instant(quote["available_at"]) <= feature_cutoff,
                 "future or stale stock sizing reference")
         require(type(quote["source_refs"]) is list and bool(quote["source_refs"]), "reference provenance required")
@@ -204,20 +253,49 @@ def _plan(frame, account, context, top_k, admitted=None):
             source_ref(ref)
         prices[security] = decimal(quote["price"], minimum=0)
         require(prices[security] > 0, "positive reference price required")
+    if missing:
+        result["status"] = "NO_DECISION"
+        result["trace"].append({"reason": "MISSING_SIZING_REFERENCE", "security_ids": missing,
+                                 "required_session": context["feature_session"]})
+        return PortfolioDecision.from_dict(result)
     budget = Decimal(account["cash_minor"]) + sum(Decimal(position["quantity"]) * prices[security] * 100
-                                                  for security, position in account["positions"].items())
+                                                  for security, position in account["positions"].items() if security in held)
     for security in sorted(needed):
-        result["targets"][security] = int(budget / k / (prices[security] * 100)) // 100 * 100 if security in selected else 0
+        raw = int(budget / k / (prices[security] * 100)) if security in selected else 0
+        if full:
+            rule = rule_at(rules, security, context["trade_session"], validated=rule_index)
+            result["targets"][security] = floor_quantity(raw, rule["buy_minimum"], rule["buy_increment"])
+            if security in selected and not result["targets"][security]:
+                result["trace"].append({"reason": "TARGET_BELOW_MINIMUM_QUANTITY", "security_id": security,
+                    "raw_target_quantity": raw, "minimum": rule["buy_minimum"]})
+        else:
+            result["targets"][security] = raw // 100 * 100
     for security, position in sorted(account["positions"].items()):
         reduction = max(0, position["quantity"] - result["targets"].get(security, 0))
         quantity = min(reduction, position["sellable_quantity"])
+        available = quantity
+        if full and quantity:
+            rule = rule_at(rules, security, context["trade_session"], validated=rule_index)
+            quantity = legal_quantity(reduction, "SELL", rule, held=position["quantity"],
+                                      sellable=position["sellable_quantity"], apply_maximum=False)
+            if quantity < available:
+                result["trace"].append({"reason": "BELOW_MINIMUM_ORDER_QUANTITY" if not quantity else "ORDER_QUANTITY_INCREMENT",
+                    "security_id": security, "side": "SELL", "quantity": available - quantity})
         if quantity:
             result["intents"].append({"security_id": security, "side": "SELL", "quantity": quantity})
-        if reduction > quantity:
-            result["trace"].append({"reason": "T_PLUS_ONE_OR_UNSELLABLE", "security_id": security, "quantity": reduction - quantity})
+        if reduction > available:
+            result["trace"].append({"reason": "T_PLUS_ONE_OR_UNSELLABLE", "security_id": security, "quantity": reduction - available})
     for security in sorted(selected):
         current = account["positions"].get(security, {"quantity": 0})["quantity"]
-        quantity = max(0, result["targets"][security] - current) // 100 * 100
+        increase = max(0, result["targets"][security] - current)
+        if full:
+            rule = rule_at(rules, security, context["trade_session"], validated=rule_index)
+            quantity = legal_quantity(increase, "BUY", rule, apply_maximum=False)
+            if quantity < increase:
+                result["trace"].append({"reason": "BELOW_MINIMUM_ORDER_QUANTITY" if not quantity else "ORDER_QUANTITY_INCREMENT",
+                    "security_id": security, "side": "BUY", "quantity": increase - quantity})
+        else:
+            quantity = increase // 100 * 100
         if quantity:
             result["intents"].append({"security_id": security, "side": "BUY", "quantity": quantity})
     result["trace"].append({"reason": "RAW_TOP5" if legacy else "RAW_TOP_K", "eligible_count": len(eligible),
