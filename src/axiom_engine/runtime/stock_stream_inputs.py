@@ -793,7 +793,7 @@ class StockInputSource:
         fields(descriptor, "contract_version fold_ref files")
         names = {"fold.json", "feature-slice.json", "label-slice.json", "dataset.json", "model.json",
                  "predictions.json", "signal-evidence.json", "booster.txt"}
-        require(descriptor["contract_version"] == "stock_ml_fold_manifest_v1" and type(descriptor["files"]) is dict and
+        require(descriptor["contract_version"] in ("stock_ml_fold_manifest_v1", "stock_ml_fold_manifest_v2") and type(descriptor["files"]) is dict and
                 set(descriptor["files"]) == names, "Original saved fold manifest required")
         for reference in descriptor["files"].values():
             digest(reference)
@@ -801,7 +801,11 @@ class StockInputSource:
         header = index.object_header(("definition",))
         fields(header, "contract_version content_digest definition_ref status feature_ref label_ref dataset_ref model_ref signal_run_ref evidence_ref fold_ref engine_admission limitations")
         refs = {name: header[name] for name in ("feature_ref", "label_ref", "dataset_ref", "model_ref", "signal_run_ref", "evidence_ref")}
-        require(header["contract_version"] == {"stock_ml_fold_spec_v1": "stock_ml_fold_v1", "stock_ml_fold_spec_v2": "stock_ml_fold_v2"}.get(spec.get("contract_version")) and header["status"] == "COMPLETE" and
+        require((descriptor["contract_version"], header["contract_version"], spec.get("contract_version")) in {
+                    ("stock_ml_fold_manifest_v1", "stock_ml_fold_v1", "stock_ml_fold_spec_v1"),
+                    ("stock_ml_fold_manifest_v1", "stock_ml_fold_v2", "stock_ml_fold_spec_v2"),
+                    ("stock_ml_fold_manifest_v2", "stock_ml_fold_v3", "stock_ml_fold_spec_v1"),
+                    ("stock_ml_fold_manifest_v2", "stock_ml_fold_v3", "stock_ml_fold_spec_v2")} and header["status"] == "COMPLETE" and
                 header["content_digest"] == index.unsigned_digest("content_digest") and
                 header["definition_ref"] == index.span_digest(("definition",)) and
                 header["fold_ref"] == Document.from_dict({"definition_ref": header["definition_ref"], **refs}).identity ==

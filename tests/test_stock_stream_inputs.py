@@ -107,7 +107,8 @@ def rebind_native(manifest, name, mutate):
     manifest["request_ref"] = logical_ref(manifest, "request_ref")
 
 
-def nested_fold_fixture(root, *, spec_version=None, wrapper_version=None):
+def nested_fold_fixture(root, *, spec_version=None, wrapper_version=None,
+                        manifest_version="stock_ml_fold_manifest_v1"):
     """The saved Research wire shape, with synthetic unselected parent data."""
     manifest, plan = source_fixture(root)
     item = manifest["prediction_input"]["frames"][0]
@@ -139,7 +140,7 @@ def nested_fold_fixture(root, *, spec_version=None, wrapper_version=None):
     (folder/"fold.json").write_text(canonical(fold)+"\n")
     file_names = ("fold.json", "feature-slice.json", "label-slice.json", "dataset.json", "model.json",
                   "predictions.json", "signal-evidence.json", "booster.txt")
-    descriptor = {"contract_version": "stock_ml_fold_manifest_v1", "fold_ref": fold["fold_ref"],
+    descriptor = {"contract_version": manifest_version, "fold_ref": fold["fold_ref"],
                   "files": {name: "sha256:"+hashlib.sha256((folder/name).read_bytes()).hexdigest()
                             if (folder/name).exists() else REF for name in file_names}}
     (folder/"manifest.json").write_text(canonical(descriptor)+"\n")
@@ -271,6 +272,84 @@ class StockStreamInputTests(unittest.TestCase):
                     self.assertTrue(any(block.signals for block in blocks))
                 else:
                     with self.assertRaisesRegex(ContractError, "wrapper identity mismatch"):
+                        admitted(source, manifest)
+                    self.assertFalse(source._audited)
+
+    def test_nested_matrix_v3_accepts_only_exact_manifest_wrapper_spec_combinations(self):
+        accepted = {("stock_ml_fold_manifest_v1", "stock_ml_fold_v1", "stock_ml_fold_spec_v1"),
+                    ("stock_ml_fold_manifest_v1", "stock_ml_fold_v2", "stock_ml_fold_spec_v2"),
+                    ("stock_ml_fold_manifest_v2", "stock_ml_fold_v3", "stock_ml_fold_spec_v1"),
+                    ("stock_ml_fold_manifest_v2", "stock_ml_fold_v3", "stock_ml_fold_spec_v2")}
+        from itertools import product
+        for versions in product(("stock_ml_fold_manifest_v1", "stock_ml_fold_manifest_v2", "unknown"),
+                                ("stock_ml_fold_v1", "stock_ml_fold_v2", "stock_ml_fold_v3"),
+                                ("stock_ml_fold_spec_v1", "stock_ml_fold_spec_v2")):
+            with self.subTest(versions=versions), tempfile.TemporaryDirectory() as tmp:
+                descriptor, wrapper, spec = versions
+                manifest, _, _ = nested_fold_fixture(Path(tmp), manifest_version=descriptor,
+                                                     wrapper_version=wrapper, spec_version=spec)
+                source = StockInputSource()
+                if versions in accepted:
+                    admitted(source, manifest)
+                    blocks = list(source.iter_blocks(manifest, block_sessions=2, read_budget=read_budget(LIMITS)))
+                    self.assertTrue(any(block.signals for block in blocks))
+                else:
+                    with self.assertRaises(ContractError):
+                        admitted(source, manifest)
+                    self.assertFalse(source._audited)
+
+    def test_nested_matrix_v3_keeps_original_parent_selector_stage_and_clock_gates(self):
+        for spec in ("stock_ml_fold_spec_v1", "stock_ml_fold_spec_v2"):
+            for failure in ("child", "selector", "parent", "raw_file", "model_file", "stage", "clock"):
+                with self.subTest(spec=spec, failure=failure), tempfile.TemporaryDirectory() as tmp:
+                    manifest, _, folder = nested_fold_fixture(Path(tmp), manifest_version="stock_ml_fold_manifest_v2",
+                        wrapper_version="stock_ml_fold_v3", spec_version=spec)
+                    item = manifest["prediction_input"]["frames"][0]
+                    if failure == "child":
+                        item["fold_spec_artifact"]["content_digest"] = REF
+                    elif failure == "selector":
+                        item["fold_spec_artifact"]["manifest_uri"] = str(folder/"fold.json")+"#definition/input_manifest"
+                    elif failure == "stage":
+                        item["feature_ref"] = Document.from_dict({"unrelated_stage": True}).identity
+                    elif failure == "parent":
+                        wire = Document((folder/"fold.json").read_text()).to_dict()
+                        wire["definition"]["input_manifest"]["tampered"] = True
+                        wire.pop("content_digest"); wire["content_digest"] = Document.from_dict(wire).identity
+                        (folder/"fold.json").write_text(canonical(wire)+"\n")
+                    elif failure == "clock":
+                        # Rebind valid hashes so rejection exercises the clock gate.
+                        wire = Document((folder/"model.json").read_text()).to_dict()
+                        wire["simulated_available_at"] = wire["fit_cutoff"]
+                        wire.pop("model_ref"); wire["model_ref"] = Document.from_dict(wire).identity
+                        (folder/"model.json").write_text(canonical(wire)+"\n")
+                        item["model_ref"] = wire["model_ref"]
+                        item["model_metadata_artifact"]["content_digest"] = Document.from_dict(wire).identity
+                        prediction = Document((folder/"predictions.json").read_text()).to_dict()
+                        prediction["model_ref"] = wire["model_ref"]
+                        prediction.pop("signal_run_ref"); prediction["signal_run_ref"] = Document.from_dict(prediction).identity
+                        item["signal_run_ref"] = prediction["signal_run_ref"]
+                        item["prediction_artifact"]["content_digest"] = Document.from_dict(prediction).identity
+                        (folder/"predictions.json").write_text(canonical(prediction)+"\n")
+                        wrapper = Document((folder/"fold.json").read_text()).to_dict()
+                        wrapper.update(model_ref=wire["model_ref"], signal_run_ref=prediction["signal_run_ref"])
+                        refs = {name: wrapper[name] for name in ("feature_ref", "label_ref", "dataset_ref", "model_ref", "signal_run_ref", "evidence_ref")}
+                        wrapper["fold_ref"] = Document.from_dict({"definition_ref": wrapper["definition_ref"], **refs}).identity
+                        wrapper.pop("content_digest"); wrapper["content_digest"] = Document.from_dict(wrapper).identity
+                        item["fold_ref"] = wrapper["fold_ref"]
+                        (folder/"fold.json").write_text(canonical(wrapper)+"\n")
+                        descriptor = Document((folder/"manifest.json").read_text()).to_dict()
+                        descriptor["fold_ref"] = wrapper["fold_ref"]
+                        for name in ("fold.json", "model.json", "predictions.json"):
+                            descriptor["files"][name] = "sha256:"+hashlib.sha256((folder/name).read_bytes()).hexdigest()
+                        (folder/"manifest.json").write_text(canonical(descriptor)+"\n")
+                    else:
+                        wire = Document((folder/"manifest.json").read_text()).to_dict()
+                        wire["files"]["fold.json" if failure == "raw_file" else "model.json"] = REF
+                        (folder/"manifest.json").write_text(canonical(wire)+"\n")
+                    manifest["prediction_input"]["prediction_ref"] = logical_ref(manifest["prediction_input"], "prediction_ref")
+                    manifest["request_ref"] = logical_ref(manifest, "request_ref")
+                    source = StockInputSource()
+                    with self.assertRaisesRegex(ContractError, "model|Model|clock" if failure == "clock" else ".*"):
                         admitted(source, manifest)
                     self.assertFalse(source._audited)
 
