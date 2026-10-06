@@ -126,6 +126,9 @@ def _plan(frame, account, context, top_k, admitted=None):
     wire, rows = validate_stock_predictions(frame) if admitted is None else admitted
     v2 = wire["contract_version"] == "stock_prediction_run_v2"
     full = "stock_execution_rules" in context
+    if full and admitted is None and not v2:
+        unsigned = dict(wire); reference = unsigned.pop("signal_run_ref")
+        require(Document.from_dict(unsigned).identity == reference, "Saved prediction identity mismatch")
     if v2:
         require(top_k is not None and "feature_knowledge_cutoff" in context,
                 "v2 neutral predictions only; account clock consumption is not admitted without explicit TopK and feature clock")

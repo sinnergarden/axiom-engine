@@ -117,7 +117,7 @@ def _verified_display(display):
 
 def _units(saved):
     profile = saved["plan"]["profile"]
-    if saved["contract_version"] in ("backtest_run_v3", "backtest_run_v4"):
+    if saved["contract_version"] in ("backtest_run_v3", "backtest_run_v4", "backtest_run_v6"):
         require(saved["price_unit"] == "CNY/share" and saved["quantity_unit"] == "shares",
                 "stock account unit differs")
         return "CNY/share"
@@ -133,10 +133,11 @@ def _unit_contract(saved):
 
 def _contract_unit(contract):
     fields(contract, "backtest_contract_version profile_contract_version quantity_unit price_unit")
-    stock = contract["backtest_contract_version"] in ("backtest_run_v3", "backtest_run_v4")
+    stock = contract["backtest_contract_version"] in ("backtest_run_v3", "backtest_run_v4", "backtest_run_v6")
+    full = contract["backtest_contract_version"] == "backtest_run_v6"
     v5 = contract["backtest_contract_version"] == "backtest_run_v5"
-    require(contract["backtest_contract_version"] in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4", "backtest_run_v5") and
-        contract["profile_contract_version"] == ("stock_daily_open_profile_v1" if stock else ("daily_open_profile_v2" if v5 else "daily_open_profile_v1")),
+    require(contract["backtest_contract_version"] in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4", "backtest_run_v5", "backtest_run_v6") and
+        contract["profile_contract_version"] == ("stock_daily_open_profile_v2" if full else ("stock_daily_open_profile_v1" if stock else ("daily_open_profile_v2" if v5 else "daily_open_profile_v1"))),
         "unsupported saved account unit contract")
     require((contract["quantity_unit"], contract["price_unit"]) == (("shares", "CNY/share") if stock else (("fund units", "CNY/fund unit") if v5 else (None, None))),
         "saved account unit metadata differs")

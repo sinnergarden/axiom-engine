@@ -187,7 +187,7 @@ def _execution_trace(saved):
             for order in orders.get(intent.get("intent_id"),[]) if intent.get("intent_id") is not None else []:
                 actual=fills.get(order.get("order_id"),[]) if order.get("order_id") is not None else []
                 matched.append(dict(order_id=order.get("order_id"),status=order.get("status"),reason=order.get("reason"),
-                    requested_quantity=order.get("quantity"),filled_quantity=order.get("filled_quantity"),
+                    requested_quantity=order.get("requested_quantity", order.get("quantity")),filled_quantity=order.get("filled_quantity"),
                     unfilled_quantity=order.get("unfilled_quantity"),execution_admission=order.get("execution_admission"),
                     committed_sequence=order.get("committed_sequence"),fill_ids=[f.get("fill_id") for f in actual],fills=actual))
             linked.append(dict(intent_id=intent.get("intent_id"),intent=intent,orders=matched))

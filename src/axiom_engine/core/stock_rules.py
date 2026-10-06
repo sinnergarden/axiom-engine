@@ -1,5 +1,4 @@
 """Frozen stock quantity rules; pure validation and integer sizing only."""
-from copy import deepcopy
 import re
 
 from .contracts import Document, digest, fields, integer, require, session, text
@@ -36,7 +35,8 @@ def _sources(sources):
 
 
 def _source_keys(value, keys):
-    require(type(value) is list and bool(value) and len(set(value)) == len(value) and set(value) <= keys,
+    require(type(value) is list and bool(value) and all(type(v) is str for v in value) and
+            len(set(value)) == len(value) and set(value) <= keys,
             "unbound classification or rule source")
 
 
@@ -77,8 +77,10 @@ def validate_execution_rules(wire):
             "unsupported frozen stock quantity policy")
     _period(wire["verified_from"], wire["verified_through"])
     universe, calendar = wire["universe"], wire["calendar"]
-    require(type(universe) is list and bool(universe) and universe == sorted(set(universe)), "sorted stock union required")
-    require(type(calendar) is list and bool(calendar) and calendar == sorted(set(calendar)), "ordered stock calendar required")
+    require(type(universe) is list and bool(universe) and all(type(s) is str for s in universe) and
+            universe == sorted(set(universe)), "sorted stock union required")
+    require(type(calendar) is list and bool(calendar) and all(type(d) is str for d in calendar) and
+            calendar == sorted(set(calendar)), "ordered stock calendar required")
     for day in calendar:
         session(day)
         require(wire["verified_from"] <= day <= wire["verified_through"], "stock session outside verified rule window")
@@ -113,6 +115,7 @@ def validate_execution_rules(wire):
     for row in identity["rows"]:
         fields(row, "security_id exchange board instrument_kind listing_date delisting_date classification_source_keys source_refs")
         security = row["security_id"]
+        require(type(security) is str, "canonical stock identity required")
         match = re.fullmatch(r"cnstock\.(\d{6})\.(SH|SZ)\.(\d{8})", security)
         require(match is not None and security not in index and row["instrument_kind"] == "A_SHARE" and
                 row["board"] in BOARDS, "unknown or conflicting stock classification")
@@ -135,6 +138,7 @@ def validate_execution_rules(wire):
         # documented exceptional assignments, such as 302132 on ChiNext, remain representable.
         index[security] = row
     require(list(index) == universe, "complete ordered canonical stock identity union required")
+    require(type(wire["quantity_rules"]) is list and bool(wire["quantity_rules"]), "frozen stock quantity intervals required")
     for rule in wire["quantity_rules"]:
         fields(rule, RULE_FIELDS)
         require(rule["board"] in BOARDS, "unknown quantity-rule board")
@@ -154,10 +158,10 @@ def validate_execution_rules(wire):
 
 
 def stock_execution_rules(*, universe, calendar, identity_input, quantity_rules, sources, verified_from, verified_through):
-    wire = deepcopy(dict(contract_version="stock_execution_rules_v1", universe=universe, calendar=calendar,
+    wire = Document.from_dict(dict(contract_version="stock_execution_rules_v1", universe=universe, calendar=calendar,
         identity_input=identity_input, identity_input_ref=Document.from_dict(identity_input).identity,
         quantity_rules=quantity_rules, sources=sources, verified_from=verified_from, verified_through=verified_through,
-        limitations=RULE_LIMITATIONS))
+        limitations=RULE_LIMITATIONS)).to_dict()
     validate_execution_rules(wire)
     return wire
 
