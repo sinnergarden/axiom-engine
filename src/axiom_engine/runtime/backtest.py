@@ -358,14 +358,16 @@ def run_backtest(request, *, limits=None):
         return _run(request, decoded_plan=decoded_plan)
 
 
-def _run(request, *, decoded_plan=None):
-    plan, signal, signals, market, calendar, rows, profile = _validate(request, decoded_plan=decoded_plan)
+def _run(request, *, decoded_plan=None, admitted=None, storage=None):
+    plan, signal, signals, market, calendar, rows, profile = (
+        _validate(request, decoded_plan=decoded_plan) if admitted is None else admitted)
+    streaming = storage is not None
     v5 = plan["contract_version"] == "backtest_request_v5"
     v2 = plan["contract_version"] in ("backtest_request_v2", "backtest_request_v5")
     v4 = plan["contract_version"] == "backtest_request_v4"
-    v6 = plan["contract_version"] == "backtest_request_v6"
+    v6 = plan["contract_version"] in ("backtest_request_v6", "backtest_request_v7")
     scheduled = v4 or v6
-    stock = plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4", "backtest_request_v6")
+    stock = plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4", "backtest_request_v6", "backtest_request_v7")
     hold = v5 and plan["portfolio_policy"]["contract_version"] == "etf_buy_and_hold_policy_v1"
     from ..core.etf_buy_hold import BUY_HOLD_VERSION, plan_etf_buy_and_hold
     runtime = "axiom.backtest/6" if v6 else ("axiom.backtest/5" if v5 else ("axiom.backtest/4" if v4 else ("axiom.backtest/3" if stock else (RUNTIME_VERSION if v2 else LEGACY_RUNTIME_VERSION))))
@@ -373,25 +375,35 @@ def _run(request, *, decoded_plan=None):
     rules_index = None
     if v6:
         from ..core.stock_rules import validate_execution_rules
-        rules_index = validate_execution_rules(profile["stock_execution_rules"])
+        rules_index = storage.audit.globals["rules_index"] if streaming else validate_execution_rules(profile["stock_execution_rules"])
     splits = market.get("unit_splits", [])
-    run_id = Document.from_dict({"request": plan, "core": core_version, "runtime": runtime,
+    run_id = storage.run_id if streaming else Document.from_dict({"request": plan, "core": core_version, "runtime": runtime,
                                 "implementation_ref": IMPLEMENTATION_REF}).identity
     ledger = AccountLedger(cash_minor=plan["initial_account"]["cash_minor"], calendar=calendar,
-                           settlement_sessions=profile["settlement_sessions"], positions=plan["initial_account"]["positions"])
+                           settlement_sessions=profile["settlement_sessions"], positions=plan["initial_account"]["positions"],
+                           output_guard=storage.reserve_output if streaming else None)
     quotes, marks, entitlements = {}, {}, {}
     registrations, applications, mark_basis = {}, [], {}
     nav, positions, orders, decisions = [], [], [], []
+    order_index = 0
+    calendar_index = {day: index for index, day in enumerate(calendar)}
+    if streaming:
+        storage.attach(ledger, nav, positions, orders, decisions)
+    def append_output(kind, row):
+        if streaming:
+            storage.reserve_output(kind, row)
+        {"nav": nav, "positions": positions, "orders": orders, "decisions": decisions}[kind].append(row)
     initial_value = None
     stopped = None
     lifecycle = None
     if v6:
-        lifecycle = dict(pre_listing_null=0, listed_nonmember_gap=0, member_gap=0, held_gap=0)
-        for row in rows.values():
-            gap = not row["_stock_factor_valid"] or any(row[name] is None for name in
-                ("open", "close", "volume_shares", "limit_up", "limit_down"))
-            if row["market_state"] == "not_listed": lifecycle["pre_listing_null"] += 1
-            elif row["_stock_listed"] and gap: lifecycle["member_gap" if row["_stock_member"] else "listed_nonmember_gap"] += 1
+        lifecycle = dict(storage.audit.lifecycle) if streaming else dict(pre_listing_null=0, listed_nonmember_gap=0, member_gap=0, held_gap=0)
+        if not streaming:
+            for row in rows.values():
+                gap = not row["_stock_factor_valid"] or any(row[name] is None for name in
+                    ("open", "close", "volume_shares", "limit_up", "limit_down"))
+                if row["market_state"] == "not_listed": lifecycle["pre_listing_null"] += 1
+                elif row["_stock_listed"] and gap: lifecycle["member_gap" if row["_stock_member"] else "listed_nonmember_gap"] += 1
     for index, day in enumerate(calendar):
         if day > plan["end_session"]:
             break
@@ -416,12 +428,16 @@ def _run(request, *, decoded_plan=None):
                     if gaps:
                         stopped = {"session": day, "reason": "HELD_MISSING_STOCK_LIFECYCLE_CAPABILITY", "gaps": gaps,
                                    "committed_sequence": ledger.sequence}
+                        if streaming:
+                            storage.flush(day, "STOPPED_BEFORE_NAV", ledger.sequence)
                         break
                 blocking = [block for security, position in ledger.positions.items() if position["quantity"]
                             for block in applicable_blocks(market, security, day)]
                 if blocking:
                     stopped = {"session": day, "reason": "HELD_UNSUPPORTED_STOCK_ACTION", "blocks": blocking,
                                "committed_sequence": ledger.sequence}
+                    if streaming:
+                        storage.flush(day, "STOPPED_BEFORE_NAV", ledger.sequence)
                     break
             for phase, key in (("EX", "ex_session"), ("PAY", "pay_session")):
                 for action in sorted(market["cash_dividends"], key=lambda a: a["event_id"]):
@@ -459,10 +475,14 @@ def _run(request, *, decoded_plan=None):
                     decision = plan_rotation(SignalFrame.from_dict(signal), account=ledger.account(), context=context).to_dict()
                 if v2 or stock:
                     decision["reference_prices"] = {s: dict(q) for s, q in quotes.items()}
-                decisions.append(decision)
+                append_output("decisions", decision)
                 for intent in decision["intents"]:
-                    orders.append(_simulate(intent, rows[day, intent["security_id"]], ledger, profile, day, run_id, len(orders),
-                                            splits if v2 else None, market if stock else None, stock_rules_index=rules_index))
+                    order = _simulate(intent, rows[day, intent["security_id"]], ledger, profile, day, run_id, order_index,
+                                      splits if v2 else None, market if stock else None, stock_rules_index=rules_index)
+                    order_index += 1
+                    append_output("orders", order)
+                    if streaming:
+                        storage.observe_order(order)
             for action in market["cash_dividends"]:
                 if action["record_session"] == day:
                     entitlements[action["event_id"]] = ledger.positions.get(action["security_id"], {"quantity": 0})["quantity"]
@@ -502,20 +522,33 @@ def _run(request, *, decoded_plan=None):
             mark = marks[security]
             amount = minor(decimal(mark["price"]) * position["quantity"] * 100)
             value += amount
-            positions.append({"session": day, "security_id": security, **position,
+            point = {"session": day, "security_id": security, **position,
                 "mark_price": mark["price"], "mark_session": mark["session"],
-                "is_stale": mark["session"] != day, "stale_sessions": index - calendar.index(mark["session"]),
+                "is_stale": mark["session"] != day, "stale_sessions": index - calendar_index[mark["session"]],
                 "mark_source_refs": mark["source_refs"], "market_value_minor": amount,
-                "committed_sequence": ledger.sequence})
+                "committed_sequence": ledger.sequence}
             if v2:
-                positions[-1]["mark_basis_event_id"] = mark_basis.get(security)
+                point["mark_basis_event_id"] = mark_basis.get(security)
             if v6:
-                positions[-1]["stale_reason"] = rows[day, security]["_stock_close_missing_reason"] if mark["session"] != day else None
+                point["stale_reason"] = rows[day, security]["_stock_close_missing_reason"] if mark["session"] != day else None
+            append_output("positions", point)
         receivable = sum(ledger.receivables.values())
         total = ledger.cash + value + receivable
-        nav.append({"session": day, "cash_minor": ledger.cash, "market_value_minor": value,
+        append_output("nav", {"session": day, "cash_minor": ledger.cash, "market_value_minor": value,
             "receivable_minor": receivable, "nav_minor": total,
             "nav_index": str(Decimal(total) / initial_value), "committed_sequence": ledger.sequence})
+        if streaming:
+            storage.observe_nav(nav[-1], initial_value)
+            storage.flush(day, "SESSION_COMMITTED", ledger.sequence)
+    if streaming:
+        limitations = [profile["limitation"],
+            "Daily open-price approximation; full-day volume is an execution-side capacity proxy, not known opening liquidity.",
+            "Day orders expire after one simulated fill; no live broker, SQLite recovery, general stock quantity-action or delisting support.",
+            "Dividend handling supports explicit record/ex/pay cash events; unsupported economic events must be rejected by the caller adapter.",
+            "Metrics cover the frozen stock sample; separate saved evaluation owns annualization.",
+            *market["limitations"], *signal["limitations"], *plan["limitations"]]
+        return storage.result(ledger=ledger, initial_value=initial_value, stopped=stopped,
+                              lifecycle=lifecycle, limitations=limitations)
     peak, drawdown = initial_value, Decimal(0)
     for point in nav:
         peak = max(peak, point["nav_minor"])
