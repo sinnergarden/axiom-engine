@@ -163,6 +163,7 @@ def _required_cells(p, outputs, by_security, refs, reference_index):
     positions = {k: i for keys in by_security.values() for i, k in enumerate(keys)}
     pending = [(o['node'], k) for o in p['outputs'] for k in outputs]
     seen = set()
+    expanded_cs = set()
     needed = {name: set() for name in nodes}
     while pending:
         name, key = pending.pop()
@@ -186,9 +187,14 @@ def _required_cells(p, outputs, by_security, refs, reference_index):
                 dependencies = history[max(0, start):end]
         elif op in CS:
             industry = refs[key]['industry']
-            reference_keys = (by_session[key[1]] if q['group'] == 'session' else
-                              by_industry[(key[1], industry)] if industry is not None else ())
-            dependencies += [k for k in reference_keys if refs[k]['member']]
+            group = (name, key[1], industry if q['group'] == 'industry' else '')
+            if group not in expanded_cs:
+                expanded_cs.add(group)
+                reference_keys = (by_session[key[1]] if q['group'] == 'session' else
+                                  by_industry[(key[1], industry)] if industry is not None else ())
+                dependencies += [k for k in reference_keys if refs[k]['member']]
+            # The first expansion drains all group parents before another key
+            # of this node is visited. Each key still needs its own parent.
         for parent in n['inputs']:
             pending.extend((parent, k) for k in dependencies)
     return needed
@@ -300,6 +306,9 @@ def _cross_section(op, source, keys, refs, q, reference_index):
         blocked = absent and q['missing'] == 'propagate'
         std = _std(vals, q['ddof']) if op == 'cs_zscore' and vals else None
         undefined = std is None or std == 0 or std < q.get('epsilon', 0)
+        eligible = set(eligible)
+        group_dependency = _merge(None, deps + refs_cells)
+        mean = None
         for key in group_keys:
             x = source[key].value
             if x is None and q['missing'] == 'fill_zero': x = 0.0
@@ -310,7 +319,11 @@ def _cross_section(op, source, keys, refs, q, reference_index):
                 elif undefined:
                     require(q['constant'] != 'reject', 'UNDEFINED_CS_SCALE')
                     value = 0.0 if q['constant'] == 'zero' else None
-                else: value = (x - math.fsum(vals)/len(vals)) / std
+                else:
+                    # Keep reference order and defer arithmetic until the first
+                    # row that used it originally (excluded/blocked rows may not).
+                    if mean is None: mean = math.fsum(vals) / len(vals)
+                    value = (x - mean) / std
             elif op == 'cs_zscore' and key in eligible and not blocked and undefined:
                 require(q['constant'] != 'reject', 'UNDEFINED_CS_SCALE')
                 if x is not None and q['constant'] == 'zero': value = 0.0
@@ -319,7 +332,7 @@ def _cross_section(op, source, keys, refs, q, reference_index):
                 value = 0.0
             if op == 'cs_zscore' and value is not None and q['clip'] is not None:
                 value = min(max(value, q['clip'][0]), q['clip'][1])
-            out[key] = _merge(value, deps + refs_cells + [source[key]], 'REFERENCE_MISSING')
+            out[key] = _merge(value, [group_dependency, source[key]], 'REFERENCE_MISSING')
     return out
 
 
