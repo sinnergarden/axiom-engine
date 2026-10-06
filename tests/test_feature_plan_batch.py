@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import math
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -149,6 +150,84 @@ class FeaturePlanBatch(unittest.TestCase):
                     if row['session']==base[2]['sessions'][32]:row['values']=[-0.0]
         result=self.assertExact(requests_for(base,history=65,view_count=2,transform=swap),2**20)
         self.assertEqual(result['stats']['helpers']['rolling.std']['reused'],0)
+
+    def test_public_fill_integer_control_preserves_original_float_outputs(self):
+        # The proposed public collision does not reach the memo as an int:
+        # the existing float64 node exit converts fill's value before rolling.
+        integer, floating = 2**53+1, float(2**53)
+        for width in (1,70):
+            nodes=[node('filled','fill',['x'],{'value':integer}),
+                   rolling('std','filled',64,64,'std'),rolling('mean','std',2,2)]
+            outputs=['mean']
+            if width>1:
+                nodes.append(cs('z','cs_zscore',src='mean',constant='missing'))
+                outputs.append('z')
+            base=setup({f'S{i:03d}':[floating]*66 for i in range(width)},nodes,outputs)
+            def restored(index,p,f,c):
+                if index==0:
+                    row=next(r for r in f['rows'] if r['security_id']=='S000' and
+                             r['session']==base[2]['sessions'][31])
+                    row.update(values=[None],missing_reasons=['RESTORED_LATER'])
+            requests=requests_for(base,history=65,view_count=2,transform=restored)
+            before=tuple(tuple(d.payload for d in r) for r in requests)
+            observed=set(); original=execution._std
+            def typed_std(vals,ddof):
+                observed.update(type(v) for v in vals)
+                return original(vals,ddof)
+            with self.subTest(width=width),patch.object(execution,'_std',side_effect=typed_std):
+                for budget in (0,2**20):
+                    result=self.assertExact(requests,budget)
+                    for frame in result['frames']:
+                        for row in frame.to_dict()['rows']:
+                            self.assertEqual(row['values'][0],0.0)
+                            if width>1:self.assertIsNone(row['values'][1])
+            self.assertEqual(observed,{float})
+            self.assertEqual(before,tuple(tuple(d.payload for d in r) for r in requests))
+            self.assertIs(type(requests[0][0].to_dict()['nodes'][0]['params']['value']),int)
+
+    def test_numeric_memo_preserves_actual_integer_type_for_std_and_cs_scale(self):
+        integer, floating = 2**53+1, float(2**53)
+        self.assertNotEqual(feature_batch._value_key(integer),feature_batch._value_key(floating))
+        self.assertEqual(feature_batch._value_key(integer),('int',integer))
+        self.assertEqual(len({feature_batch._value_key(v) for v in (True,1,1.0,None)}),4)
+        days=setup({'A':[floating]*64},[rolling('std')])[2]['sessions']
+        for kind in ('rolling.std','cs_zscore.scale'):
+            memo=feature_batch._NumericReuse(2**20)
+            universe=('A',) if kind=='rolling.std' else tuple(f'S{i:03d}' for i in range(64))
+            scope=(tuple(('A',day) for day in days) if kind=='rolling.std' else
+                   tuple((security,days[-1]) for security in universe))
+            refs=({key:dict(member=True,industry='industry1') for key in scope}
+                  if kind=='cs_zscore.scale' else None)
+            q={'reduction':'std','ddof':0,'epsilon':1e-12}
+            function=execution._rolling_value if kind=='rolling.std' else execution._cs_zscore_scale
+            results=[]
+            try:
+                for vals in ([floating]*63+[integer],[floating]*64):
+                    cells=tuple(execution._Cell(v,None,()) for v in vals)
+                    args=(vals,vals[-1],q) if kind=='rolling.std' else (vals,q)
+                    memo.begin_view(universe)
+                    result=memo.evaluate(kind,0,scope,cells,function,args,refs=refs,source_name='x')
+                    self.assertEqual(result,function(*args))
+                    results.append(result)
+                    memo.finish_view()
+                numeric=[r if kind=='rolling.std' else r[0] for r in results]
+                self.assertEqual(numeric,[0.12401959270615269,0.0])
+                self.assertEqual(memo.stats['helpers'][kind]['computed'],2)
+                self.assertEqual(memo.stats['helpers'][kind]['reused'],0)
+                self.assertLessEqual(memo.stats['peak_reuse_bytes'],memo.budget)
+            finally:
+                memo.clear()
+            # The cold construction reservation must cover a larger int body,
+            # before building its typed leaf key, even for internal inputs.
+            memo=feature_batch._NumericReuse(2**20);memo.begin_view(universe)
+            try:
+                regular=tuple(execution._Cell(floating,None,()) for _ in scope)
+                larger=regular[:-1]+(execution._Cell(2**2400,None,()),)
+                small=memo._construction_bound(scope,scope,regular,'x',refs)
+                large=memo._construction_bound(scope,scope,larger,'x',refs)
+                self.assertGreaterEqual(large-small,sys.getsizeof(2**2400)-sys.getsizeof(floating))
+            finally:
+                memo.clear()
 
     def test_zero_tiny_and_eviction_budgets_and_singleton_shadow(self):
         requests=rolling_views(width=6,count=3)

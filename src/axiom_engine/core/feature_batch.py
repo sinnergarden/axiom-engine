@@ -15,6 +15,15 @@ def _tree_bytes(value):
     return sys.getsizeof(value) + (sum(_tree_bytes(v) for v in value) if type(value) is tuple else 0)
 
 
+def _value_key(value):
+    """Preserve the helper's actual numeric type; never coerce its key value."""
+    if value is None: return 'null',None
+    if type(value) is float: return 'float',struct.pack('<d',value)
+    if type(value) is int: return 'int',value
+    if type(value) is bool: return 'bool',value
+    require(False, 'INTERNAL_NONNUMERIC_REUSE_INPUT')
+
+
 class _BatchProfile:
     def __init__(self):
         self.semantic = self.universe = self.previous_day = None
@@ -94,13 +103,17 @@ class _NumericReuse:
         self.stats['peak_reuse_bytes'] = max(self.stats['peak_reuse_bytes'], size)
         return True
 
-    def _construction_bound(self, scope, dependency_scope, source_name, refs):
-        misses = sum((0,source_name,k) not in self.current for k in dependency_scope)
+    def _construction_bound(self, scope, dependency_scope, cells, source_name, refs):
+        misses, number_bytes = 0, 0
+        for key,cell in zip(dependency_scope,cells):
+            if (0,source_name,key) not in self.current:
+                misses += 1
+                number_bytes = max(number_bytes,sys.getsizeof(cell.value))
         ref_misses = sum((1,None,k) not in self.current for k in scope) if refs is not None else 0
         # New ID keys/current lookup keys contain the original immutable key,
         # exact bits/validity or member/industry. Charge borrowed strings again.
         industry = max((sys.getsizeof(refs[k]['industry']) for k in scope),default=0) if refs is not None else 0
-        leaf_bound = 512+2*self.key_bound+2*sys.getsizeof(source_name)+industry
+        leaf_bound = 512+2*self.key_bound+2*sys.getsizeof(source_name)+industry+number_bytes
         count = len(dependency_scope)+(len(scope) if refs is not None else 0)
         return (misses+ref_misses)*(leaf_bound+1024)+count*(2*_POINTER_BYTES+sys.getsizeof(0))+1024
 
@@ -108,7 +121,7 @@ class _NumericReuse:
         lookup = tag,source_name,key
         code = self.current.get(lookup)
         if code is not None: return code
-        leaf = ((tag,source_name,key,struct.pack('<d',cell.value) if cell.value is not None else None,bool(cell.issues))
+        leaf = ((tag,source_name,key,_value_key(cell.value),bool(cell.issues))
                 if tag == 0 else (tag,source_name,key,reference['member'],reference['industry']))
         code = self.intern.get(leaf)
         if code is None:
@@ -156,13 +169,13 @@ class _NumericReuse:
             if not self._reserve(256):
                 self.stats['budget_fallbacks'] += 1
             else:
-                bound = self._construction_bound(scope,dependency_scope,source_name,refs)
+                bound = self._construction_bound(scope,dependency_scope,cells,source_name,refs)
                 generation = self.generation
                 room = self._reserve(bound)
                 if room and self.generation != generation:
                     # Clearing the tables invalidates the sizing pass's hit
                     # counts. Reserve again for the now-cold complete keys.
-                    room = self._reserve(self._construction_bound(scope,dependency_scope,source_name,refs))
+                    room = self._reserve(self._construction_bound(scope,dependency_scope,cells,source_name,refs))
                 if not room:
                     self.stats['budget_fallbacks'] += 1
                 else:
