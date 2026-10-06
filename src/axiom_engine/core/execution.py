@@ -85,7 +85,8 @@ def _inputs(p, facts, context):
     for t in c['cutoffs'].values(): timestamp(t)
     require(list(c['cutoffs'][s] for s in sessions) == sorted(c['cutoffs'][s] for s in sessions), 'Cutoffs must be monotonic')
     history, outputs = _key_list(c['history_keys']), _key_list(c['output_keys'])
-    require(bool(history) and bool(outputs) and set(outputs) <= set(history), 'Output/history coverage')
+    history_set = set(history)
+    require(bool(history) and bool(outputs) and set(outputs) <= history_set, 'Output/history coverage')
     require(all(k[1] in sessions for k in history), 'Unknown session')
     history = sorted(history)
     source_ids = {s['id'] for s in p['sources']}
@@ -96,11 +97,11 @@ def _inputs(p, facts, context):
         key = _key(r)
         require(key not in rows, 'Duplicate fact key')
         cells = _cells(r, f['schema'], source_ids)
-        require(key in set(history), 'Undeclared fact key')
+        require(key in history_set, 'Undeclared fact key')
         cutoff = c['cutoffs'][key[1]]
         rows[key] = [_Cell(None, v.available, v.sources, ('UNAVAILABLE_AT_SESSION_CUTOFF',), 'UNAVAILABLE')
                      if v.available > cutoff else v for v in cells]
-    require(set(rows) == set(history), 'MISSING_HISTORY_ROW: supplied rows do not match declared history')
+    require(set(rows) == history_set, 'MISSING_HISTORY_ROW: supplied rows do not match declared history')
     by_security = {}
     for key in history: by_security.setdefault(key[0], []).append(key)
     if p['observation_domain'] == 'sessions':
@@ -118,7 +119,7 @@ def _inputs(p, facts, context):
         timestamp(r['available_at'])
         require(r['available_at'] <= c['cutoffs'][key[1]] and r['source'] in source_ids, 'Unavailable/unbound reference')
         refs[key] = r
-    require(set(refs) == set(history), 'Complete frozen reference mask required for history')
+    require(set(refs) == history_set, 'Complete frozen reference mask required for history')
     for day in {k[1] for k in history}:
         actual = {k[0]: r['industry'] for k, r in refs.items() if k[1] == day and r['member']}
         require(day in p['reference_members'] and actual == p['reference_members'][day],
@@ -142,12 +143,22 @@ def _inputs(p, facts, context):
     return c, history, outputs, rows, by_security, refs, events
 
 
-def _required_cells(p, outputs, by_security, refs):
+def _reference_index(refs):
+    """Index already-validated references in their original iteration order."""
+    by_session, by_industry = {}, {}
+    for key, row in refs.items():
+        by_session.setdefault(key[1], []).append(key)
+        by_industry.setdefault((key[1], row['industry']), []).append(key)
+    return by_session, by_industry
+
+
+def _required_cells(p, outputs, by_security, refs, reference_index):
     """Per-node evaluation scope on the original history, including CS inputs.
 
     This extends the history admission walk; it does not reorder or crop rows.
     Partial warmup follows the same dependencies but permits absent predecessors.
     """
+    by_session, by_industry = reference_index
     nodes = {n['name']: n for n in p['nodes']}
     positions = {k: i for keys in by_security.values() for i, k in enumerate(keys)}
     pending = [(o['node'], k) for o in p['outputs'] for k in outputs]
@@ -174,9 +185,10 @@ def _required_cells(p, outputs, by_security, refs):
                         'INSUFFICIENT_HISTORY: full rolling dependency')
                 dependencies = history[max(0, start):end]
         elif op in CS:
-            dependencies += [k for k, r in refs.items() if k[1] == key[1] and r['member'] and
-                             (q['group'] == 'session' or
-                              r['industry'] is not None and r['industry'] == refs[key]['industry'])]
+            industry = refs[key]['industry']
+            reference_keys = (by_session[key[1]] if q['group'] == 'session' else
+                              by_industry[(key[1], industry)] if industry is not None else ())
+            dependencies += [k for k in reference_keys if refs[k]['member']]
         for parent in n['inputs']:
             pending.extend((parent, k) for k in dependencies)
     return needed
@@ -263,7 +275,7 @@ def _rolling(cells, q):
     return _merge(value, cells)
 
 
-def _cross_section(op, source, keys, refs, q):
+def _cross_section(op, source, keys, refs, q, reference_index):
     groups = {}
     for key in keys:
         r = refs[key]
@@ -272,9 +284,10 @@ def _cross_section(op, source, keys, refs, q):
             require(q['unknown_group'] != 'reject', 'UNKNOWN_INDUSTRY')
         groups.setdefault((key[1], group), []).append(key)
     out = {}
+    by_session, by_industry = reference_index
     for (_, group), group_keys in groups.items():
-        reference_keys = [k for k, r in refs.items() if k[1] == group_keys[0][1] and
-                          (q['group'] == 'session' or r['industry'] == group)]
+        day = group_keys[0][1]
+        reference_keys = (by_session[day] if q['group'] == 'session' else by_industry[(day, group)])
         eligible = [k for k in reference_keys if refs[k]['member'] and group is not None]
         deps = [source[k] for k in eligible]
         # Membership and classification are dependencies even when they exclude a row.
@@ -319,7 +332,8 @@ def execute_feature_plan(plan, facts, context):
     """
     p = validate_plan(plan, execution=True)
     c, keys, outputs, rows, by_security, refs, events = _inputs(p, facts, context)
-    needed = _required_cells(p, outputs, by_security, refs)
+    reference_index = _reference_index(refs)
+    needed = _required_cells(p, outputs, by_security, refs, reference_index)
     positions = {k: i for security_keys in by_security.values() for i, k in enumerate(security_keys)}
     env = {col['name']: {k: rows[k][i] for k in keys} for i, col in enumerate(p['input_schema'])}
     for n in p['nodes']:
@@ -328,7 +342,7 @@ def execute_feature_plan(plan, facts, context):
         if not node_keys:
             continue
         if op in CS:
-            out = _cross_section(op, env[args[0]], node_keys, refs, q)
+            out = _cross_section(op, env[args[0]], node_keys, refs, q, reference_index)
         elif op in ('shift', 'pct_change', 'rolling'):
             out = {}
             source = env.get(args[0], {})
