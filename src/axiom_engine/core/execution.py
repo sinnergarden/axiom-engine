@@ -47,13 +47,29 @@ def _key_list(values):
     return keys
 
 
-def _cells(row, columns, source_ids):
+_INPUT_TIMESTAMP_CACHE_LIMIT = 128
+
+
+def _timestamp_once(value, checked):
+    # Only successfully admitted, exact strings enter this call-local memo.
+    # Each is exactly 20 characters; capacity and borrowed-key storage are bounded.
+    if type(value) is str and value in checked:
+        return
+    timestamp(value)
+    if len(checked) == _INPUT_TIMESTAMP_CACHE_LIMIT:
+        del checked[next(iter(checked))]
+    checked[value] = None
+
+
+def _cells(row, columns, source_ids, *, _timestamps=None):
     size = len(columns)
     for k in ('values', 'availability', 'sources', 'missing_reasons'):
         require(type(row[k]) is list and len(row[k]) == size, 'Missing/misaligned row columns')
     out = []
     for v, a, refs, reason, col in zip(row['values'], row['availability'], row['sources'], row['missing_reasons'], columns):
-        check_value(v, col); timestamp(a)
+        check_value(v, col)
+        if _timestamps is None: timestamp(a)
+        else: _timestamp_once(a, _timestamps)
         require(type(refs) is list and bool(refs) and all(type(s) is str and s in source_ids for s in refs),
                 'Unbound cell source')
         require(len(refs) == len(set(refs)), 'Duplicate cell source')
@@ -64,6 +80,13 @@ def _cells(row, columns, source_ids):
         out.append(_Cell(float(v) if col['dtype'] == 'float64' and v is not None else v,
                          a, tuple(sorted(refs)), (), reason))
     return out
+
+
+def _reference_members_by_day(refs):
+    members = {}
+    for key, row in refs.items():
+        if row['member']: members.setdefault(key[1], {})[key[0]] = row['industry']
+    return members
 
 
 def _inputs(p, facts, context):
@@ -81,13 +104,15 @@ def _inputs(p, facts, context):
     require(type(sessions) is list and bool(sessions), 'Explicit calendar sessions required')
     for s in sessions: session(s)
     require(sessions == sorted(set(sessions)), 'Calendar sessions must be sorted and unique')
+    session_positions = {s: i for i, s in enumerate(sessions)}
+    checked_timestamps = {}
     require(type(c['cutoffs']) is dict and set(c['cutoffs']) == set(sessions), 'Every session needs its own cutoff')
-    for t in c['cutoffs'].values(): timestamp(t)
+    for t in c['cutoffs'].values(): _timestamp_once(t, checked_timestamps)
     require(list(c['cutoffs'][s] for s in sessions) == sorted(c['cutoffs'][s] for s in sessions), 'Cutoffs must be monotonic')
     history, outputs = _key_list(c['history_keys']), _key_list(c['output_keys'])
     history_set = set(history)
     require(bool(history) and bool(outputs) and set(outputs) <= history_set, 'Output/history coverage')
-    require(all(k[1] in sessions for k in history), 'Unknown session')
+    require(all(k[1] in session_positions for k in history), 'Unknown session')
     history = sorted(history)
     source_ids = {s['id'] for s in p['sources']}
     require(type(f['rows']) is list, 'Rows must be array')
@@ -96,7 +121,7 @@ def _inputs(p, facts, context):
         fields(r, 'security_id session values availability sources missing_reasons')
         key = _key(r)
         require(key not in rows, 'Duplicate fact key')
-        cells = _cells(r, f['schema'], source_ids)
+        cells = _cells(r, f['schema'], source_ids, _timestamps=checked_timestamps)
         require(key in history_set, 'Undeclared fact key')
         cutoff = c['cutoffs'][key[1]]
         rows[key] = [_Cell(None, v.available, v.sources, ('UNAVAILABLE_AT_SESSION_CUTOFF',), 'UNAVAILABLE')
@@ -106,7 +131,7 @@ def _inputs(p, facts, context):
     for key in history: by_security.setdefault(key[0], []).append(key)
     if p['observation_domain'] == 'sessions':
         for keys in by_security.values():
-            start, end = sessions.index(keys[0][1]), sessions.index(keys[-1][1])
+            start, end = session_positions[keys[0][1]], session_positions[keys[-1][1]]
             require([k[1] for k in keys] == sessions[start:end+1], 'MISSING_SESSION: history cannot compress calendar gaps')
     refs = {}
     require(type(c['reference']) is list, 'Explicit reference rows required')
@@ -116,12 +141,13 @@ def _inputs(p, facts, context):
         require(key not in refs and key in rows, 'Duplicate/undeclared reference key')
         require(type(r['member']) is bool, 'Membership must be explicit bool')
         require(r['industry'] is None or type(r['industry']) is str and bool(r['industry'].strip()), 'Industry must be string or null')
-        timestamp(r['available_at'])
+        _timestamp_once(r['available_at'], checked_timestamps)
         require(r['available_at'] <= c['cutoffs'][key[1]] and r['source'] in source_ids, 'Unavailable/unbound reference')
         refs[key] = r
     require(set(refs) == history_set, 'Complete frozen reference mask required for history')
+    members_by_day = _reference_members_by_day(refs)
     for day in {k[1] for k in history}:
-        actual = {k[0]: r['industry'] for k, r in refs.items() if k[1] == day and r['member']}
+        actual = members_by_day.get(day, {})
         require(day in p['reference_members'] and actual == p['reference_members'][day],
                 'INCOMPLETE_REFERENCE: members/industry differ from frozen plan')
     events = {name: {} for name in p['event_schema']}
@@ -134,7 +160,7 @@ def _inputs(p, facts, context):
         session(e['event_session']); session(e['report_period'])
         ident = (e['stream'], e['security_id'], e['event_id'])
         require(ident not in seen_ids, 'Duplicate event ID'); seen_ids.add(ident)
-        cells = _cells(e, p['event_schema'][e['stream']], source_ids)
+        cells = _cells(e, p['event_schema'][e['stream']], source_ids, _timestamps=checked_timestamps)
         stream = events[e['stream']].setdefault(e['security_id'], [])
         require(all(x[0] != e['event_session'] for x in stream), 'Ambiguous event date: Data must resolve fixed stream')
         stream.append((e['event_session'], e['report_period'], cells))

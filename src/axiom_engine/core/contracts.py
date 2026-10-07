@@ -125,7 +125,21 @@ class Document:
 
     @classmethod
     def from_dict(cls, value):
-        return cls(canonical(value))
+        payload = canonical(value)
+        # canonical has admitted every JSON leaf and owns the immutable wire.
+        # Re-parsing that wire only to walk/encode it again adds no validation.
+        # Keep custom construction hooks on the original constructor path.
+        if (type(cls) is not type or cls.__init__ is not Document.__init__ or
+                cls.__post_init__ is not Document.__post_init__ or
+                cls.__new__ is not object.__new__ or
+                hasattr(cls, '__del__') or
+                cls.__getattribute__ is not object.__getattribute__ or
+                any('payload' in base.__dict__ for base in cls.__mro__)):
+            return cls(payload)
+        require(type(value) is dict, "Contract must be an object")
+        result = object.__new__(cls)
+        object.__setattr__(result, 'payload', payload)
+        return result
 
     def to_dict(self):
         return json.loads(self.payload)
