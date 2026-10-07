@@ -19,6 +19,7 @@ from .fill_display import (SavedReviewDisplay, FillDisplayReport, read_review_di
                           build_fill_display, save_fill_display, load_fill_display)
 from .stock_stream import run_stock_backtest, audit_stock_backtest_source, stock_run_id
 from .stock_stream_inputs import StockInputSource
+from .stock_owned_inputs import AdmittedStockInputs, admit_stock_inputs
 from .stock_stream_outputs import StockResultSink
 from .stock_stream_projection import SavedRunProjection, load_stock_backtest_projection
 
@@ -35,4 +36,4 @@ __all__ = ["BatchReference", "DecisionBatchGate", "InputGateError", "stale_price
            "SavedReviewDisplay", "FillDisplayReport", "read_review_display",
            "build_fill_display", "save_fill_display", "load_fill_display",
            "run_stock_backtest", "audit_stock_backtest_source", "stock_run_id",
-           "StockInputSource", "StockResultSink", "SavedRunProjection", "load_stock_backtest_projection"]
+           "StockInputSource", "AdmittedStockInputs", "admit_stock_inputs", "StockResultSink", "SavedRunProjection", "load_stock_backtest_projection"]

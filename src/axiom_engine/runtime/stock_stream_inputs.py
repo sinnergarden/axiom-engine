@@ -5,6 +5,7 @@ DataBatch/PredictionFrame: byte spans remain bound to the original parent.
 No supplier, Research loader, training or account execution belongs here.
 """
 from array import array
+from contextlib import nullcontext
 from dataclasses import dataclass
 import hashlib
 import json
@@ -734,6 +735,10 @@ class StockInputSource:
         self._prediction_paths = set()
         self._prediction_remaining = 0
         self._memory = None
+
+    def execution_scope(self):
+        """Original sources retain their existing invocation-local behavior."""
+        return nullcontext()
 
     @staticmethod
     def _artifacts(manifest):

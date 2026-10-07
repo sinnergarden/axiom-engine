@@ -44,10 +44,27 @@ The bounded stock v7 path is
 `run_stock_backtest(manifest, *, source, sink, block_sessions, limits)`, with
 `StockInputSource` reading fixed saved inputs and `StockResultSink` writing
 immutable result parts. `stock_run_id(manifest)` supplies the sink's run identity.
-Every call audits the complete fixed source before creating the same Runtime
-account used by v6. `audit_stock_backtest_source` performs that audit independently.
+An original source audits the complete fixed inputs before creating the same
+Runtime account used by v6. `audit_stock_backtest_source` performs that audit independently.
 The explicit limits bound input reads, decoded blocks, pending output, parts and
 total results; synthetic checks do not establish a long-window RSS guarantee.
+
+For sequential accounts over the same saved predictions, use
+`admit_stock_inputs(manifest, *, source, block_sessions, limits, max_owned_bytes)`
+and pass its returned `AdmittedStockInputs` as the existing `source` argument.
+Use the handle as a context manager or call `close()`. Import fully validates
+the original bytes and captures projected blocks in a bounded private temporary
+file; each account decodes only its current block. No portable validated marker
+or new source identity is created. Original source span indexes are released.
+
+Only `account_id`, positive initial cash (with empty initial positions), and a
+legal `portfolio_policy.top_k` may change. All other manifest fields retain
+their admitted capability, including policy semantics, profile/fees/rules,
+scope, clock/action policy, snapshots, native refs and fold/model/prediction
+refs. Artifact locations retain their existing delivery-only semantics. Unknown
+risk parameters fail rather than receive implicit permission to reuse inputs.
+`block_sessions` remains fixed for this handle; every account's input, decoded
+and result budgets still apply. Core, broker and ledger execution is unchanged.
 
 `load_stock_backtest_projection(path, *, artifact_reader, limits)` validates a
 saved v7 run, its result parts, and small profile/event views for evaluation and
