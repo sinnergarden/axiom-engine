@@ -66,6 +66,17 @@ risk parameters fail rather than receive implicit permission to reuse inputs.
 `block_sessions` remains fixed for this handle; every account's input, decoded
 and result budgets still apply. Core, broker and ledger execution is unchanged.
 
+`StockInputSource(scalar_cache_bytes=262144)` reuses already validated small
+canonical literals within one import. Set `scalar_cache_bytes=0` for the original
+scanner oracle. Reuse is charged to the shared decoded budget and evicted before
+required input growth. The full source bytes, JSON structure, key ordering and
+reserved Unknown objects are still checked. `source.statistics` exposes per-file
+scan/read/hash, scalar decode/canonical counts/timings and selected-row operations;
+`inputs.statistics` separates source audit/capture from subsequent owned reads.
+The synthetic exact/performance probe is
+`PYTHONPATH=src:tests python tools/bench_stock_owned_inputs.py`; it uses no real
+saved inputs, Data access, features, fitting or prediction calls.
+
 `load_stock_backtest_projection(path, *, artifact_reader, limits)` validates a
 saved v7 run, its result parts, and small profile/event views for evaluation and
 fill display. It does not reopen large Data, prediction or training parents.

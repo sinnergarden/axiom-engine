@@ -40,6 +40,17 @@ def run_owned(root, manifest, inputs, limits=LIMITS):
 
 
 class StockOwnedInputTests(unittest.TestCase):
+    def test_one_byte_read_limit_preserves_owned_output_and_serialization_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); manifest = request_for(root)
+            oracle, _, _ = execute(root/"out", manifest); shutil.rmtree(root/"out")
+            limits = {**LIMITS, "max_read_bytes": 1}
+            with admit_stock_inputs(BacktestRequest.from_dict(manifest), source=StockInputSource(),
+                    block_sessions=2, limits=limits, max_owned_bytes=2_000_000) as inputs:
+                wire, _ = run_owned(root/"out", manifest, inputs, limits)
+                self.assertEqual(wire, oracle)
+                self.assertLessEqual(inputs.statistics["source_decoded_bytes_peak"], limits["max_block_bytes"])
+
     def test_top3_top5_and_cash_match_complete_original_wire_with_one_source_admission(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); first = request_for(root)

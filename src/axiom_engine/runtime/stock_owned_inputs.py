@@ -204,10 +204,12 @@ def admit_stock_inputs(manifest, *, source, block_sessions: int, limits: dict,
     def write(value):
         offset_stage.reserve(16)
         start = store.tell()
-        scratch_bytes = min(1024, limits["max_read_bytes"])
+        # Internal serialization is not an input read. Reserve escaped text,
+        # UTF-8 and finite-number buffers even when max_read_bytes is one.
+        scratch_bytes = 2048
         with source._memory.stage() as scratch:
             scratch.reserve(scratch_bytes)
-            for piece in _json_pieces(value, piece_chars=max(1, scratch_bytes//8)):
+            for piece in _json_pieces(value, piece_chars=64):
                 require(store.tell()+len(piece) <= max_owned_bytes, "Owned stock input store exceeds max_owned_bytes before write")
                 store.write(piece)
         offsets.extend((start, store.tell()-start))
@@ -223,8 +225,12 @@ def admit_stock_inputs(manifest, *, source, block_sessions: int, limits: dict,
                 except StopIteration:
                     break
                 try:
-                    write(_block_wire(block))
                     count = len(block.market_rows)+sum(len(rows) for _, rows in block.signals.values())
+                    with source._memory.stage() as view:
+                        # Own the temporary list/index wrappers before building
+                        # them; source row graphs remain borrowed, never copied.
+                        view.reserve(64*count+512)
+                        write(_block_wire(block))
                     peak_owned_decode = max(peak_owned_decode, base_bytes+meta_bytes+3*offsets[-1]+64*count)
                     require(peak_owned_decode <= limits["max_block_bytes"], "Owned stock block exceeds decoded budget before account")
                 finally:
@@ -235,8 +241,9 @@ def admit_stock_inputs(manifest, *, source, block_sessions: int, limits: dict,
                       "max_owned_decoded_bytes": peak_owned_decode,
                       "owned_blocks": len(offsets)//2-1, "owned_read_bytes": 0,
                       "owned_record_decodes": 0, "account_bindings": 0,
-                      "source_operations": {name: sum(index.statistics[name] for index in source._indexes.values())
-                                            for name in next(iter(source._indexes.values())).statistics}}
+                      "source_operations": source.statistics["source_operations"],
+                      "source_decoded_bytes_peak": source.statistics["decoded_bytes_peak"],
+                      "source_scalar_cache_evictions": source.statistics["scalar_cache_evictions"]}
         return AdmittedStockInputs(_IMPORT, store, offsets, key, block_sessions, inventory, statistics)
     except Exception:
         store.close()
