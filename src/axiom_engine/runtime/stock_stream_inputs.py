@@ -204,7 +204,8 @@ class _CanonicalIndex:
     scalar/row/header must fit the decoded budget; unsupported oversized
     values fail before their byte buffer grows.  No decompression is accepted.
     """
-    def _initialize(self, artifact, budget, *, row_limit=None, native_scope=None, memory=None, descriptor_path=None):
+    def _initialize(self, artifact, budget, *, row_limit=None, native_scope=None, memory=None,
+                    descriptor_path=None, fixed_stat=None):
         self.path = Path(descriptor_path).resolve() if descriptor_path is not None else _path(artifact)
         self.artifact = artifact
         fragment = urlparse(artifact["manifest_uri"]).fragment if artifact is not None else ""
@@ -214,7 +215,12 @@ class _CanonicalIndex:
         self._values = {}
         self._object_headers = {}
         self._whole_value = None
-        self.size = self.path.stat().st_size
+        stat = self.path.stat()
+        observed = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        require(fixed_stat is None or observed == fixed_stat,
+                "Fixed stock artifact changed after CJSON preflight")
+        self._stat = observed if fixed_stat is None else fixed_stat
+        self.size = self._stat[2]
         self.statistics = {"file_bytes": self.size, "scan_seconds": 0.0,
             "read_calls": 0, "scan_read_bytes": 0, "read_seconds": 0.0, "hash_seconds": 0.0,
             "content_hash_bytes": 0, "file_hash_bytes": 0,
@@ -231,8 +237,6 @@ class _CanonicalIndex:
             "cjson_spool_seconds": 0.0, "cjson_compare_bytes": 0,
             "cjson_spool_bytes": 0, "cjson_metadata_consume_seconds": 0.0,
             "cjson_peak_tree_rss_bytes": 0}
-        stat = self.path.stat()
-        self._stat = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
         self._header_hashes = {}
         self._context_header = None
         self._metadata_header = None

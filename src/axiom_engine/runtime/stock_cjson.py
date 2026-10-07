@@ -87,7 +87,9 @@ def cjson_native_index(artifact, budget, *, row_limit, native_scope, memory,
     """None means a preflight stream choice, never a failed helper retry."""
     started = perf_counter()
     path = _path(artifact)
-    size = path.stat().st_size
+    stat = path.stat()
+    fixed_stat = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    size = fixed_stat[2]
     reason = None
     processes = None
     try:
@@ -111,17 +113,18 @@ def cjson_native_index(artifact, budget, *, row_limit, native_scope, memory,
     require(spool_used < options['max_spool_bytes'], 'CJSON source private spool budget exhausted')
     index = _CjsonIndex.__new__(_CjsonIndex)
     index._store = None
-    index._initialize(artifact, budget, row_limit=row_limit, native_scope=native_scope, memory=memory)
     event = dict(path=str(path), backend='cjson', phase='starting', planned_peak_bytes=estimate)
     events.append(event)
     child = None
     gate_read = gate_write = None
     peak = 0
     try:
+        index._initialize(artifact, budget, row_limit=row_limit, native_scope=native_scope,
+                          memory=memory, fixed_stat=fixed_stat)
         index._store = tempfile.TemporaryFile(mode='w+b')
         with tempfile.TemporaryFile(mode='w+b') as specification, tempfile.TemporaryFile(mode='w+b') as errors:
             spec = dict(artifact=artifact, native_scope=native_scope, row_limit=row_limit,
-                read_budget=budget, stat=list(index._stat),
+                read_budget=budget, stat=list(fixed_stat), max_file_bytes=options['max_file_bytes'],
                 max_spool_bytes=options['max_spool_bytes']-spool_used)
             with memory.stage() as scratch:
                 scratch.reserve(3*_encoded_size(spec))

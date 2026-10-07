@@ -202,6 +202,95 @@ class StockCjsonTests(unittest.TestCase):
                 self.assertEqual(handle.statistics['source_operations']['cjson_files'], 0)
             self.assertEqual({e['phase'] for e in fallback._file_parse_events}, {'preflight'})
 
+    def test_metadata_container_and_scalar_boundaries_match_original_spans_and_admission(self):
+        values = [0, None, False, 'x', [], {}, [0], [[]], [{}],
+                  {'flag': 0}, {'by_key': []}, {'by_key': 0}]
+        cases = [(False, value) for value in values] + [(True, value) for value in (0, None, [], {}, [[0]])]
+        for root_shape, value in cases:
+            with self.subTest(root_shape=root_shape, value=value), tempfile.TemporaryDirectory() as tmp:
+                manifest = request_for(Path(tmp))
+                def mutate(wire):
+                    if root_shape:
+                        wire['field_meta'] = value
+                    else:
+                        wire['field_meta']['unanticipated_field'] = value
+                rebind_native(manifest, 'native-1', mutate)
+                artifact = next(item['artifact'] for item in manifest['market_input']['native_inputs']
+                                if item['artifact']['artifact_id'] == 'native-1')
+                old = _CanonicalIndex(artifact, read_budget(LIMITS), row_limit=1000,
+                                      native_scope=(manifest, LIMITS))
+                new = self.index(artifact, manifest)
+                try:
+                    self.assertEqual(new.metadata_header(), old.metadata_header())
+                    self.assertEqual(new.group_hashes, old.group_hashes)
+                finally:
+                    new.close()
+        # Exercise the reported complete-admission bypass, including nested lists.
+        for value in ([0], [[]], [{}]):
+            with self.subTest(complete_admission=value), tempfile.TemporaryDirectory() as tmp:
+                manifest = request_for(Path(tmp))
+                rebind_native(manifest, 'native-1', lambda w: w['field_meta'].update(other_field=value))
+                for candidate in (StockInputSource(), source()):
+                    with self.assertRaisesRegex(ContractError, 'Incomplete original native stock metadata grid'):
+                        with imported(manifest, candidate):
+                            pass
+                    self.assertTrue(all(getattr(index, '_store', None) is None
+                                        for index in candidate._indexes.values()))
+
+    def test_preflight_stat_races_fail_before_helper_launch_without_stream_retry(self):
+        for change in ('grow', 'same_size', 'replace_inode'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                manifest = request_for(Path(tmp)); artifact = manifest['market_input']['native_inputs'][0]['artifact']
+                path = Path(artifact['manifest_uri']); original = path.read_bytes(); events = []
+                processes = fast._processes()
+                def mutate_after_size_check():
+                    if change == 'grow':
+                        path.write_bytes(original+b' '*1024)
+                    elif change == 'same_size':
+                        path.write_bytes(b' '+original[1:])
+                    else:
+                        replacement = path.with_suffix('.replacement')
+                        replacement.write_bytes(original); replacement.replace(path)
+                    return processes
+                with patch.object(fast, '_processes', side_effect=mutate_after_size_check), \
+                        patch.object(fast.subprocess, 'Popen', side_effect=AssertionError('helper launched')), \
+                        patch.object(_CanonicalIndex, '__init__', side_effect=AssertionError('stream retry')):
+                    with self.assertRaisesRegex(ContractError, 'changed after CJSON preflight'):
+                        self.index(artifact, manifest, events, max_file_bytes=len(original))
+                self.assertEqual(events[-1]['phase'], 'failed')
+
+    def test_worker_file_cap_and_fd_races_reject_before_payload_read(self):
+        from axiom_engine.runtime import stock_cjson_worker as worker
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryFile(mode='w+b') as store:
+            manifest = request_for(Path(tmp)); artifact = manifest['market_input']['native_inputs'][0]['artifact']
+            path = Path(artifact['manifest_uri']); original = path.read_bytes()
+            spec = dict(artifact=artifact, native_scope=(manifest, LIMITS), row_limit=1000,
+                read_budget=read_budget(LIMITS), stat=worker._mark(path),
+                max_file_bytes=len(original)-1, max_spool_bytes=2_000_000)
+            with patch.object(Path, 'open', side_effect=AssertionError('payload opened over file cap')):
+                with self.assertRaisesRegex(ContractError, 'file cap exceeded before read'):
+                    worker.run(spec, store)
+            spec['max_file_bytes'] = len(original)
+            real_mark = worker._mark; real_open = Path.open
+            def mutate_between_path_and_fd_mark(value):
+                snapshot = real_mark(value)
+                with real_open(path, 'wb') as writer:
+                    writer.write(original+b' '*1024)
+                return snapshot
+            class Unreadable:
+                def __init__(self, handle): self.handle = handle
+                def fileno(self): return self.handle.fileno()
+                def read(self, *_): raise AssertionError('payload read after fd grew over cap')
+                def __enter__(self): return self
+                def __exit__(self, *_): self.handle.close()
+            def open_unreadable(value, *args, **kwargs):
+                return Unreadable(real_open(value, *args, **kwargs))
+            with patch.object(worker, '_mark', side_effect=mutate_between_path_and_fd_mark), \
+                    patch.object(Path, 'open', new=open_unreadable):
+                with self.assertRaisesRegex(ContractError, 'fd file cap exceeded before read'):
+                    worker.run(spec, store)
+            self.assertEqual(store.tell(), 0)
+
     def test_started_memoryerror_timeout_rss_and_spool_stops_never_retry_and_close(self):
         real_popen = subprocess.Popen; real_tree = fast._tree_rss
         with tempfile.TemporaryDirectory() as tmp:

@@ -47,6 +47,16 @@ def _fd_mark(stream):
     return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
 
 
+def _children(value):
+    # Match original depth-three metadata spans, including list wildcards.
+    # Scalars and empty containers have no child spans in the stream oracle.
+    if type(value) is dict:
+        return value.items()
+    if type(value) is list:
+        return (('*', child) for child in value)
+    return ()
+
+
 class _Gate(_CanonicalIndex):
     def header(self):
         return self.wire['context']
@@ -55,15 +65,21 @@ class _Gate(_CanonicalIndex):
 def run(spec, store):
     from urllib.parse import unquote, urlparse
     path = Path(unquote(urlparse(spec['artifact']['manifest_uri']).path)).resolve()
-    require(_mark(path) == spec['stat'], 'CJSON original file changed before read')
-    stats = dict(read_calls=1, scan_read_bytes=0, read_seconds=0.0, hash_seconds=0.0,
+    observed = _mark(path)
+    require(observed[2] <= spec['max_file_bytes'], 'CJSON file cap exceeded before read')
+    require(observed == spec['stat'], 'CJSON original file changed before read')
+    stats = dict(read_calls=2, scan_read_bytes=0, read_seconds=0.0, hash_seconds=0.0,
         content_hash_bytes=0, file_hash_bytes=0, cjson_parse_seconds=0.0,
         cjson_validation_seconds=0.0, cjson_compare_seconds=0.0, cjson_compare_bytes=0,
         cjson_spool_seconds=0.0)
     with path.open('rb', buffering=0) as original:
-        require(_fd_mark(original) == spec['stat'], 'CJSON original fd changed before read')
-        reading = perf_counter(); raw = original.read(spec['stat'][2]+1)
+        observed = _fd_mark(original)
+        require(observed[2] <= spec['max_file_bytes'], 'CJSON fd file cap exceeded before read')
+        require(observed == spec['stat'], 'CJSON original fd changed before read')
+        reading = perf_counter(); raw = original.read(spec['stat'][2])
         require(len(raw) == spec['stat'][2], 'CJSON original size changed while reading')
+        require(original.read(1) == b'' and _fd_mark(original) == _mark(path) == spec['stat'],
+                'CJSON original file changed during read')
         stats['scan_read_bytes'] = len(raw); stats['read_seconds'] = perf_counter()-reading
         require(raw.startswith(b'{'), 'Stock artifact must be a canonical JSON object')
         lf = raw.endswith(b'\n'); body_size = len(raw)-int(lf)
@@ -136,15 +152,12 @@ def run(spec, store):
     for key in (('records',), ('rows',)):
         rows(key, wire.get(key[0]))
     field_meta = wire.get('field_meta', {})
-    if type(field_meta) is dict:
-        for name, field in field_meta.items():
-            if type(field) is not dict:
-                continue
-            for key, value in field.items():
-                if key == 'by_key':
-                    rows(('field_meta', name, key), value)
-                else:
-                    header(('field_meta', name, key), value)
+    for name, field in _children(field_meta):
+        for key, value in _children(field):
+            if key == 'by_key':
+                rows(('field_meta', name, key), value)
+            else:
+                header(('field_meta', name, key), value)
     stats['cjson_spool_seconds'] = perf_counter()-spooling
     metadata = dict(content_digest=content_digest, file_digest=file_digest,
         file_bytes=spec['stat'][2], stat=spec['stat'], spans=spans,
