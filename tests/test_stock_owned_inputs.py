@@ -1,5 +1,7 @@
 """One original byte admission, isolated accounts, and unchanged exact oracle."""
 from copy import deepcopy
+import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -40,6 +42,76 @@ def run_owned(root, manifest, inputs, limits=LIMITS):
 
 
 class StockOwnedInputTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "fork"), "fork process-ownership counterexample")
+    def test_fork_rejects_every_entry_before_lock_or_shared_cursor_and_parent_still_reads(self):
+        class ForbiddenLock:
+            def acquire(self, **kwargs):
+                raise AssertionError("child touched lock before PID rejection")
+            def release(self):
+                raise AssertionError("child released lock before PID rejection")
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = request_for(Path(tmp))
+            with imported(manifest) as inputs:
+                store = inputs._AdmittedStockInputs__store
+                fd = store.fileno()
+                before = os.lseek(fd, 0, os.SEEK_CUR)
+                counters = inputs.statistics
+                scope = inputs.execution_scope(); scope.__enter__()
+                inherited = inputs.iter_blocks(manifest, block_sessions=2, read_budget=read_budget(LIMITS))
+                read_fd, write_fd = os.pipe()
+                child = os.fork()
+                if child == 0:
+                    os.close(read_fd)
+                    inputs._AdmittedStockInputs__lock = ForbiddenLock()
+                    result = {}
+                    actions = {
+                        "inventory": lambda: inputs.inventory(manifest),
+                        "statistics": lambda: inputs.statistics,
+                        "scope_enter": lambda: inputs.execution_scope().__enter__(),
+                        "inherited_scope_exit": lambda: scope.__exit__(None, None, None),
+                        "audit": lambda: inputs.audit(manifest, block_sessions=2,
+                            read_budget=read_budget(LIMITS), limits=LIMITS, implementation_ref=IMPLEMENTATION_REF),
+                        "iter_blocks": lambda: inputs.iter_blocks(manifest, block_sessions=2, read_budget=read_budget(LIMITS)),
+                        "inherited_iterator": lambda: next(inherited),
+                        "context_enter": inputs.__enter__, "context_exit": lambda: inputs.__exit__(None, None, None),
+                        "close": inputs.close}
+                    for name, action in actions.items():
+                        try:
+                            action()
+                            result[name] = "ACCEPTED"
+                        except ContractError as exc:
+                            result[name] = "PID_REJECTED" if "creating process" in str(exc) else str(exc)
+                        except Exception as exc:
+                            result[name] = repr(exc)
+                    result["cursor_unchanged"] = os.lseek(fd, 0, os.SEEK_CUR) == before
+                    os.write(write_fd, json.dumps(result).encode())
+                    os.close(write_fd)
+                    os._exit(0)
+                os.close(write_fd)
+                try:
+                    raw = bytearray()
+                    while piece := os.read(read_fd, 4096):
+                        raw.extend(piece)
+                    _, status = os.waitpid(child, 0)
+                    self.assertEqual(status, 0)
+                    result = json.loads(raw)
+                    self.assertTrue(result.pop("cursor_unchanged"))
+                    self.assertEqual(set(result.values()), {"PID_REJECTED"})
+                    self.assertEqual(os.lseek(fd, 0, os.SEEK_CUR), before)
+                    self.assertEqual(inputs.statistics, counters)
+                    audit = inputs.audit(manifest, block_sessions=2, read_budget=read_budget(LIMITS),
+                        limits=LIMITS, implementation_ref=IMPLEMENTATION_REF)
+                    self.assertEqual(audit.receipt["request_ref"], manifest["request_ref"])
+                    blocks = inputs.iter_blocks(manifest, block_sessions=2, read_budget=read_budget(LIMITS))
+                    try:
+                        self.assertEqual(next(blocks).sessions, tuple(manifest["scope"]["calendar"][:2]))
+                    finally:
+                        blocks.close()
+                finally:
+                    os.close(read_fd)
+                    inherited.close()
+                    scope.__exit__(None, None, None)
+
     def test_one_byte_read_limit_preserves_owned_output_and_serialization_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); manifest = request_for(root)

@@ -7,6 +7,7 @@ fresh decoded blocks, while original canonical sources are consumed once.
 from array import array
 from contextlib import closing, contextmanager
 import json
+import os
 import tempfile
 from threading import Lock
 from time import perf_counter
@@ -51,6 +52,7 @@ class AdmittedStockInputs(StockInputSource):
     def __init__(self, token, store, offsets, key, block_sessions, inventory, statistics):
         require(token is _IMPORT, "Use admit_stock_inputs; admission flags are unsupported")
         super().__init__()
+        self.__owner_pid = os.getpid()
         self.__store = store
         self.__offsets = offsets
         self.__key = key
@@ -62,6 +64,7 @@ class AdmittedStockInputs(StockInputSource):
 
     @property
     def statistics(self):
+        self.__owner()
         return json.loads(canonical(self.__statistics))
 
     def inventory(self, manifest):
@@ -69,24 +72,31 @@ class AdmittedStockInputs(StockInputSource):
         return json.loads(self.__inventory)
 
     def __check(self, manifest):
+        self.__owner()
         require(not self.__closed, "Admitted stock inputs are closed")
         plan = validate_manifest(manifest)
         validate_top_k(plan["portfolio_policy"]["top_k"], plan["scope"]["execution_universe"])
         require(_input_key(plan) == self.__key, "Stock inputs differ from the complete admitted capability")
         return plan
 
+    def __owner(self):
+        require(os.getpid() == self.__owner_pid, "Admitted stock inputs belong to their creating process")
+
     @contextmanager
     def execution_scope(self):
+        self.__owner()
         require(self.__lock.acquire(blocking=False), "Admitted stock inputs support sequential accounts only")
         try:
             require(not self.__closed, "Admitted stock inputs are closed")
             yield
         finally:
+            self.__owner()
             self._prepared = None
             self._memory = None
             self.__lock.release()
 
     def __read(self, number, budget):
+        self.__owner()
         start, length = self.__offsets[2*number:2*number+2]
         stage = self._memory.stage()
         try:
@@ -135,6 +145,10 @@ class AdmittedStockInputs(StockInputSource):
         return StockSourceAudit(receipt=receipt, globals=meta["globals"], lifecycle=meta["lifecycle"], manifest=plan)
 
     def iter_blocks(self, manifest, *, block_sessions, read_budget):
+        self.__owner()
+        return self.__blocks(manifest, block_sessions=block_sessions, read_budget=read_budget)
+
+    def __blocks(self, manifest, *, block_sessions, read_budget):
         plan = self.__check(manifest); budget = _budget(read_budget)
         require(block_sessions == self.__block_sessions and self._prepared is not None and
                 self._prepared["request_ref"] == plan["request_ref"], "Stock owner needs this account's binding")
@@ -156,10 +170,12 @@ class AdmittedStockInputs(StockInputSource):
                 value = rows = signals = None
                 yield block
             finally:
+                self.__owner()
                 value = rows = signals = block = None
                 stage.close()
 
     def close(self):
+        self.__owner()
         require(self.__lock.acquire(blocking=False), "Cannot close stock inputs during account execution")
         try:
             if not self.__closed:
@@ -172,6 +188,7 @@ class AdmittedStockInputs(StockInputSource):
             self.__lock.release()
 
     def __enter__(self):
+        self.__owner()
         require(not self.__closed, "Admitted stock inputs are closed")
         return self
 
