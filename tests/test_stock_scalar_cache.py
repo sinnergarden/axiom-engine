@@ -19,6 +19,22 @@ def indexed(root, raw, cache_bytes, *, read_bytes=7, decoded_bytes=4096):
 
 
 class StockScalarCacheTests(unittest.TestCase):
+    def test_public_default_admission_has_no_cache_and_explicit_opt_in_preserves_owned_input(self):
+        from axiom_engine.runtime import StockInputSource
+        from test_stock_owned_inputs import imported, request_for
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = request_for(Path(tmp))
+            with imported(manifest, source=StockInputSource()) as default, imported(
+                    manifest, source=StockInputSource(scalar_cache_bytes=262144)) as opt_in:
+                a, b = default.statistics, opt_in.statistics
+                self.assertEqual(a['source_operations']['scalar_cache_hits'], 0)
+                self.assertEqual(a['source_scalar_cache_evictions'], 0)
+                self.assertEqual(a['source_operations']['scalar_decode_count'],
+                                 a['source_operations']['scalar_count'])
+                self.assertGreater(b['source_operations']['scalar_cache_hits'], 0)
+                self.assertEqual(a['owned_bytes'], b['owned_bytes'])
+                self.assertEqual(default.inventory(manifest), opt_in.inventory(manifest))
+
     def test_utf8_escapes_numbers_null_and_chunk_boundaries_preserve_original_scan(self):
         values = [None, True, False, 0, -1, 1.0, -0.0, 1e-20, '重复😀', '\\"\n\t/', "x"*300]
         raw = canonical({"context": {"coverage": {"items": values*30}}, "records": []}).encode()+b"\n"

@@ -800,7 +800,7 @@ class _CanonicalIndex:
 
 class StockInputSource:
     """Explicit local source. Inventory never opens a source payload."""
-    def __init__(self, *, scalar_cache_bytes=262144):
+    def __init__(self, *, scalar_cache_bytes=0):
         integer(scalar_cache_bytes)
         self._scalar_cache_bytes = scalar_cache_bytes
         self._indexes = {}
