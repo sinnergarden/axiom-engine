@@ -6,7 +6,7 @@ No supplier, Research loader, training or account execution belongs here.
 """
 from array import array
 from collections import OrderedDict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import hashlib
 import json
@@ -204,7 +204,7 @@ class _CanonicalIndex:
     scalar/row/header must fit the decoded budget; unsupported oversized
     values fail before their byte buffer grows.  No decompression is accepted.
     """
-    def __init__(self, artifact, budget, *, row_limit=None, native_scope=None, memory=None, descriptor_path=None):
+    def _initialize(self, artifact, budget, *, row_limit=None, native_scope=None, memory=None, descriptor_path=None):
         self.path = Path(descriptor_path).resolve() if descriptor_path is not None else _path(artifact)
         self.artifact = artifact
         fragment = urlparse(artifact["manifest_uri"]).fragment if artifact is not None else ""
@@ -225,7 +225,12 @@ class _CanonicalIndex:
             "reread_bytes": 0, "reread_calls": 0,
             "local_decode_count": 0, "local_decode_seconds": 0.0,
             "span_identity_count": 0, "span_identity_seconds": 0.0,
-            "unsigned_identity_count": 0, "unsigned_identity_seconds": 0.0}
+            "unsigned_identity_count": 0, "unsigned_identity_seconds": 0.0,
+            "cjson_files": 0, "cjson_helper_seconds": 0.0, "cjson_parse_seconds": 0.0,
+            "cjson_validation_seconds": 0.0, "cjson_compare_seconds": 0.0,
+            "cjson_spool_seconds": 0.0, "cjson_compare_bytes": 0,
+            "cjson_spool_bytes": 0, "cjson_metadata_consume_seconds": 0.0,
+            "cjson_peak_tree_rss_bytes": 0}
         stat = self.path.stat()
         self._stat = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
         self._header_hashes = {}
@@ -251,6 +256,10 @@ class _CanonicalIndex:
         self._metadata_fields = None
         self._array_counts = {}
         self._indexed_rows = 0
+
+    def __init__(self, artifact, budget, *, row_limit=None, native_scope=None, memory=None, descriptor_path=None):
+        self._initialize(artifact, budget, row_limit=row_limit, native_scope=native_scope,
+                         memory=memory, descriptor_path=descriptor_path)
         scan_started = perf_counter()
         with self._memory.stage() as self._scan_stage:
             with self.path.open("rb", buffering=0) as self._stream:
@@ -278,6 +287,9 @@ class _CanonicalIndex:
         stat = self.path.stat()
         require((stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) == self._stat,
                 "Fixed stock artifact changed after admission")
+
+    def _open_data(self):
+        return self.path.open("rb", buffering=0)
 
     def _peek(self):
         if self._cursor == len(self._buffer):
@@ -605,7 +617,7 @@ class _CanonicalIndex:
         self.unchanged()
         with self._memory.stage() as stage:
             stage.reserve(2*self.spans[path][1])
-            with self.path.open("rb", buffering=0) as stream:
+            with self._open_data() as stream:
                 raw = self._read_span(stream, *self.spans[path], budget)
             self.unchanged()
             reference = _hash(raw)
@@ -659,7 +671,7 @@ class _CanonicalIndex:
                 "Original stock rows require a shared decoded reservation")
         result, retained, bindings = [], 0, []
         self.unchanged()
-        with self.path.open("rb", buffering=0) as stream:
+        with self._open_data() as stream:
             for day in days:
                 spans = self.groups.get((path, day), ())
                 hashed = hashlib.sha256()
@@ -800,9 +812,25 @@ class _CanonicalIndex:
 
 class StockInputSource:
     """Explicit local source. Inventory never opens a source payload."""
-    def __init__(self, *, scalar_cache_bytes=0):
+    def __init__(self, *, scalar_cache_bytes=0, file_parse_mode="stream",
+                 max_file_parse_bytes=None, max_file_parse_rss_bytes=None,
+                 max_file_parse_spool_bytes=None, max_file_parse_seconds=120):
         integer(scalar_cache_bytes)
+        require(file_parse_mode in ("stream", "cjson"), "Unsupported stock file parse mode")
+        integer(max_file_parse_seconds, 1)
+        for value in (max_file_parse_bytes, max_file_parse_rss_bytes, max_file_parse_spool_bytes):
+            if value is not None:
+                integer(value, 1)
+        require(file_parse_mode != "cjson" or all(value is not None for value in
+            (max_file_parse_bytes, max_file_parse_rss_bytes, max_file_parse_spool_bytes)),
+            "CJSON requires explicit file, process-tree RSS and private spool budgets")
         self._scalar_cache_bytes = scalar_cache_bytes
+        self._file_parse_mode = file_parse_mode
+        self._file_parse_options = dict(max_file_bytes=max_file_parse_bytes,
+            max_tree_rss_bytes=max_file_parse_rss_bytes, max_spool_bytes=max_file_parse_spool_bytes,
+            max_seconds=max_file_parse_seconds)
+        self._file_parse_events = []
+        self._cjson_spool_bytes = 0
         self._indexes = {}
         self._prepared = None
         self._inventory_sizes = {}
@@ -815,16 +843,36 @@ class StockInputSource:
 
     def execution_scope(self):
         """Original sources retain their existing invocation-local behavior."""
+        if self._file_parse_mode == "cjson":
+            return self._private_scope()
         return nullcontext()
+
+    @contextmanager
+    def _private_scope(self):
+        try:
+            yield
+        finally:
+            self._close_private_views()
+            self._prepared = None
+            self._audited = False
+
+    def _close_private_views(self):
+        for index in self._indexes.values():
+            if hasattr(index, "close"):
+                index.close()
 
     @property
     def statistics(self):
         """Read-only operation counters; never a persisted admission capability."""
         files = [{"path": str(index.path), **index.statistics} for index in self._indexes.values()]
         return {"files": files, "source_operations": {
-                    name: sum(item[name] for item in files) for name in (files[0].keys()-{"path"})} if files else {},
+                    name: (max(item[name] for item in files) if name == "cjson_peak_tree_rss_bytes"
+                           else sum(item[name] for item in files))
+                    for name in (files[0].keys()-{"path"})} if files else {},
                 "decoded_bytes_peak": 0 if self._memory is None else self._memory.peak_bytes,
-                "scalar_cache_evictions": 0 if self._memory is None else self._memory.scalar_cache.evictions}
+                "scalar_cache_evictions": 0 if self._memory is None else self._memory.scalar_cache.evictions,
+                "file_parse_events": [dict(event) for event in self._file_parse_events],
+                "cjson_peak_tree_rss_bytes": max((item["cjson_peak_tree_rss_bytes"] for item in files), default=0)}
 
     @staticmethod
     def _artifacts(manifest):
@@ -864,8 +912,17 @@ class StockInputSource:
             if key[0] in self._prediction_paths:
                 row_limit = min(row_limit, self._prediction_remaining)
                 require(row_limit > 0, "Stock prediction row budget exhausted before compact index growth")
-            self._indexes[key] = _CanonicalIndex(artifact, budget,
-                row_limit=row_limit, native_scope=self._scan_native_scopes.get(key[0]), memory=self._memory)
+            native_scope = self._scan_native_scopes.get(key[0])
+            index = None
+            if self._file_parse_mode == "cjson" and native_scope is not None:
+                from .stock_cjson import cjson_native_index
+                index = cjson_native_index(artifact, budget, row_limit=row_limit,
+                    native_scope=native_scope, memory=self._memory, options=self._file_parse_options,
+                    spool_used=self._cjson_spool_bytes, events=self._file_parse_events)
+                if index is not None:
+                    self._cjson_spool_bytes += index.statistics["cjson_spool_bytes"]
+            self._indexes[key] = index if index is not None else _CanonicalIndex(artifact, budget,
+                row_limit=row_limit, native_scope=native_scope, memory=self._memory)
             if key[0] in self._prediction_paths:
                 self._prediction_remaining -= self._indexes[key]._array_counts.get(("rows",), 0)
         return self._indexes[key]
@@ -919,8 +976,14 @@ class StockInputSource:
             self._audited = True
             return audit
         except (KeyError, IndexError, TypeError, OSError) as exc:
+            self._close_private_views()
             self._prepared = None
             raise ContractError("Malformed or unreadable fixed stock source: " + str(exc)) from exc
+        except BaseException:
+            self._close_private_views()
+            self._prepared = None
+            self._audited = False
+            raise
 
     def iter_blocks(self, manifest, *, block_sessions, read_budget) -> Iterator[StockInputBlock]:
         from .stock_stream_contracts import validate_manifest
@@ -1202,7 +1265,9 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
     require(all(inventory["declared_rows"][name] <= limits["max_" + name] for name in ("market_rows", "prediction_rows")),
             "Stock source inventory exceeds declared row budget")
     # An audit is never a cache exemption across invocations.
+    source._close_private_views()
     source._indexes = {}; source._prepared = None
+    source._file_parse_events = []; source._cjson_spool_bytes = 0
     source._memory = _DecodedMemory(budget["max_decoded_bytes"], scalar_cache_bytes=source._scalar_cache_bytes)
     source._memory.reserve_global(("request", manifest["request_ref"]), _encoded_size(manifest))
     source._inventory_sizes = {str(_path(item["artifact"])) if "artifact" in item else item["manifest_uri"]: item["file_bytes"]
