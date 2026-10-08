@@ -70,7 +70,50 @@ def derived_request(root, original):
     return seal_request(plan)
 
 
+def configured_fold_request(root, *, window=None, change=None):
+    plan=v3_request(root)
+    for i,item in enumerate(plan['prediction_input']['frames']):
+        spec=Document(Path(item['fold_spec_artifact']['manifest_uri']).read_text()).to_dict()
+        spec['contract_version']='stock_ml_fold_spec_v3'
+        spec['training_window']=window or dict(unit='feature_sessions',length=12,end='previous_fit_session')
+        if change: change(spec)
+        item['fold_spec_ref']=_ref(spec)
+        item['fold_spec_artifact']=artifact_file(root,'configured-spec-'+str(i),spec)
+        prediction=Document(Path(item['prediction_artifact']['manifest_uri']).read_text()).to_dict()
+        prediction['fold_spec_ref']=item['fold_spec_ref']
+        prediction.pop('signal_run_ref');prediction['signal_run_ref']=_ref(prediction)
+        item['signal_run_ref']=prediction['signal_run_ref']
+        item['prediction_artifact']=artifact_file(root,'configured-prediction-'+str(i),prediction)
+    return seal_request(plan)
+
+
 class StockSignalInputTests(unittest.TestCase):
+    def test_configured_original_windows_bind_without_training_calendar_or_account(self):
+        for window in (dict(unit='feature_sessions',length=12,end='previous_fit_session'),
+            dict(unit='calendar_years',length=2,end='previous_fit_session',
+                start='fit_date_minus_years_inclusive',leap_day='clamp_feb_28')):
+            with self.subTest(window=window),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);plan=configured_fold_request(root,window=window)
+                with patch('axiom_engine.runtime.backtest.AccountLedger',side_effect=AssertionError('account started')):
+                    with market_for(plan) as market,bind(market,plan) as inputs:
+                        self.assertGreater(inputs.statistics['owned_bytes'],0)
+
+    def test_resigned_configured_window_and_clock_damage_reject_before_account(self):
+        cases=[lambda s:s['training_window'].update(length=True),
+            lambda s:s['training_window'].update(length=0),
+            lambda s:s['training_window'].update(end='fit_session'),
+            lambda s:s['training_window'].update(extra='unapproved'),
+            lambda s:s.update(training_window=dict(unit='calendar_years',length=2,end='previous_fit_session',
+                start='fit_date_minus_years_inclusive',leap_day='roll_mar_1')),
+            lambda s:s.update(fit_cutoff='2023-12-28T20:30:00+08:00'),
+            lambda s:s.update(evaluation_cutoff=next(iter(s['inference_cutoff_by_session'].values())))]
+        for index,change in enumerate(cases):
+            with self.subTest(index=index),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);plan=configured_fold_request(root,change=change)
+                with market_for(plan) as market,patch('axiom_engine.runtime.backtest.AccountLedger',
+                        side_effect=AssertionError('account started')):
+                    with self.assertRaises(ContractError):bind(market,plan)
+
     def test_raw_horizon_and_feature_width_use_existing_account_and_saved_projection(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);plan=v3_request(root,h=17)

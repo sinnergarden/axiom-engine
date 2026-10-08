@@ -563,6 +563,28 @@ class StockStreamInputTests(unittest.TestCase):
                 admitted(source, manifest)
             self.assertFalse(source._audited)
 
+    def test_research_types_are_opaque_only_at_original_fold_configuration_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);spec={'contract_version':'stock_ml_fold_spec_v3'}
+            typed={'contract_type':'TrainingSpec','contract_version':'1','name':'saved original'}
+            for case in ('original','wrong_path','wrong_type','wrong_version','whole_document'):
+                wire={'definition':{'fold_spec':spec,'training_spec':deepcopy(typed)}}
+                if case=='wrong_path':wire['definition']['annotation']=wire['definition'].pop('training_spec')
+                if case=='wrong_type':wire['definition']['training_spec']['contract_type']='AccountPolicy'
+                if case=='wrong_version':wire['definition']['training_spec']['contract_version']='2'
+                raw=json.dumps(wire,sort_keys=True,separators=(',',':')).encode()
+                folder=root/case;folder.mkdir();path=folder/'fold.json';path.write_bytes(raw)
+                artifact=dict(artifact_type='StockFoldSpec',artifact_id='original',contract_version='stock_ml_fold_spec_v3',
+                    manifest_uri=str(path)+'#definition/fold_spec',content_digest=Document.from_dict(spec).identity)
+                if case=='whole_document':artifact.update(manifest_uri=str(path),content_digest='sha256:'+hashlib.sha256(raw).hexdigest())
+                budget=dict(max_read_bytes=64,max_decoded_bytes=10000)
+                if case=='original':
+                    index=_CanonicalIndex(artifact,budget)
+                    self.assertEqual(index.value(('definition','fold_spec')),spec)
+                    self.assertEqual(index.file_digest,'sha256:'+hashlib.sha256(raw).hexdigest())
+                else:
+                    with self.assertRaises(ContractError):_CanonicalIndex(artifact,budget)
+
     def test_audit_cumulative_live_budget_rejects_old_25000_byte_case(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest, _ = source_fixture(Path(tmp)); source = StockInputSource()

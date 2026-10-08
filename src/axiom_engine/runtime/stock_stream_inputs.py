@@ -24,6 +24,17 @@ from ..core.contracts import (ContractError, Document, canonical, digest, fields
 _STRING_BOUNDARY = re.compile(rb'["\\]')
 _SCALAR_BOUNDARY = re.compile(rb'[,\]}]')
 
+# Typed Research configuration is opaque provenance inside an original saved
+# fold. It is not an Engine wire type or a Runtime policy. The complete parent
+# bytes and definition digest are still checked by _fold_spec.
+_RESEARCH_FOLD_TYPES = {
+    ("definition", "target_spec", "label_spec"): ("LabelSpec", {"1", "2"}),
+    ("definition", "target_spec", "label_spec", "maturity"): ("MaturitySpec", {"1"}),
+    ("definition", "training_spec"): ("TrainingSpec", {"1"}),
+    ("definition", "training_spec", "fit_range"): ("SessionRange", {"1"}),
+    ("definition", "training_spec", "resources"): ("ResourceSpec", {"1"}),
+}
+
 
 def _hash(raw):
     return "sha256:" + hashlib.sha256(raw).hexdigest()
@@ -483,7 +494,8 @@ class _CanonicalIndex:
         scalar_stage = None
         if self._peek() == 123:
             self._take(); last = None; count = 0; reserved = None; reserved_names = True; has_reserved = False
-            reserved_values = {}; metadata_object = False
+            reserved_values = {}; metadata_object = False; reserved_version_ok = False
+            research_type = _RESEARCH_FOLD_TYPES.get(path) if self.selector == ("definition", "fold_spec") else None
             name_stage = reserved_stage = None
             try:
                 if self._peek() != 125:
@@ -512,6 +524,7 @@ class _CanonicalIndex:
                                 metadata_object = self._peek() == 123
                             value, value_stage = self._value(path + (name,), depth + 1)
                             if name == "contract_version":
+                                reserved_version_ok = type(value) is str and research_type is not None and value in research_type[1]
                                 reserved_values[name] = value == "1"
                             elif name in ("unknown_id", "reason", "required_evidence"):
                                 reserved_values[name] = type(value) is str and bool(value) and not value.isspace()
@@ -523,11 +536,15 @@ class _CanonicalIndex:
                         self._take()
                 self._expect(125)
                 if has_reserved:
-                    require(reserved == "Unknown" and count == 6 and reserved_names,
-                        "Unsupported reserved contract_type in stock source")
-                    require(reserved_values.get("contract_version") is True and metadata_object and
-                            all(reserved_values.get(name) is True for name in ("unknown_id", "reason", "required_evidence")),
-                            "Invalid reserved Unknown in stock source")
+                    if research_type is not None and reserved == research_type[0]:
+                        require(reserved_version_ok,
+                                "Unsupported original Research configuration version")
+                    else:
+                        require(reserved == "Unknown" and count == 6 and reserved_names,
+                            "Unsupported reserved contract_type in stock source")
+                        require(reserved_values.get("contract_version") is True and metadata_object and
+                                all(reserved_values.get(name) is True for name in ("unknown_id", "reason", "required_evidence")),
+                                "Invalid reserved Unknown in stock source")
             finally:
                 name = last = reserved = None
                 if name_stage is not None:
@@ -962,7 +979,9 @@ class StockInputSource:
                     ("stock_ml_fold_manifest_v1", "stock_ml_fold_v1", "stock_ml_fold_spec_v1"),
                     ("stock_ml_fold_manifest_v1", "stock_ml_fold_v2", "stock_ml_fold_spec_v2"),
                     ("stock_ml_fold_manifest_v2", "stock_ml_fold_v3", "stock_ml_fold_spec_v1"),
-                    ("stock_ml_fold_manifest_v2", "stock_ml_fold_v3", "stock_ml_fold_spec_v2")} and header["status"] == "COMPLETE" and
+                    ("stock_ml_fold_manifest_v2", "stock_ml_fold_v3", "stock_ml_fold_spec_v2"),
+                    ("stock_ml_fold_manifest_v2", "stock_ml_fold_v3", "stock_ml_fold_spec_v3"),
+                    ("stock_ml_fold_manifest_v2", "stock_ml_fold_v4", "stock_ml_fold_spec_v3")} and header["status"] == "COMPLETE" and
                 header["content_digest"] == index.unsigned_digest("content_digest") and
                 header["definition_ref"] == index.span_digest(("definition",)) and
                 header["fold_ref"] == Document.from_dict({"definition_ref": header["definition_ref"], **refs}).identity ==
@@ -1197,6 +1216,25 @@ def _warmup_visibility(batch, days, universe, names):
                 require(visible, "Unavailable original stock warmup fact")
 
 
+def _configured_fold_window(spec):
+    """Check v3's declared window without loading Research's training domain.
+
+    The original saved fold owns the full Feature calendar and training proof.
+    Runtime's account calendar contains only the execution anchor and OOS days.
+    """
+    window = spec["training_window"]
+    require(type(window) is dict and window.get("unit") in ("feature_sessions", "calendar_years") and
+            type(window.get("length")) is int and window["length"] > 0 and
+            window.get("end") == "previous_fit_session", "Positive configured fold training window required")
+    wanted = {"unit", "length", "end"}
+    if window["unit"] == "calendar_years":
+        wanted |= {"start", "leap_day"}
+        require(window.get("start") == "fit_date_minus_years_inclusive" and
+                window.get("leap_day") == "clamp_feb_28", "Unsupported configured fold year boundary")
+        require(int(spec["fit_session"][:4]) > window["length"], "Configured fold year boundary outside date domain")
+    require(set(window) == wanted, "Unsupported configured fold training window fields")
+
+
 def _frames(source, manifest, budget, *, require_coverage=True, raw_only=False):
     if not raw_only and manifest['prediction_input']['contract_version']=='stock_prediction_input_refs_v2':
         from .stock_signal_inputs import frames
@@ -1212,6 +1250,13 @@ def _frames(source, manifest, budget, *, require_coverage=True, raw_only=False):
         model_index = source._index(item["model_metadata_artifact"], budget)
         model = model_index.whole()
         fields(spec, "contract_version training_window fit_session fit_cutoff simulated_model_available_at oos_trade_sessions inference_cutoff_by_session evaluation_cutoff")
+        require(spec["contract_version"] in ("stock_ml_fold_spec_v1", "stock_ml_fold_spec_v2", "stock_ml_fold_spec_v3"), "Saved fold spec required")
+        session(spec["fit_session"])
+        configured = spec["contract_version"] == "stock_ml_fold_spec_v3"
+        if configured:
+            _configured_fold_window(spec)
+            require(instant(spec["fit_cutoff"]) == instant(spec["fit_session"] + "T20:30:00+08:00"),
+                    "Configured fold differs from fixed account fit clock")
         trades = spec["oos_trade_sessions"]
         require(type(trades) is list and bool(trades) and trades == sorted(set(trades)) and
                 all(day in previous for day in trades), "Original fold OOS scope required before compact prediction indexing")
@@ -1226,7 +1271,6 @@ def _frames(source, manifest, budget, *, require_coverage=True, raw_only=False):
                     model_index.file_digest == descriptor["files"]["model.json"] and
                     frame_index.file_digest == descriptor["files"]["predictions.json"], "Original saved fold stage bytes mismatch")
         header = frame_index.object_header(("rows",))
-        require(spec["contract_version"] in ("stock_ml_fold_spec_v1", "stock_ml_fold_spec_v2"), "Saved fold spec required")
         with source._memory.stage() as proof_stage:
             proof_stage.reserve(3*(_encoded_size(spec)+_encoded_size(model)))
             _verify_model(model)
@@ -1258,6 +1302,10 @@ def _frames(source, manifest, budget, *, require_coverage=True, raw_only=False):
         last = trades[-1]; features = [previous[d] for d in trades]
         require(set(spec["inference_cutoff_by_session"]) == set(features) and
                 {d for path, d in frame_index.groups if path == ("rows",)} == set(features), "Stock fold predecessor coverage mismatch")
+        if configured:
+            require(instant(spec["evaluation_cutoff"]) >
+                    max(instant(value) for value in spec["inference_cutoff_by_session"].values()),
+                    "Configured fold evaluation cutoff must follow inference")
         require(spec["fit_session"] in calendar and
                 instant(model["fit_cutoff"]) == instant(spec["fit_cutoff"]) and
                 instant(model["simulated_available_at"]) == instant(spec["simulated_model_available_at"]) ==
