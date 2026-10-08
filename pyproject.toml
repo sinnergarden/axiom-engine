@@ -9,5 +9,8 @@ requires-python = ">=3.11"
 description = "Deterministic Core features and offline cached-signal account backtests"
 dependencies = []
 
+[project.optional-dependencies]
+forward-returns = ["numpy"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -141,3 +141,12 @@ class StockSignalLifecycleTests(unittest.TestCase):
             mutate_part(path,wire,index,lambda part:part['rows']['decisions'][0]['prediction_clock'].update(label_spec_ref='sha256:'+'4'*64))
             with self.assertRaisesRegex(ContractError,'admitted LabelSpec'):
                 load_stock_backtest_projection(path,artifact_reader=lambda ref:ref['manifest_uri'],limits=LIMITS)
+            for version in (None,'stock_prediction_clock_v1','unknown_clock'):
+                with self.subTest(downgrade=version):
+                    def downgrade(part):
+                        clock=part['rows']['decisions'][0]['prediction_clock']
+                        clock.pop('contract_version',None)
+                        if version is not None:clock['contract_version']=version
+                    mutate_part(path,wire,index,downgrade)
+                    with self.assertRaisesRegex(ContractError,'admitted LabelSpec'):
+                        load_stock_backtest_projection(path,artifact_reader=lambda ref:ref['manifest_uri'],limits=LIMITS)

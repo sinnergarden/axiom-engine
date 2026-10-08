@@ -280,10 +280,14 @@ def _saved_business(wire, rows, profile):
         else:
             require(clock.get('model_ref')==frame['model_ref'] and clock.get('fold_spec_ref')==frame['fold_spec_ref'],
                     'Saved decision/Signal metadata mismatch')
+            target=wire['source_audit'].get('prediction_targets',{}).get(decision['signal_ref'])
+            if target is not None:
+                require(clock.get('contract_version')=='stock_signal_clock_v2',
+                        'Saved raw clock differs from admitted LabelSpec')
             if clock.get('contract_version')=='stock_signal_clock_v2':
                 require(clock.get('kind')=='raw' and clock.get('signal_stage')=='raw_prediction','Saved raw Signal stage mismatch')
                 digest(clock.get('label_spec_ref'))
-                require(clock['label_spec_ref']==wire['source_audit'].get('prediction_targets',{}).get(decision['signal_ref']),
+                require(clock['label_spec_ref']==target,
                         'Saved raw target differs from admitted LabelSpec')
         require(type(decision.get("intents")) is list, "saved decision intents required")
         for intent in decision["intents"]:

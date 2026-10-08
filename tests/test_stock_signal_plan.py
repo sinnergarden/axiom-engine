@@ -35,6 +35,20 @@ def raw(h=7):
 def typed(kind,**value): return dict(contract_type=kind,contract_version='1',metadata={},**value)
 
 
+def typed_label(spec):
+    h=spec['horizon_sessions']
+    result=typed('LabelSpec',name=spec['label_id'],key=['security_id','session'],
+        horizon_sessions=h,feature_session='actual_feature_session',formula=spec['formula'],
+        return_start_rule='next_session_open',return_end_rule='horizon_session_close',
+        return_start_offset_sessions=1,return_end_offset_sessions=h,price_basis=spec['price_basis'],
+        benchmark_semantics='absolute_return',corporate_action_semantics=spec['corporate_action_policy'],
+        normalization_policy='none',missing_delisting_policy=spec['missing_policy'],
+        maturity=typed('MaturitySpec',rule=spec['maturity_rule'],lag_sessions=h,
+            calendar_policy='actual_exchange_sessions',availability_rule=spec['availability']))
+    result['contract_version']='2'
+    return result
+
+
 def plan_for(inputs):
     nodes=[]; declared=[]
     for alias,wire in inputs.items():
@@ -65,14 +79,7 @@ def execute(inputs,plan=None,context=None):
 class StockSignalPlanTests(unittest.TestCase):
     def test_original_research_typed_plan_semantic_identity_survives_neutral_save(self):
         wire=raw(23);p=plan_for({'prediction':wire});spec=wire['label_spec']
-        p['inputs'][0]['label']=typed('LabelSpec',name=spec['label_id'],key=['security_id','session'],
-            horizon_sessions=23,feature_session='actual_feature_session',formula=spec['formula'],
-            return_start_rule='next_session_open',return_end_rule='horizon_session_close',
-            return_start_offset_sessions=1,return_end_offset_sessions=23,price_basis=spec['price_basis'],
-            benchmark_semantics='absolute_return',corporate_action_semantics=spec['corporate_action_policy'],
-            normalization_policy='none',missing_delisting_policy=spec['missing_policy'],
-            maturity=typed('MaturitySpec',rule=spec['maturity_rule'],lag_sessions=23,
-                calendar_policy='actual_exchange_sessions',availability_rule=spec['availability']))
+        p['inputs'][0]['label']=typed_label(spec)
         p['metadata']={'description':'annotation outside identity'}
         p['inputs'][0]['label']['metadata']={'source':'local annotation'}
         # Independently implement the published Research semantic projection.
@@ -88,6 +95,23 @@ class StockSignalPlanTests(unittest.TestCase):
         self.assertNotIn('contract_type',out['signal_plan'])
         p['inputs'][0]['label']['maturity']['lag_sessions']=22
         with self.assertRaises(ContractError):execute({'prediction':wire},p)
+
+    def test_typed_v2_does_not_reinterpret_v1_or_expand_other_versions_and_maturity(self):
+        wire=raw(3);p=plan_for({'prediction':wire});p['inputs'][0]['label']=typed_label(wire['label_spec'])
+        p['inputs'][0]['label']['formula']='close(f+3) / open(f+1) - 1'
+        self.assertTrue(execute({'prediction':wire},p)['rows'])
+        old=deepcopy(p);declared=old['inputs'][0]['label'];declared['contract_version']='1'
+        with self.assertRaisesRegex(ContractError,'v1 endpoint-distance mismatch'):execute({'prediction':wire},old)
+        declared['return_end_offset_sessions']=4;declared['maturity']['lag_sessions']=4
+        with self.assertRaisesRegex(ContractError,'v1 endpoint-distance target cannot map'):execute({'prediction':wire},old)
+        for path in ((),('inputs',0),('nodes',0),('inputs',0,'label','maturity')):
+            changed=deepcopy(p);value=changed
+            for key in path:value=value[key]
+            value['contract_version']='2'
+            with self.subTest(version_path=path),self.assertRaisesRegex(ContractError,'Unsupported original'):
+                execute({'prediction':wire},changed)
+        changed=deepcopy(p);changed['inputs'][0]['label']['maturity']['rule']='all_outcome_dependencies_at_or_before_fit_cutoff'
+        with self.assertRaisesRegex(ContractError,'maturity differs'):execute({'prediction':wire},changed)
 
     def test_outer_join_retains_missing_parent_days_and_inner_join_explicitly_intersects(self):
         a,b=raw(3),raw(17)

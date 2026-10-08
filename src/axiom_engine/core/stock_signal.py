@@ -150,9 +150,9 @@ def _neutral(value):
     return {k:_neutral(v) for k,v in value.items() if k!='contract_type'}
 
 
-def _contract(value, kind, names):
+def _contract(value, kind, names, *, version='1'):
     fields(value, ('contract_type ' if 'contract_type' in value else '')+'contract_version metadata '+names)
-    require(value.get('contract_type',kind) == kind and value['contract_version'] == '1' and
+    require(value.get('contract_type',kind) == kind and value['contract_version'] == version and
             type(value['metadata']) is dict, 'Unsupported original '+kind+' wire')
 
 
@@ -207,12 +207,22 @@ def _match_label(declared, spec):
     if 'return_start_rule' not in declared:
         require(validate_label_spec(declared) == spec, 'Signal input complete LabelSpec differs')
         return
-    _contract(declared,'LabelSpec','name key horizon_sessions feature_session formula return_start_rule return_end_rule '
+    names=('name key horizon_sessions feature_session formula return_start_rule return_end_rule '
         'return_start_offset_sessions return_end_offset_sessions price_basis benchmark_semantics corporate_action_semantics '
         'normalization_policy maturity missing_delisting_policy')
+    if declared.get('contract_version')=='1':
+        _contract(declared,'LabelSpec',names)
+        integer(declared['horizon_sessions'],1)
+        start,end=declared['return_start_offset_sessions'],declared['return_end_offset_sessions']
+        require(type(start) is int and type(end) is int and start>=0 and
+                end-start==declared['horizon_sessions'],'Legacy LabelSpec v1 endpoint-distance mismatch')
+        require(False,'Legacy LabelSpec v1 endpoint-distance target cannot map to open(f+1)->close(f+h)')
+    _contract(declared,'LabelSpec',names,version='2')
     require(declared['key']==['security_id','session'] and type(declared['return_start_offset_sessions']) is int and
             type(declared['return_end_offset_sessions']) is int, 'LabelSpec key/offset types mismatch')
-    expected=dict(horizon_sessions=spec['horizon_sessions'],formula=spec['formula'],
+    require(declared['formula'] in (spec['formula'],f"close(f+{spec['horizon_sessions']}) / open(f+1) - 1"),
+            'Signal input complete Label formula differs')
+    expected=dict(horizon_sessions=spec['horizon_sessions'],
         return_start_rule='next_session_open',return_end_rule='horizon_session_close',
         return_start_offset_sessions=1,return_end_offset_sessions=spec['horizon_sessions'],
         price_basis=spec['price_basis'],benchmark_semantics='absolute_return',
