@@ -6,6 +6,7 @@ module imports neither Research nor Data and uses the existing Core arithmetic.
 from copy import deepcopy
 from datetime import timezone, timedelta
 from hashlib import sha256
+from types import MappingProxyType
 import math
 import json
 
@@ -274,6 +275,75 @@ def _execute_signal_plan_admitted(plan, admitted, context):
     Both paths execute this one arithmetic implementation.
     """
     plan=validate_signal_plan(plan); context=deepcopy(context)
+    days=set.intersection(*[{d for d,_ in indexed} for _,indexed in admitted.values()]) if plan['join_policy']=='inner_on_security_session' else set.union(*[{d for d,_ in indexed} for _,indexed in admitted.values()])
+    first=next(iter(admitted.values()))[0]
+    admission=_SignalPlanAdmission(plan,{a:w for a,(w,_) in admitted.items()},context,first['universe'],days)
+    rows,parents,stage,limitations=_signal_plan_rows(admission._plan,admitted,context,admission)
+    wire=dict(contract_version='derived_signal_run_v1',score_ref=_ref(rows),signal_plan=plan,signal_plan_ref=signal_plan_ref(plan),
+        parent_signal_refs=parents,implementation_ref=IMPLEMENTATION_REF,signal_stage=stage,score_semantics=plan['score_semantics'],
+        score_unit='dimensionless',universe=first['universe'],rows=rows,context=context,limitations=limitations)
+    wire['signal_run_ref']=_ref(wire)
+    return SignalFrame.from_dict(wire)
+
+
+def _freeze(value):
+    if type(value) is dict:return MappingProxyType({k:_freeze(v) for k,v in value.items()})
+    if type(value) is list:return tuple(_freeze(v) for v in value)
+    if type(value) is set:return frozenset(value)
+    return value
+
+
+class _SignalPlanAdmission:
+    """Private immutable complete-context admission, reused by the same day kernel.
+
+    Construction always validates the original complete scope. There is no
+    public row-slice or boolean admission override.
+    """
+    def __init__(self, plan, parents, context, universe, days):
+        plan=validate_signal_plan(plan)
+        require(set(parents)=={v['alias'] for v in plan['inputs']},'Exact original Signal parents required')
+        for item in plan['inputs']:
+            wire=parents[item['alias']]
+            require(wire['contract_version'] in ('stock_prediction_run_v2','stock_prediction_run_v3') and
+                    wire['score_semantics']==item['score_semantics'] and wire['score_unit']=='dimensionless' and
+                    wire['universe']==universe,'Original raw Signal semantics/union required')
+            digest(wire['signal_run_ref'])
+            horizon=wire['label_spec']['horizon_sessions'] if wire['contract_version'].endswith('_v3') else 5
+            require(item['label']['horizon_sessions']==horizon,'Signal input Label horizon mismatch')
+            if wire['contract_version'].endswith('_v3'):
+                _match_label(item['label'],wire['label_spec'])
+                require(wire['label_spec']['calendar_ref']==context['calendar_ref'],'Signal target/reference calendars differ')
+        refs,sources=_context(context,universe,days)
+        self._plan=_freeze(plan);self._universe=tuple(universe)
+        self._parents=MappingProxyType({a:w['signal_run_ref'] for a,w in parents.items()})
+        self._static=_freeze({k:v for k,v in context.items() if k not in ('reference_members','cutoff_by_session')})
+        self._cutoffs=MappingProxyType(dict(context['cutoff_by_session']))
+        grouped={d:{} for d in days};members={d:{} for d in days}
+        for (security,day),row in refs.items():grouped[day][security]=row
+        for day,rows in context['reference_members'].items():
+            for row in rows:members[day][row['security_id']]=row
+        self._refs=_freeze(grouped);self.members=_freeze(members);self._sources=_freeze(sources)
+
+    def _scope(self, universe, days):
+        require(tuple(universe)==self._universe and set(days)<=self._cutoffs.keys(),'Signal scope differs from original admission')
+        return ({(security,day):row for day in days for security,row in self._refs[day].items()},
+                {day:self._sources[day] for day in days})
+
+    def execute_day(self, admitted, day):
+        require({a:w['signal_run_ref'] for a,(w,_) in admitted.items()}==dict(self._parents),'Original admitted parents differ')
+        context={**self._static,'cutoff_by_session':{day:self._cutoffs[day]}}
+        return _signal_plan_rows(self._plan,admitted,context,self)
+
+    def validate_rows(self, wire, day):
+        rows=_rows(wire,raw=False)
+        for (session,security),row in rows.items():
+            require(session==day and row['knowledge_cutoff']==self._cutoffs[day] and
+                    row['member']==self.members[day][security]['member'],'Derived row differs from original context')
+        return rows
+
+
+def _signal_plan_rows(plan, admitted, context, admission):
+    require(isinstance(admission,_SignalPlanAdmission),'Original Core Signal admission required')
     require(set(admitted)=={v['alias'] for v in plan['inputs']}, 'Exact admitted Signal aliases required')
     parents, env, key_sets, universe, feature_clocks = {}, {}, [], None, {}
     parent_rows = {}
@@ -284,11 +354,6 @@ def _execute_signal_plan_admitted(plan, admitted, context):
                 wire['score_semantics'] == item['score_semantics'], 'Original raw Signal semantics required')
         reference=wire['signal_run_ref']; digest(reference)
         parent_rows[item['alias']]=indexed
-        horizon=wire['label_spec']['horizon_sessions'] if wire['contract_version'].endswith('_v3') else 5
-        require(item['label']['horizon_sessions'] == horizon, 'Signal input Label horizon mismatch')
-        if wire['contract_version'].endswith('_v3'):
-            _match_label(item['label'],wire['label_spec'])
-            require(wire['label_spec']['calendar_ref']==context['calendar_ref'], 'Signal target/reference calendars differ')
         if universe is None: universe=wire['universe']
         require(wire['universe'] == universe and wire['score_unit'] == 'dimensionless', 'Common frozen Signal union/unit required')
         parents[item['alias']]=reference; values={}; limitations.update(wire['limitations'])
@@ -300,7 +365,7 @@ def _execute_signal_plan_admitted(plan, admitted, context):
     keys=set.intersection(*key_sets) if plan['join_policy']=='inner_on_security_session' else set.union(*key_sets)
     require(bool(keys), 'Empty Signal join'); days={key[1] for key in keys}
     require(keys == {(security,day) for security in universe for day in days}, 'Signal output must preserve full session union')
-    refs,actual_sources=_context(context,universe,days); ordered=sorted(keys)
+    refs,actual_sources=admission._scope(universe,days); ordered=sorted(keys)
     for item in plan['inputs']:
         source=env[item['alias']]
         for key in ordered:
@@ -340,15 +405,11 @@ def _execute_signal_plan_admitted(plan, admitted, context):
                 valid=cell.value is not None,invalid_reason=None if cell.value is not None else cell.reason or 'MISSING_SIGNAL_INPUT',
                 source_refs=list(cell.sources),member=refs[security,day]['member']))
     stage=next(n['output_stage'] for n in plan['nodes'] if n['name']==plan['output'])
-    wire=dict(contract_version='derived_signal_run_v1',score_ref=_ref(rows),signal_plan=plan,signal_plan_ref=signal_plan_ref(plan),
-        parent_signal_refs=parents,implementation_ref=IMPLEMENTATION_REF,signal_stage=stage,score_semantics=plan['score_semantics'],
-        score_unit='dimensionless',universe=universe,rows=rows,context=context,limitations=sorted(limitations))
-    wire['signal_run_ref']=_ref(wire)
-    return SignalFrame.from_dict(wire)
+    return rows,parents,stage,sorted(limitations)
 
 
 def validate_derived_signal(frame):
-    """Admit a saved Derived row view; the caller verifies the full artifact hash."""
+    """Validate a complete Derived wire; the caller verifies original artifact hashes."""
     wire=frame.to_dict(); fields(wire,DERIVED_FIELDS)
     require(wire['contract_version']=='derived_signal_run_v1' and wire['score_unit']=='dimensionless', 'Unsupported Derived Signal')
     plan=validate_signal_plan(wire['signal_plan'])

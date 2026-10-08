@@ -18,8 +18,8 @@ from test_stock_stream_inputs import artifact_file, LIMITS
 from test_stock_stream import execute
 
 
-def v3_request(root, *, h=17):
-    plan=request_for(root);plan['prediction_input']['contract_version']='stock_prediction_input_refs_v2'
+def v3_request(root, *, h=17, base_plan=None):
+    plan=request_for(root) if base_plan is None else base_plan;plan['prediction_input']['contract_version']='stock_prediction_input_refs_v2'
     for i,item in enumerate(plan['prediction_input']['frames']):
         item['kind']='raw'
         model=Document(Path(item['model_metadata_artifact']['manifest_uri']).read_text()).to_dict()

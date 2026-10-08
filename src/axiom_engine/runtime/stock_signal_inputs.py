@@ -5,9 +5,9 @@ Core entry as Research; this module does not train, predict or run an account.
 """
 from .._implementation import IMPLEMENTATION_REF
 from ..core.contracts import fields, require, digest
-from ..core.stock_portfolio import StockPredictionFrame, instant, validate_stock_predictions
+from ..core.stock_portfolio import StockPredictionFrame, instant
 from ..core.stock_signal import (DERIVED_FIELDS, _context, validate_signal_plan,
-    signal_plan_ref, _execute_signal_plan_admitted)
+    signal_plan_ref, _SignalPlanAdmission)
 
 
 def frames(source, manifest, budget):
@@ -47,9 +47,13 @@ def frames(source, manifest, budget):
             stage=next(n['output_stage'] for n in plan['nodes'] if n['name']==plan['output'])
             require(header['signal_stage']==stage,'Derived plan/output stage mismatch')
             days=sorted(d for path,d in index.groups if path==('rows',))
-            _context(header['context'],universe,days)
+            source._memory.reserve_global(('derived_reference_index',header['signal_run_ref']),
+                512*len(days)*len(universe)+256*len(days))
+            core=_SignalPlanAdmission(plan,{a:raw[p['signal_run_ref']]['header'] for a,p in binding['parent_inputs'].items()},
+                                      header['context'],universe,days)
             for value in (header['signal_run_ref'],header['score_ref'],header['implementation_ref']):digest(value)
-            frame={'kind':'derived','index':index,'header':header,'item':binding,
+            small={k:v for k,v in header.items() if k not in ('context','signal_plan')}
+            frame={'kind':'derived','index':index,'header':small,'original_header':header,'item':binding,'core_admission':core,
                    'parents':{a:raw[p['signal_run_ref']] for a,p in binding['parent_inputs'].items()},'features':set(days)}
         require(bool(days) and all(d in following for d in days),'Saved Signal predecessor scope mismatch')
         trades=[following[d] for d in days]
@@ -69,42 +73,85 @@ def frames(source, manifest, budget):
         if frame.get('kind')=='derived':
             source._memory.reserve_global(('derived_signal_metadata',frame['header']['signal_run_ref']),
                 _encoded_size(frame['header'])+128*len(frame['features']))
+    for frame in result:
+        if frame.get('kind')=='derived':frame['admission']=_DerivedAdmission(source,frame)
     return result,trade_map
 
 
-def read_derived(source, frame, feature, budget, reservation):
-    """Read one score cross-section and recompute from admitted real parents."""
-    from .stock_stream_inputs import _encoded_size
-    frame['index'].unchanged()
-    rows,_,refs=frame['index'].rows(('rows',),[feature],budget,reservation=reservation)
-    admitted={};context=frame['header']['context']
-    scoped={**context,'reference_members':{feature:context['reference_members'][feature]},
-            'cutoff_by_session':{feature:context['cutoff_by_session'][feature]}}
-    with source._memory.stage() as proof:
-        proof.reserve(4*(_encoded_size(frame['header'])+sum(_encoded_size(r) for r in rows)+32))
-        for alias,parent in frame['parents'].items():
+class _DerivedAdmission:
+    """Invocation-local source identity and verified Core day lifecycle."""
+    def __init__(self,source,frame):
+        self.source=source;self.frame=frame;self.memory=source._memory
+        self.verified_days=set()
+        self.index_key=(str(frame['index'].path),frame['item']['signal_artifact']['content_digest'])
+
+    def check_rows(self,feature,rows):
+        return self.frame['core_admission'].validate_rows({**self.frame['header'],'rows':rows},feature)
+
+    def read(self,feature,budget,reservation):
+        from .stock_stream_inputs import _encoded_size
+        from ..core.stock_portfolio import validate_stock_predictions
+        source,frame=self.source,self.frame
+        require(source._memory is self.memory and source._indexes.get(self.index_key) is frame['index'],
+                'Derived admission belongs to its original source lifetime')
+        frame['index'].unchanged()
+        for parent in frame['parents'].values():
             parent['spec_index'].unchanged();parent['model_index'].unchanged();parent['index'].unchanged()
-            binding=parent['parent_binding']
-            if binding is not None:
-                require(parent['spec_index'].span_digest(parent['spec_index'].selector)==binding['child_ref'],
-                        'Original saved parent fold changed after admission')
-                refs.append(binding)
-            if feature in parent['features']:
-                values,_,parent_refs=parent['index'].rows(('rows',),[feature],budget,reservation=proof)
-                refs+=parent_refs
-                proof.reserve(4*(_encoded_size(parent['header'])+sum(_encoded_size(r) for r in values)+32))
-                wire,indexed=validate_stock_predictions(StockPredictionFrame.from_dict({**parent['header'],'rows':values}))
-                for row in indexed.values():
-                    require(instant(row['simulated_model_available_at'])==instant(parent['model']['simulated_available_at']),
-                            'Original parent prediction/model clock mismatch')
-                admitted[alias]=(wire,indexed)
-            else: admitted[alias]=(parent['header'],{})
-        expected=_execute_signal_plan_admitted(frame['header']['signal_plan'],admitted,scoped).to_dict()
-        require(rows==expected['rows'],'Saved Derived scores/validity/clocks/refs differ from Core execution')
-        require(expected['parent_signal_refs']==frame['header']['parent_signal_refs'] and
-                expected['signal_stage']==frame['header']['signal_stage'] and
-                expected['limitations']==frame['header']['limitations'],'Derived provenance differs from original parents')
-    return rows,refs
+        rows,_,refs=frame['index'].rows(('rows',),[feature],budget,reservation=reservation)
+        self.check_rows(feature,rows)
+        refs += [p['parent_binding'] for p in frame['parents'].values() if p['parent_binding'] is not None]
+        if feature in self.verified_days:
+            # Original row spans still pass source identity checks. This is a
+            # capability tied to this source, not a caller/persisted PASS flag.
+            return rows,refs
+        admitted={}
+        with source._memory.stage() as proof:
+            proof.reserve(4*(_encoded_size(frame['header'])+sum(_encoded_size(r) for r in rows)+32))
+            for alias,parent in frame['parents'].items():
+                if feature in parent['features']:
+                    values,_,parent_refs=parent['index'].rows(('rows',),[feature],budget,reservation=proof)
+                    refs+=parent_refs
+                    proof.reserve(4*(_encoded_size(parent['header'])+sum(_encoded_size(r) for r in values)+32))
+                    wire,indexed=validate_stock_predictions(StockPredictionFrame.from_dict({**parent['header'],'rows':values}))
+                    for row in indexed.values():
+                        require(instant(row['simulated_model_available_at'])==instant(parent['model']['simulated_available_at']),
+                                'Original parent prediction/model clock mismatch')
+                    admitted[alias]=(wire,indexed)
+                else:admitted[alias]=(parent['header'],{})
+            expected,parents,stage,limitations=frame['core_admission'].execute_day(admitted,feature)
+            require(rows==expected,'Saved Derived scores/validity/clocks/refs differ from Core execution')
+            require(parents==frame['header']['parent_signal_refs'] and stage==frame['header']['signal_stage'] and
+                    limitations==frame['header']['limitations'],'Derived provenance differs from original parents')
+        self.verified_days.add(feature)
+        return rows,refs
+
+
+def read_derived(source,frame,feature,budget,reservation):
+    admission=frame.get('admission')
+    require(isinstance(admission,_DerivedAdmission) and admission.source is source,
+            'Original Derived source admission required')
+    return admission.read(feature,budget,reservation)
+
+
+def check_day_rows(frame,feature,rows):
+    if frame.get('kind')=='derived':
+        return frame['admission'].check_rows(feature,rows)
+    from ..core.stock_portfolio import validate_stock_predictions as validate_raw
+    return validate_raw(StockPredictionFrame.from_dict({**frame['header'],'rows':rows}))[1]
+
+
+def prediction_targets(frames):
+    """Small source-admitted raw target refs, including original Derived parents."""
+    targets={}
+    for frame in frames:
+        parents=frame['parents'].values() if frame.get('kind')=='derived' else [frame]
+        for parent in parents:
+            header=parent['header'];ref=header.get('label_spec_ref')
+            if ref is not None:digest(ref)
+            key=header['signal_run_ref']
+            require(key not in targets or targets[key]==ref,'Conflicting admitted raw target refs')
+            targets[key]=ref
+    return targets
 
 
 def validate_day(frame, feature, checked, members, metadata, native_ref):
@@ -116,12 +163,11 @@ def validate_day(frame, feature, checked, members, metadata, native_ref):
                 instant(row['knowledge_cutoff'])==instant(feature+'T21:00:00+08:00'),
                 'Saved prediction membership/fixed clock mismatch')
         if derived:
-            reference=next(r for r in frame['header']['context']['reference_members'][feature]
-                           if r['security_id']==row['security_id'])
+            reference=frame['core_admission'].members[feature][row['security_id']]
             fact=metadata['is_member'][key]
             require(fact.get('usable_from') is not None and
                     instant(reference['available_at'])==instant(fact['usable_from']) and
-                    reference['source_refs']==[native_ref],
+                    tuple(reference['source_refs'])==(native_ref,),
                     'Derived reference differs from original membership availability')
         else:
             require(instant(row['available_at'])==instant(feature+'T21:00:00+08:00') and

@@ -1278,7 +1278,7 @@ def _frames(source, manifest, budget, *, require_coverage=True, raw_only=False):
 
 
 def _audit(source, manifest, block_sessions, budget, limits, implementation_ref, *, market_only=False, capture=None):
-    from .stock_stream_contracts import validate_manifest, validate_limits
+    from .stock_stream_contracts import validate_manifest, validate_limits, check_inventory_rows, resolve_prediction_inventory
     from .stock_market import _project_stock_actions, _visible
     from .profiles import stock_daily_open_profile_v2
     from .stock_rules import csi300_stock_portfolio_policy
@@ -1295,8 +1295,7 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
     inventory = source.inventory(manifest)
     require(inventory["input_bytes"] <= limits["max_input_bytes"] and inventory["folds"] <= limits["max_folds"],
             "Stock source inventory exceeds input/fold budget")
-    require(all(inventory["declared_rows"][name] <= limits["max_" + name] for name in ("market_rows", "prediction_rows")),
-            "Stock source inventory exceeds declared row budget")
+    check_inventory_rows(inventory,limits)
     # An audit is never a cache exemption across invocations.
     source._close_private_views()
     source._indexes = {}; source._prepared = None
@@ -1345,6 +1344,7 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
     source_refs = [native_by_day["execution", kind, calendar[0] if kind not in ("actions-ex", "actions-record") else None].content_digest
                    for kind in ("states", "market", "limits", "factor", "actions-ex", "actions-record", "membership")]
     frames, trade_map = ([], {}) if market_only else _frames(source, manifest, budget)
+    resolve_prediction_inventory(inventory,source,limits)
     prepared = {"request_ref": manifest["request_ref"], "native_by_day": native_by_day,
                 "rules_index": rules_index, "source_refs": source_refs, "trade_map": trade_map}
     source._prepared = prepared
@@ -1433,7 +1433,8 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
                         # Reading view only; the original parent identity was checked above.
                         validated_wire = checked = membership = members = member_metadata = member_bindings = None
                         try:
-                            validated_wire, checked = validate_stock_predictions(StockPredictionFrame.from_dict({**header, "rows": list(indexed.values())}))
+                            from .stock_signal_inputs import check_day_rows
+                            checked=check_day_rows(trade_map[trade][0],feature,list(indexed.values()))
                             require(len(checked) == len(universe), "Incomplete original saved prediction date group")
                             membership, _, member_bindings = source._native("execution", "membership", [feature], budget, reservation=stage)
                             members, member_metadata = _grid(membership, [feature], universe)
@@ -1491,6 +1492,9 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
                               "market_rows": market_rows,
                               "cash_actions": len(cash), "action_diagnostics": len(diagnostics), "action_blocks": len(blocks)},
                    "limitations": limitations}
+        if manifest.get('prediction_input',{}).get('contract_version')=='stock_prediction_input_refs_v2':
+            from .stock_signal_inputs import prediction_targets
+            receipt.update(contract_version='stock_input_audit_v2',prediction_targets=prediction_targets(frames))
         source._memory.reserve_global(("projected", "audit_receipt"), _encoded_size(receipt))
         return StockSourceAudit(receipt=receipt, globals={"profile": profile, "market_header": market_header,
             "calendar": calendar, "rules_index": rules_index, "profile_bytes": profile_index.size,

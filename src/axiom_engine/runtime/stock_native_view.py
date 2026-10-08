@@ -131,10 +131,12 @@ class StockNativeViewSource(StockInputSource):
                 if '#' in artifact['manifest_uri']:
                     descriptor = path.with_name('manifest.json')
                     files.setdefault(str(descriptor), {'manifest_uri': str(descriptor), 'file_bytes': descriptor.stat().st_size})
+        from .stock_stream_contracts import prediction_inventory
+        folds,prediction_rows=prediction_inventory(plan.get('prediction_input',{}),plan['scope'])
         return {'files': list(files.values()), 'native_artifacts': native,
-            'input_bytes': sum(f['file_bytes'] for f in files.values()), 'folds': len(plan.get('prediction_input', {}).get('frames', [])),
+            'input_bytes': sum(f['file_bytes'] for f in files.values()), 'folds': folds,
             'declared_rows': {'market_rows': len(plan['scope']['calendar'])*len(plan['scope']['execution_universe']),
-                'prediction_rows': (len(plan['scope']['calendar'])-1)*len(plan['scope']['prediction_universe']) if plan.get('prediction_input', {}).get('frames') else 0},
+                'prediction_rows': prediction_rows},
             'declared_scope': deepcopy(plan['scope'])}
 
     def _index(self, artifact, budget):

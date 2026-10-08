@@ -4,7 +4,7 @@ from decimal import Context, Decimal, ROUND_HALF_UP, localcontext
 from .._implementation import IMPLEMENTATION_REF
 from ..core.contracts import Document, fields, integer, require
 from .backtest import BacktestRequest, BacktestRun, _run
-from .stock_stream_contracts import (AUDIT_VERSION, RESULT_GROUPS, RUN_VERSION,
+from .stock_stream_contracts import (RESULT_GROUPS, RUN_VERSION,
     STREAM_RUNTIME_VERSION, read_budget, validate_artifact_ref, validate_limits,
     validate_manifest, write_budget)
 from .stock_stream_inputs import StockInputSource
@@ -31,8 +31,9 @@ def _admit(manifest, source, block_sessions, limits):
     audit = source.audit(plan, block_sessions=block_sessions, read_budget=read_budget(limits),
                          limits=limits, implementation_ref=IMPLEMENTATION_REF)
     receipt = audit.receipt
-    fields(receipt, "contract_version request_ref market_ref prediction_ref profile_ref implementation_ref counts limitations")
-    require(receipt["contract_version"] == AUDIT_VERSION and
+    from .stock_stream_contracts import validate_source_audit
+    validate_source_audit(receipt,plan)
+    require(
             receipt["request_ref"] == plan["request_ref"] and
             receipt["market_ref"] == plan["market_input"]["market_ref"] and
             receipt["prediction_ref"] == plan["prediction_input"]["prediction_ref"] and

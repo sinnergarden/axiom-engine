@@ -190,10 +190,39 @@ def score_artifacts(predictions):
 
 
 def prediction_inventory(predictions, scope):
-    """Conservative pre-scan quota includes parents and saved Derived score rows."""
+    """Payload-free inventory; modern OOS ranges resolve in the bounded scan.
+
+    ArtifactRef envelopes contain no trusted row/date count. Do not multiply
+    every fold by the whole calendar, or invent a declared zero as an estimate.
+    """
     bindings=list(prediction_bindings(predictions))
-    derived=sum(frame.get('kind')=='derived' for frame in predictions.get('frames',[]))
-    # Legacy inventory is exact and unchanged. Modern inputs conservatively
-    # reserve each distinct parent/output against the full requested calendar.
-    multiplier=len(bindings)+derived if predictions.get('contract_version')=='stock_prediction_input_refs_v2' else bool(bindings)
-    return len(bindings), (len(scope['calendar'])-1)*len(scope['prediction_universe'])*multiplier
+    rows=None if predictions.get('contract_version')=='stock_prediction_input_refs_v2' else (len(scope['calendar'])-1)*len(scope['prediction_universe'])*bool(bindings)
+    return len(bindings),rows
+
+
+def check_inventory_rows(inventory,limits):
+    for name,value in inventory['declared_rows'].items():
+        require(value is None and name=='prediction_rows' or type(value) is int and value<=limits['max_'+name],
+                'Stock source inventory exceeds declared row budget')
+
+
+def resolve_prediction_inventory(inventory,source,limits):
+    if inventory['declared_rows']['prediction_rows'] is None:
+        inventory['declared_rows']['prediction_rows']=limits['max_prediction_rows']-source._prediction_remaining
+    return inventory
+
+
+AUDIT_FIELDS='contract_version request_ref market_ref prediction_ref profile_ref implementation_ref counts limitations'
+
+
+def validate_source_audit(receipt,manifest):
+    modern=manifest.get('prediction_input',{}).get('contract_version')=='stock_prediction_input_refs_v2'
+    fields(receipt,AUDIT_FIELDS+(' prediction_targets' if modern else ''))
+    require(receipt['contract_version']==('stock_input_audit_v2' if modern else AUDIT_VERSION),'Source audit version mismatch')
+    if modern:
+        targets=receipt['prediction_targets']
+        require(type(targets) is dict and set(targets)=={i['signal_run_ref'] for i in prediction_bindings(manifest['prediction_input'])},
+                'Admitted raw target summary differs from original bindings')
+        for ref in targets.values():
+            if ref is not None:digest(ref)
+    return receipt
