@@ -2,7 +2,7 @@
 
 These notes explain the software probes, recorded measurements and their limits.
 The public API and input-reuse contract are maintained in
-[Axiom design 04](https://github.com/sinnergarden/axiom-docs/blob/codex/docs-owned-stock-inputs-20261007/docs/design/04_axiom_trade.md#64-已保存股票输入的一次准入与顺序账户复用).
+[Axiom design 04](https://github.com/sinnergarden/axiom-docs/blob/af702babcfbead8cf0850aaf00738067b497fd35/docs/design/04_axiom_trade.md#66-已保存股票输入的一次准入与顺序账户复用).
 Implementation increments were integrated through [PR21](https://github.com/sinnergarden/axiom-engine/pull/21)
 and [PR22](https://github.com/sinnergarden/axiom-engine/pull/22).
 Original inputs, account metrics, local locations and detailed receipts remain private.
