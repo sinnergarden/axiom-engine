@@ -5,20 +5,16 @@ It has no published path and no writer after import. Each account receives
 fresh decoded blocks, while original canonical sources are consumed once.
 """
 from array import array
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 import json
 import os
-import tempfile
 from threading import Lock
-from time import perf_counter
 
-from .._implementation import IMPLEMENTATION_REF
 from ..core.contracts import canonical, integer, require
 from ..core.stock_portfolio import validate_top_k
 from .stock_stream_contracts import identity_view, read_budget, validate_limits, validate_manifest
 from .stock_stream_inputs import (StockInputSource, StockInputBlock, StockSourceAudit,
                                   _DecodedMemory, _budget, _encoded_size)
-from .stock_stream_outputs import _json_pieces
 
 
 _IMPORT = object()
@@ -36,20 +32,13 @@ def _input_key(plan):
     return canonical(value).encode("utf-8")
 
 
-def _block_wire(block):
-    return {"sessions": list(block.sessions), "market_rows": list(block.market_rows.values()),
-            "signals": [{"session": day, "header": header, "rows": list(rows.values())}
-                        for day, (header, rows) in block.signals.items()],
-            "bindings": list(block.bindings)}
-
-
 class AdmittedStockInputs(StockInputSource):
     """Opaque sequential-account source; construct only with admit_stock_inputs.
 
     close()/context-manager exit release the private store. No account can
     mutate a later account's inputs through its decoded globals or blocks.
     """
-    def __init__(self, token, store, offsets, key, block_sessions, inventory, statistics):
+    def __init__(self, token, store, offsets, key, block_sessions, inventory, statistics, *, market=None):
         require(token is _IMPORT, "Use admit_stock_inputs; admission flags are unsupported")
         super().__init__()
         self.__owner_pid = os.getpid()
@@ -61,11 +50,25 @@ class AdmittedStockInputs(StockInputSource):
         self.__statistics = statistics
         self.__lock = Lock()
         self.__closed = False
+        self.__market = market
+        self.__owns_market = False
+        self.__market_final_stats = None
 
     @property
     def statistics(self):
         self.__owner()
-        return json.loads(canonical(self.__statistics))
+        value = json.loads(canonical(self.__statistics))
+        if self.__owns_market:
+            shared = self.__market_final_stats or self.__market.statistics
+            left, right = shared["source_operations"], value["source_operations"]
+            value["source_operations"] = {name: (max(left.get(name, 0), right.get(name, 0))
+                if name == "cjson_peak_tree_rss_bytes" else left.get(name, 0)+right.get(name, 0))
+                for name in left.keys() | right.keys()}
+            for name in ("source_audit_seconds", "capture_seconds", "owned_bytes", "source_scalar_cache_evictions"):
+                value[name] += shared[name]
+            for name in ("source_decoded_bytes_peak", "max_owned_decoded_bytes"):
+                value[name] = max(value[name], shared["source_decoded_bytes_peak"])
+        return value
 
     def inventory(self, manifest):
         self.__check(manifest)
@@ -88,7 +91,11 @@ class AdmittedStockInputs(StockInputSource):
         require(self.__lock.acquire(blocking=False), "Admitted stock inputs support sequential accounts only")
         try:
             require(not self.__closed, "Admitted stock inputs are closed")
-            yield
+            if self.__market is None:
+                yield
+            else:
+                with self.__market._scope():
+                    yield
         finally:
             self.__owner()
             self._prepared = None
@@ -121,6 +128,8 @@ class AdmittedStockInputs(StockInputSource):
 
     def audit(self, manifest, *, block_sessions, read_budget, limits, implementation_ref):
         plan = self.__check(manifest)
+        if self.__market is not None:
+            self.__market._assert_lease()
         integer(block_sessions, 1); budget = _budget(read_budget); limits = validate_limits(limits)
         require(block_sessions == self.__block_sessions, "Admitted stock block_sessions must remain fixed")
         inventory = json.loads(self.__inventory)
@@ -129,7 +138,8 @@ class AdmittedStockInputs(StockInputSource):
         require(all(inventory["declared_rows"][name] <= limits["max_"+name]
                     for name in ("market_rows", "prediction_rows")), "Admitted stock declared row limit exceeded")
         self._memory = _DecodedMemory(budget["max_decoded_bytes"])
-        self._memory.reserve_global("owned_binding", len(self.__key)+len(self.__inventory)+len(self.__offsets)*8)
+        # Immutable history/key/index volume belongs to each owner's lifetime,
+        # not to a fresh account's temporary decoded budget.
         self._memory.reserve_global("owned_request", _encoded_size(plan))
         meta, stage = self.__read(0, budget)
         size = stage.used
@@ -142,7 +152,18 @@ class AdmittedStockInputs(StockInputSource):
         receipt["request_ref"] = plan["request_ref"]
         self._prepared = {"request_ref": plan["request_ref"]}
         self.__statistics["account_bindings"] += 1
-        return StockSourceAudit(receipt=receipt, globals=meta["globals"], lifecycle=meta["lifecycle"], manifest=plan)
+        if self.__market is None:
+            globals_value, lifecycle = meta["globals"], meta["lifecycle"]
+        else:
+            market_meta, market_stage = self.__market._globals(self._memory, budget)
+            market_size = market_stage.used
+            market_stage.close()
+            self._memory.reserve_global("market_globals", market_size)
+            globals_value = market_meta["globals"]
+            globals_value["signal_limitations"] = meta["signal_limitations"]
+            globals_value["market_header"]["limitations"] = receipt["limitations"]
+            lifecycle = market_meta["lifecycle"]
+        return StockSourceAudit(receipt=receipt, globals=globals_value, lifecycle=lifecycle, manifest=plan)
 
     def iter_blocks(self, manifest, *, block_sessions, read_budget):
         self.__owner()
@@ -150,6 +171,8 @@ class AdmittedStockInputs(StockInputSource):
 
     def __blocks(self, manifest, *, block_sessions, read_budget):
         plan = self.__check(manifest); budget = _budget(read_budget)
+        if self.__market is not None:
+            self.__market._assert_lease()
         require(block_sessions == self.__block_sessions and self._prepared is not None and
                 self._prepared["request_ref"] == plan["request_ref"], "Stock owner needs this account's binding")
         require(self._memory.limit == budget["max_decoded_bytes"], "Stock owner decoded budget changed")
@@ -157,21 +180,33 @@ class AdmittedStockInputs(StockInputSource):
         for number in range(1, len(self.__offsets)//2):
             value, stage = self.__read(number, budget)
             block = None
+            market_stage = None
             try:
                 days = tuple(value["sessions"])
                 offset = (number-1)*block_sessions
                 require(days == tuple(calendar[offset:offset+block_sessions]), "Private stock block calendar mismatch")
+                if self.__market is not None:
+                    market_value, market_stage = self.__market._market_block(number-1, self._memory, budget)
+                    value["market_rows"] = market_value["market_rows"]
+                    stage.reserve(64*(len(market_value["bindings"])+len(value["bindings"]))+512)
+                    value["bindings"] = market_value["bindings"] + value["bindings"]
                 count = len(value["market_rows"]) + sum(len(item["rows"]) for item in value["signals"])
                 stage.reserve(64*count)
                 rows = {(row["session"], row["security_id"]): row for row in value["market_rows"]}
                 signals = {item["session"]: (item["header"],
                     {(row["session"], row["security_id"]): row for row in item["rows"]}) for item in value["signals"]}
+                if market_stage is not None:
+                    stage.used += market_stage.used
+                    market_stage.used = 0
                 block = StockInputBlock(days, rows, signals, tuple(value["bindings"]), stage.used, stage)
                 value = rows = signals = None
+                market_value = None
                 yield block
             finally:
                 self.__owner()
-                value = rows = signals = block = None
+                value = rows = signals = block = market_value = None
+                if market_stage is not None:
+                    market_stage.close()
                 stage.close()
 
     def close(self):
@@ -179,11 +214,18 @@ class AdmittedStockInputs(StockInputSource):
         require(self.__lock.acquire(blocking=False), "Cannot close stock inputs during account execution")
         try:
             if not self.__closed:
+                if self.__market is not None:
+                    with self.__market._scope():
+                        self.__market._release()
+                    if self.__owns_market:
+                        self.__market_final_stats = self.__market.statistics
                 self.__closed = True
                 self.__store.close()
                 self.__offsets = array("Q")
                 self.__key = self.__inventory = b""
                 self._memory = self._prepared = None
+                if self.__owns_market:
+                    self.__market.close()
         finally:
             self.__lock.release()
 
@@ -205,76 +247,24 @@ def admit_stock_inputs(manifest, *, source, block_sessions: int, limits: dict,
     """
     require(not isinstance(source, AdmittedStockInputs), "Import original stock sources, not an admission marker")
     require(isinstance(source, StockInputSource), "StockInputSource required")
-    with source.execution_scope():
-        return _capture_owned_inputs(manifest, source, block_sessions, limits, max_owned_bytes)
-
-
-def _capture_owned_inputs(manifest, source, block_sessions, limits, max_owned_bytes):
-    from .stock_stream import _admit
+    from .stock_market_owner import StockMarketSpec, admit_stock_market_inputs, bind_stock_prediction_inputs
     integer(max_owned_bytes, 1)
-    started = perf_counter()
-    plan, audit, limits = _admit(manifest, source, block_sessions, limits)
-    audited = perf_counter()
-    inventory = canonical(source.inventory(plan)).encode("utf-8")
-    key = _input_key(plan)
-    store = tempfile.TemporaryFile(mode="w+b")
-    offsets = array("Q")
-    binding_bytes = len(key)+len(inventory)+16*(1+(len(plan["scope"]["calendar"])+block_sessions-1)//block_sessions)
-    base_bytes = binding_bytes+_encoded_size(plan)
-    peak_owned_decode = 0
-    # Compact offsets are charged before growth; raw history never stays live.
-    offset_stage = source._memory.stage()
-    def write(value):
-        offset_stage.reserve(16)
-        start = store.tell()
-        # Internal serialization is not an input read. Reserve escaped text,
-        # UTF-8 and finite-number buffers even when max_read_bytes is one.
-        scratch_bytes = 2048
-        with source._memory.stage() as scratch:
-            scratch.reserve(scratch_bytes)
-            for piece in _json_pieces(value, piece_chars=64):
-                require(store.tell()+len(piece) <= max_owned_bytes, "Owned stock input store exceeds max_owned_bytes before write")
-                store.write(piece)
-        offsets.extend((start, store.tell()-start))
+    market = admit_stock_market_inputs(StockMarketSpec.from_request(manifest), source=source,
+        block_sessions=block_sessions, limits=limits, max_market_bytes=max_owned_bytes)
+    market_parse_events = source._file_parse_events
+    market._combined_limit = max_owned_bytes
     try:
-        write({"receipt": audit.receipt, "globals": audit.globals, "lifecycle": audit.lifecycle})
-        meta_bytes = offsets[1]
-        peak_owned_decode = base_bytes+3*meta_bytes
-        require(peak_owned_decode <= limits["max_block_bytes"], "Owned stock globals exceed decoded budget before account")
-        with closing(source.iter_blocks(plan, block_sessions=block_sessions, read_budget=read_budget(limits))) as blocks:
-            while True:
-                try:
-                    block = next(blocks)
-                except StopIteration:
-                    break
-                try:
-                    count = len(block.market_rows)+sum(len(rows) for _, rows in block.signals.values())
-                    with source._memory.stage() as view:
-                        # Own the temporary list/index wrappers before building
-                        # them; source row graphs remain borrowed, never copied.
-                        view.reserve(64*count+512)
-                        write(_block_wire(block))
-                    peak_owned_decode = max(peak_owned_decode, base_bytes+meta_bytes+3*offsets[-1]+64*count)
-                    require(peak_owned_decode <= limits["max_block_bytes"], "Owned stock block exceeds decoded budget before account")
-                finally:
-                    block = None
-        store.flush()
-        statistics = {"source_admissions": 1, "source_audit_seconds": audited-started,
-                      "capture_seconds": perf_counter()-audited, "owned_bytes": store.tell(),
-                      "max_owned_decoded_bytes": peak_owned_decode,
-                      "owned_blocks": len(offsets)//2-1, "owned_read_bytes": 0,
-                      "owned_record_decodes": 0, "account_bindings": 0,
-                      "source_operations": source.statistics["source_operations"],
-                      "source_decoded_bytes_peak": source.statistics["decoded_bytes_peak"],
-                      "source_scalar_cache_evictions": source.statistics["scalar_cache_evictions"]}
-        return AdmittedStockInputs(_IMPORT, store, offsets, key, block_sessions, inventory, statistics)
+        remaining = max_owned_bytes-market.statistics["owned_bytes"]
+        require(remaining > 0, "Owned stock inputs exceed max_owned_bytes before Signal binding")
+        inputs = bind_stock_prediction_inputs(market, manifest, source=source,
+            limits=limits, max_signal_bytes=remaining)
+        source._file_parse_events = market_parse_events + source._file_parse_events
+        require(market.statistics["owned_bytes"]+inputs.statistics["owned_bytes"] <= max_owned_bytes,
+                "Owned stock inputs exceed max_owned_bytes after pairing proof")
+        inputs._AdmittedStockInputs__owns_market = True
+        return inputs
     except BaseException:
-        store.close()
+        if market.statistics["signal_borrows"]:
+            inputs.close()
+        market.close()
         raise
-    finally:
-        offset_stage.close()
-        # The caller can still run the original source, which admits afresh.
-        # Its full-history span index is unnecessary after ownership transfer.
-        source._close_private_views()
-        source._indexes = {}; source._prepared = None; source._audited = False
-        source._memory = None; source._scan_native_scopes = {}; source._scan_row_limits = {}

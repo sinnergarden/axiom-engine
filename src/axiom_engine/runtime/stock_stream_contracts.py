@@ -74,12 +74,7 @@ def write_budget(limits):
             "max_total_bytes": limits["max_result_bytes"]}
 
 
-def validate_manifest(manifest):
-    plan = manifest.to_dict() if isinstance(manifest, Document) else deepcopy(manifest)
-    fields(plan, "contract_version request_ref account_id scope initial_account portfolio_policy profile_input market_input prediction_input stock_action_policy clock_policy limitations")
-    require(plan["contract_version"] == REQUEST_VERSION, "bounded stock request required")
-    text(plan["account_id"])
-    scope = plan["scope"]
+def _validate_scope(scope):
     fields(scope, "start_session end_session anchor_session calendar prediction_universe execution_universe supported_universe_ref")
     calendar = scope["calendar"]
     require(type(calendar) is list and len(calendar) > 1 and calendar == sorted(set(calendar)), "frozen exchange calendar required")
@@ -97,6 +92,15 @@ def validate_manifest(manifest):
             text(security)
     require(set(scope["execution_universe"]) <= set(scope["prediction_universe"]), "execution universe outside prediction union")
     digest(scope["supported_universe_ref"])
+
+
+def validate_manifest(manifest):
+    plan = manifest.to_dict() if isinstance(manifest, Document) else deepcopy(manifest)
+    fields(plan, "contract_version request_ref account_id scope initial_account portfolio_policy profile_input market_input prediction_input stock_action_policy clock_policy limitations")
+    require(plan["contract_version"] == REQUEST_VERSION, "bounded stock request required")
+    text(plan["account_id"])
+    scope = plan["scope"]
+    _validate_scope(scope)
     fields(plan["initial_account"], "cash_minor positions")
     integer(plan["initial_account"]["cash_minor"], 1)
     require(plan["initial_account"]["positions"] == {}, "bounded stock initial holdings must be empty")

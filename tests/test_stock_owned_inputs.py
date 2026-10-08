@@ -139,7 +139,8 @@ class StockOwnedInputTests(unittest.TestCase):
             with patch.object(source, "audit", wraps=source.audit) as audit, \
                     patch.object(source, "iter_blocks", wraps=source.iter_blocks) as blocks:
                 inputs = imported(first, source)
-                self.assertEqual(audit.call_count, 1); self.assertEqual(blocks.call_count, 1)
+                self.assertEqual(audit.call_count, 0); self.assertEqual(blocks.call_count, 0)
+                self.assertEqual(inputs._AdmittedStockInputs__market.statistics["source_admissions"], 1)
                 self.assertEqual(source._indexes, {})
                 with inputs, patch.object(source, "audit", side_effect=AssertionError("original source reopened")), \
                         patch("axiom_engine.runtime.stock_stream_inputs._CanonicalIndex", side_effect=AssertionError("scanner reused")):
@@ -206,10 +207,10 @@ class StockOwnedInputTests(unittest.TestCase):
             original = tempfile.TemporaryFile
             def temporary(*args, **kwargs):
                 value = original(*args, **kwargs); opened.append(value); return value
-            with patch("axiom_engine.runtime.stock_owned_inputs.tempfile.TemporaryFile", side_effect=temporary):
-                with self.assertRaisesRegex(ContractError, "max_owned_bytes"):
+            with patch("axiom_engine.runtime.stock_market_owner.tempfile.TemporaryFile", side_effect=temporary):
+                with self.assertRaisesRegex(ContractError, "max_market_bytes|quota"):
                     imported(manifest, max_owned_bytes=1)
-            self.assertTrue(opened[0].closed)
+            self.assertTrue(all(item.closed for item in opened))
             inputs = imported(manifest)
             with inputs.execution_scope():
                 with self.assertRaisesRegex(ContractError, "sequential"):
