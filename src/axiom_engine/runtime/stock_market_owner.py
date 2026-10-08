@@ -312,9 +312,25 @@ def _binding_inventory(market, plan, source, proof):
     known = {canonical(artifact_identity(f["artifact"])): f["file_bytes"] for f in inventory["files"] if "artifact" in f}
     if proof is not None:
         known.update(proof["sizes"])
-    files = {}
+    native = {canonical(artifact_identity(i["artifact"])): i for i in inventory.get("native_artifacts", [])}
+    if proof is not None:
+        native.update({canonical(artifact_identity(i["artifact"])): i for i in proof.get("native_artifacts", [])})
+    files = {f["manifest_uri"]: f for f in inventory["files"] if "native_view_ref" in f}
+    if proof is not None:
+        files.update({f["manifest_uri"]: f for f in proof.get("native_files", [])})
     for artifact in source._artifacts(plan):
         logical = canonical(artifact_identity(artifact))
+        if logical in native:
+            continue
+        delivery = getattr(source, "native_inventory", lambda _: None)(artifact)
+        if delivery is not None:
+            physical, binding = delivery
+            native[logical] = binding
+            for item in physical:
+                files.setdefault(item["manifest_uri"], item)
+            continue
+        if hasattr(source, "native_inventory"):
+            require(artifact not in [i["artifact"] for i in plan["market_input"]["native_inputs"]], "Native handle missing logical ref")
         path = _path(artifact, must_exist=logical not in known)
         size = known[logical] if logical in known else path.stat().st_size
         key = str(path)
@@ -324,11 +340,14 @@ def _binding_inventory(market, plan, source, proof):
         if urlparse(artifact["manifest_uri"]).fragment:
             descriptor = path.with_name("manifest.json")
             files.setdefault(str(descriptor), {"manifest_uri": str(descriptor), "file_bytes": descriptor.stat().st_size})
-    return {"files": list(files.values()), "input_bytes": sum(f["file_bytes"] for f in files.values()),
+    value = {"files": list(files.values()), "input_bytes": sum(f["file_bytes"] for f in files.values()),
         "folds": len(plan["prediction_input"]["frames"]), "declared_rows": {
             "market_rows": len(plan["scope"]["calendar"])*len(plan["scope"]["execution_universe"]),
             "prediction_rows": (len(plan["scope"]["calendar"])-1)*len(plan["scope"]["prediction_universe"])},
         "declared_scope": plan["scope"]}
+    if native:
+        value["native_artifacts"] = list(native.values())
+    return value
 
 
 def bind_stock_prediction_inputs(market, request, *, source, limits, max_signal_bytes):
@@ -404,7 +423,7 @@ def _bind(market, plan, source, limits, maximum):
                     kind, days, context = known["kind"], known["days"], known["context"]
                     index = None
                 else:
-                    path = str(_path(entry["artifact"]))
+                    path = str(source._location(entry["artifact"]))
                     source._scan_row_limits[path] = limits["max_market_rows"]; source._scan_native_scopes[path] = (plan, limits)
                     index = source._index(entry["artifact"], budget)
                     kind, days, context = _native_header(index, entry, plan)
@@ -432,6 +451,12 @@ def _bind(market, plan, source, limits, maximum):
             sizes = {canonical(artifact_identity(f["artifact"])): f["file_bytes"] for f in inventory["files"]
                      if "artifact" in f and f["artifact"] in [i["artifact"] for i in plan["market_input"]["native_inputs"] if i["role"] == "prediction_basis"]}
             proof = {"contexts": contexts, "sizes": sizes}
+            selected_artifacts = {canonical(artifact_identity(i["artifact"])) for i in plan["market_input"]["native_inputs"] if i["role"] == "prediction_basis"}
+            selected_native = [i for i in inventory.get("native_artifacts", []) if canonical(artifact_identity(i["artifact"])) in selected_artifacts]
+            if selected_native:
+                proof["native_artifacts"] = selected_native
+                refs = {i["native_view_ref"] for i in selected_native}
+                proof["native_files"] = [f for f in inventory["files"] if f.get("native_view_ref") in refs]
         frames, trade_map = _frames(source, plan, budget)
         binding_key = _input_key(plan); inventory_wire = canonical(inventory).encode()
         proof_cost = 0 if key in market._proofs else len(key)+_encoded_size(proof)+64
