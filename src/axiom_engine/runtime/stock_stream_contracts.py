@@ -41,11 +41,15 @@ def identity_view(value):
     if market is not None:
         for item in market["native_inputs"]:
             item["artifact"] = artifact_identity(item["artifact"])
-    predictions = value.get("prediction_input", value if value.get("contract_version") == "stock_prediction_input_refs_v1" else None)
+    predictions = value.get("prediction_input", value if value.get("contract_version") in ("stock_prediction_input_refs_v1", "stock_prediction_input_refs_v2") else None)
     if predictions is not None:
         for frame in predictions["frames"]:
-            for name in ("fold_spec_artifact", "model_metadata_artifact", "prediction_artifact"):
-                frame[name] = artifact_identity(frame[name])
+            if frame.get("kind") == "derived":
+                frame["signal_artifact"] = artifact_identity(frame["signal_artifact"])
+                for parent in frame["parent_inputs"].values():
+                    for name in RAW_ARTIFACTS: parent[name] = artifact_identity(parent[name])
+            else:
+                for name in RAW_ARTIFACTS: frame[name] = artifact_identity(frame[name])
     return value
 
 
@@ -132,14 +136,64 @@ def validate_manifest(manifest):
     require(market["market_ref"] == logical_ref(market, "market_ref"), "market reference mismatch")
     predictions = plan["prediction_input"]
     fields(predictions, "contract_version prediction_ref frames")
-    require(predictions["contract_version"] == "stock_prediction_input_refs_v1" and
-            type(predictions["frames"]) is list and bool(predictions["frames"]), "original prediction references required")
+    require(predictions["contract_version"] in ("stock_prediction_input_refs_v1", "stock_prediction_input_refs_v2") and
+            type(predictions["frames"]) is list and bool(predictions["frames"]), "Original prediction references required")
+    modern=predictions['contract_version']=='stock_prediction_input_refs_v2'
     for frame in predictions["frames"]:
-        fields(frame, "fold_ref fold_spec_ref model_ref feature_ref signal_run_ref fold_spec_artifact model_metadata_artifact prediction_artifact")
-        for name in ("fold_ref", "fold_spec_ref", "model_ref", "feature_ref", "signal_run_ref"):
-            digest(frame[name])
-        for name in ("fold_spec_artifact", "model_metadata_artifact", "prediction_artifact"):
-            validate_artifact_ref(frame[name])
+        if modern and frame.get('kind')=='derived':
+            fields(frame,'kind signal_run_ref signal_plan_ref score_ref implementation_ref signal_stage signal_artifact parent_inputs')
+            for name in ('signal_run_ref','signal_plan_ref','score_ref','implementation_ref'):digest(frame[name])
+            require(frame['signal_stage'] in ('daily_zscore','final'),'Derived output stage required')
+            validate_artifact_ref(frame['signal_artifact'])
+            require(type(frame['parent_inputs']) is dict and bool(frame['parent_inputs']), 'Derived parent bindings required')
+            for alias,parent in frame['parent_inputs'].items():
+                text(alias);validate_raw_binding(parent,modern=True)
+        else: validate_raw_binding(frame,modern=modern)
     require(predictions["prediction_ref"] == logical_ref(predictions, "prediction_ref"), "prediction reference mismatch")
     require(plan["request_ref"] == logical_ref(plan, "request_ref"), "request reference mismatch")
     return plan
+
+
+RAW_ARTIFACTS = ('fold_spec_artifact','model_metadata_artifact','prediction_artifact')
+RAW_BINDING = 'fold_ref fold_spec_ref model_ref feature_ref signal_run_ref fold_spec_artifact model_metadata_artifact prediction_artifact'
+
+
+def validate_raw_binding(frame, *, modern):
+    fields(frame, ('kind ' if modern else '')+RAW_BINDING)
+    if modern: require(frame['kind']=='raw','Explicit raw/derived Signal kind required')
+    for name in ('fold_ref','fold_spec_ref','model_ref','feature_ref','signal_run_ref'): digest(frame[name])
+    for name in RAW_ARTIFACTS: validate_artifact_ref(frame[name])
+
+
+def prediction_bindings(predictions):
+    """Original raw bindings, including real Derived parents, deduplicated by identity."""
+    seen=set()
+    for frame in predictions.get('frames',[]):
+        parents=frame['parent_inputs'].values() if frame.get('kind')=='derived' else [frame]
+        for parent in parents:
+            key=Document.from_dict({k:artifact_identity(parent[k]) if k in RAW_ARTIFACTS else v
+                                   for k,v in parent.items()}).identity
+            if key not in seen: seen.add(key);yield parent
+
+
+def prediction_artifacts(predictions):
+    for parent in prediction_bindings(predictions):
+        for name in RAW_ARTIFACTS: yield parent[name]
+    for frame in predictions.get('frames',[]):
+        if frame.get('kind')=='derived': yield frame['signal_artifact']
+
+
+def score_artifacts(predictions):
+    for parent in prediction_bindings(predictions): yield parent['prediction_artifact']
+    for frame in predictions.get('frames',[]):
+        if frame.get('kind')=='derived': yield frame['signal_artifact']
+
+
+def prediction_inventory(predictions, scope):
+    """Conservative pre-scan quota includes parents and saved Derived score rows."""
+    bindings=list(prediction_bindings(predictions))
+    derived=sum(frame.get('kind')=='derived' for frame in predictions.get('frames',[]))
+    # Legacy inventory is exact and unchanged. Modern inputs conservatively
+    # reserve each distinct parent/output against the full requested calendar.
+    multiplier=len(bindings)+derived if predictions.get('contract_version')=='stock_prediction_input_refs_v2' else bool(bindings)
+    return len(bindings), (len(scope['calendar'])-1)*len(scope['prediction_universe'])*multiplier

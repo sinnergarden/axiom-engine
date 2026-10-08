@@ -20,6 +20,23 @@ BINARY = {'add', 'sub', 'mul', 'divide', 'gt', 'lt', 'eq', 'and', 'or', 'calenda
 CS = {'cs_rank', 'cs_zscore', 'cs_winsorize'}
 
 
+def validate_cs_zscore_params(q):
+    """Shared explicit CS policy admission for Feature and Signal plans."""
+    fields(q, PARAMS['cs_zscore'])
+    require(q['group'] in ('session', 'industry'), 'CS group required')
+    require(q['unknown_group'] in ('missing', 'reject'), 'Unknown industry policy')
+    require(q['missing'] in ('skip', 'propagate', 'fill_zero', 'reject'), 'CS missing policy')
+    require(q['excluded'] in ('missing', 'zero_if_undefined'), 'Excluded row policy')
+    require(type(q['ddof']) is int and q['ddof'] in (0, 1), 'ddof must be 0 or 1')
+    number(q['epsilon']); require(q['epsilon'] >= 0, 'Negative epsilon')
+    require(q['constant'] in ('zero', 'missing', 'reject'), 'Constant CS policy')
+    if q['clip'] is not None:
+        require(type(q['clip']) is list and len(q['clip']) == 2, 'Clip bounds')
+        for v in q['clip']: number(v)
+        require(q['clip'][0] <= q['clip'][1], 'Reversed clip')
+    return q
+
+
 def validate_plan(plan, *, execution=False):
     require(type(plan) is FeaturePlan, 'Expected FeaturePlan')
     p = plan.to_dict()
@@ -125,13 +142,7 @@ def validate_plan(plan, *, execution=False):
             if op == 'cs_rank':
                 require(q['ties'] == 'average', 'Rank ties must be average')
             elif op == 'cs_zscore':
-                require(type(q['ddof']) is int and q['ddof'] in (0, 1), 'ddof must be 0 or 1')
-                number(q['epsilon']); require(q['epsilon'] >= 0, 'Negative epsilon')
-                require(q['constant'] in ('zero', 'missing', 'reject'), 'Constant CS policy')
-                if q['clip'] is not None:
-                    require(type(q['clip']) is list and len(q['clip']) == 2, 'Clip bounds')
-                    for v in q['clip']: number(v)
-                    require(q['clip'][0] <= q['clip'][1], 'Reversed clip')
+                validate_cs_zscore_params(q)
             else:
                 number(q['lower']); number(q['upper'])
                 require(0 <= q['lower'] <= q['upper'] <= 1 and q['interpolation'] == 'linear',

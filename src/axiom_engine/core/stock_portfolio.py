@@ -55,6 +55,12 @@ def _prediction_clock_v2(row, cutoff, available):
 def validate_stock_predictions(frame):
     """Validate saved v1/v2 neutral predictions; account admission is separate."""
     wire = frame.to_dict()
+    if wire.get('contract_version') == 'stock_prediction_run_v3':
+        from .stock_signal import validate_prediction_v3
+        return validate_prediction_v3(frame)
+    if wire.get('contract_version') == 'derived_signal_run_v1':
+        from .stock_signal import validate_derived_signal
+        return validate_derived_signal(frame)
     v2 = wire.get("contract_version") == "stock_prediction_run_v2"
     fields(wire, "contract_version signal_run_ref signal_stage score_semantics score_unit feature_ref model_ref limitations universe rows" +
            (" fold_spec_ref clock_basis" if v2 else ""))
@@ -124,13 +130,15 @@ def _plan_admitted_stock_portfolio(wire, rows, *, account, context, top_k, rules
 
 def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
     wire, rows = validate_stock_predictions(frame) if admitted is None else admitted
-    v2 = wire["contract_version"] == "stock_prediction_run_v2"
+    v2 = wire['contract_version']=='stock_prediction_run_v2'
+    derived=wire['contract_version']=='derived_signal_run_v1'
+    modern=v2 or derived or wire['contract_version']=='stock_prediction_run_v3'
     full = "stock_execution_rules" in context
     require(admitted_rules is None or (admitted is not None and full), "validated rules require private Runtime admission")
-    if full and admitted is None and not v2:
+    if full and admitted is None and not modern:
         unsigned = dict(wire); reference = unsigned.pop("signal_run_ref")
         require(Document.from_dict(unsigned).identity == reference, "Saved prediction identity mismatch")
-    if v2:
+    if modern:
         require(top_k is not None and "feature_knowledge_cutoff" in context,
                 "v2 neutral predictions only; account clock consumption is not admitted without explicit TopK and feature clock")
         if admitted is None:
@@ -138,13 +146,13 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
             require(Document.from_dict(unsigned).identity == reference, "Saved v2 prediction identity mismatch")
     fields(context, "trade_session feature_session decision_time knowledge_cutoff reference_prices commission_rate minimum_commission_minor slippage_bps account_state_version supported_security_ids supported_universe_ref" +
            (" portfolio_policy stock_execution_rules stock_execution_rules_ref" if full else " lot_size") +
-           (" feature_knowledge_cutoff" if v2 else ""))
+           (" feature_knowledge_cutoff" if modern else ""))
     session(context["trade_session"]); session(context["feature_session"])
     cutoff, decision = instant(context["knowledge_cutoff"]), instant(context["decision_time"])
     require(context["feature_session"] < context["trade_session"] and
-            cutoff == instant(context["feature_session"] + ("T21:00:00+08:00" if v2 else "T20:30:00+08:00")) and
+            cutoff == instant(context["feature_session"] + ("T21:00:00+08:00" if modern else "T20:30:00+08:00")) and
             decision == instant(context["trade_session"] + "T08:55:00+08:00"), "invalid stock decision clock")
-    feature_cutoff = instant(context["feature_knowledge_cutoff"]) if v2 else cutoff
+    feature_cutoff = instant(context["feature_knowledge_cutoff"]) if modern else cutoff
     require(feature_cutoff == instant(context["feature_session"] + "T20:30:00+08:00"), "invalid stock Feature cutoff")
     supported = context["supported_security_ids"]
     require(type(supported) is list and bool(supported) and len(set(supported)) == len(supported) and
@@ -189,9 +197,9 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
     for row in batch:
         require(instant(row["knowledge_cutoff"]) == cutoff and instant(row["available_at"]) <= decision,
                 "future/inconsistent prediction cutoff")
-        if v2:
-            require(instant(row["feature_knowledge_cutoff"]) == feature_cutoff and
-                    instant(row["simulated_model_available_at"]) < cutoff, "inconsistent v2 decision clock")
+        if modern:
+            require(instant(row['feature_knowledge_cutoff'])==feature_cutoff and
+                    (derived or instant(row['simulated_model_available_at'])<cutoff), 'Inconsistent staged decision clock')
         if full and row["member"]:
             require(listed(rule_index[0][row["security_id"]], context["feature_session"]),
                     "PIT member contradicts native stock listing interval")
@@ -210,6 +218,17 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
             "inference_cutoff": batch[0]["knowledge_cutoff"],
             "simulated_model_available_at": batch[0]["simulated_model_available_at"],
             "model_ref": wire["model_ref"], "fold_spec_ref": wire["fold_spec_ref"]}
+    elif modern:
+        result['prediction_clock']={'contract_version':'stock_signal_clock_v2',
+            'kind':'derived' if derived else 'raw','clock_basis':'declared_simulation',
+            'feature_knowledge_cutoff':batch[0]['feature_knowledge_cutoff'],
+            'inference_cutoff':batch[0]['knowledge_cutoff'],'signal_stage':wire['signal_stage']}
+        if derived:
+            result['prediction_clock'].update(parent_signal_refs=wire['parent_signal_refs'],
+                signal_plan_ref=wire['signal_plan_ref'],score_ref=wire['score_ref'],implementation_ref=wire['implementation_ref'])
+        else:
+            result['prediction_clock'].update(model_ref=wire['model_ref'],fold_spec_ref=wire['fold_spec_ref'],
+                simulated_model_available_at=batch[0]['simulated_model_available_at'],label_spec_ref=wire['label_spec_ref'])
     invalid = [row for row in eligible if not row["valid"]]
     valid_count = len(eligible) if legacy else sum(row["valid"] for row in eligible)
     if full:
@@ -302,7 +321,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         **({} if legacy else {"top_k": k}), "tie_break": "security_id_asc",
         "budget_basis": BUDGET_BASIS, "reference_budget_minor": minor(budget), "sizing": "previous_native_close",
         "score_semantics": wire["score_semantics"], "cash_check": "actual_fill_cash"})
-    identity = Document.from_dict({"contract": version, **({"frame_ref": wire["signal_run_ref"]} if v2 else {"frame": wire}), "context": context, "account": account,
+    identity = Document.from_dict({"contract": version, **({"frame_ref": wire["signal_run_ref"]} if modern else {"frame": wire}), "context": context, "account": account,
                                   **({} if legacy else {"top_k": k})}).identity
     for index, intent in enumerate(result["intents"]):
         intent.update(intent_id=identity + ":" + str(index), expected_account_version=account["version"], valid_until=context["trade_session"])

@@ -884,9 +884,8 @@ class StockInputSource:
         yield manifest["profile_input"]["artifact"]
         for entry in manifest["market_input"]["native_inputs"]:
             yield entry["artifact"]
-        for frame in manifest.get("prediction_input", {}).get("frames", []):
-            for key in ("fold_spec_artifact", "model_metadata_artifact", "prediction_artifact"):
-                yield frame[key]
+        from .stock_stream_contracts import prediction_artifacts
+        yield from prediction_artifacts(manifest.get('prediction_input',{}))
 
     def inventory(self, manifest):
         manifest = _wire(manifest)
@@ -901,11 +900,12 @@ class StockInputSource:
                 descriptor = path.with_name("manifest.json")
                 require(descriptor.is_file(), "Saved fold selector requires its original sibling manifest")
                 files.setdefault(str(descriptor), {"manifest_uri": str(descriptor), "file_bytes": descriptor.stat().st_size})
+        from .stock_stream_contracts import prediction_inventory
+        folds,prediction_rows=prediction_inventory(manifest.get('prediction_input',{}),manifest['scope'])
         return {"files": list(files.values()), "input_bytes": sum(f["file_bytes"] for f in files.values()),
-                "folds": len(manifest.get("prediction_input", {}).get("frames", [])),
+                "folds": folds,
                 "declared_rows": {"market_rows": len(manifest["scope"]["calendar"]) * len(manifest["scope"]["execution_universe"]),
-                                  "prediction_rows": ((len(manifest["scope"]["calendar"])-1) * len(manifest["scope"]["prediction_universe"])
-                                                      if manifest.get("prediction_input", {}).get("frames") else 0)},
+                                  "prediction_rows": prediction_rows},
                 "declared_scope": manifest["scope"]}
 
     def _location(self, artifact):
@@ -1063,6 +1063,13 @@ class StockInputSource:
                 if day not in prepared["trade_map"]:
                     continue
                 frame, feature = prepared["trade_map"][day]
+                if frame.get('kind')=='derived':
+                    from .stock_signal_inputs import read_derived
+                    values, refs = read_derived(self,frame,feature,budget,stage)
+                    bindings += refs
+                    indexed={(row['session'],row['security_id']):row for row in values}
+                    signals[day]=(frame['header'],indexed)
+                    continue
                 frame["spec_index"].unchanged(); frame["model_index"].unchanged()
                 binding = frame["parent_binding"]
                 if binding is not None and binding["parent_ref"] not in parent_bindings:
@@ -1190,7 +1197,10 @@ def _warmup_visibility(batch, days, universe, names):
                 require(visible, "Unavailable original stock warmup fact")
 
 
-def _frames(source, manifest, budget):
+def _frames(source, manifest, budget, *, require_coverage=True, raw_only=False):
+    if not raw_only and manifest['prediction_input']['contract_version']=='stock_prediction_input_refs_v2':
+        from .stock_signal_inputs import frames
+        return frames(source,manifest,budget)
     from .stock_schedule import _verify_model
     from ..core.stock_portfolio import instant
     calendar = manifest["scope"]["calendar"]
@@ -1221,9 +1231,19 @@ def _frames(source, manifest, budget):
             proof_stage.reserve(3*(_encoded_size(spec)+_encoded_size(model)))
             _verify_model(model)
             spec_identity = Document.from_dict(spec).identity
-        fields(header, "contract_version signal_run_ref signal_stage score_semantics score_unit feature_ref model_ref limitations universe fold_spec_ref clock_basis")
-        require(header["contract_version"] == "stock_prediction_run_v2" and
-                frame_index.unsigned_digest("signal_run_ref") == header["signal_run_ref"], "Original saved v2 signal identity mismatch")
+        modern=header.get('contract_version')=='stock_prediction_run_v3'
+        fields(header, "contract_version signal_run_ref signal_stage score_semantics score_unit feature_ref model_ref limitations universe fold_spec_ref clock_basis"+
+               (' label_spec label_spec_ref label_normalization' if modern else ''))
+        require(header['contract_version'] in (('stock_prediction_run_v2','stock_prediction_run_v3') if item.get('kind')=='raw' else ('stock_prediction_run_v2',)) and
+                frame_index.unsigned_digest('signal_run_ref')==header['signal_run_ref'], 'Original saved raw signal identity mismatch')
+        if modern:
+            from ..core.stock_signal import validate_label_spec, validate_label_normalization, _ref
+            validate_label_spec(header['label_spec']);validate_label_normalization(header['label_normalization'])
+            require(model['contract_version']=='stock_model_release_v3' and
+                    header['label_spec_ref']==_ref(header['label_spec'])==model['label_spec_ref'] and
+                    header['label_spec']==model['label_spec'] and header['label_normalization']==model['label_normalization'],
+                    'Original target/model normalization linkage mismatch')
+        else: require(model['contract_version']=='stock_model_release_v2', 'Legacy prediction requires original v2 model')
         require(header["universe"] == manifest["scope"]["prediction_universe"], "Saved fold prediction union mismatch")
         require(spec_identity == item["fold_spec_ref"] == header["fold_spec_ref"] and
                 model["model_ref"] == item["model_ref"] == header["model_ref"] and
@@ -1253,7 +1273,7 @@ def _frames(source, manifest, budget):
             require(trade not in trade_map, "Duplicate OOS trade date")
             trade_map[trade] = (frame, feature)
     required = calendar[calendar.index(manifest["scope"]["start_session"]):calendar.index(manifest["scope"]["end_session"])+1]
-    require(all(d in trade_map for d in required), "Missing required stock OOS trade date")
+    require(not require_coverage or all(d in trade_map for d in required), "Missing required stock OOS trade date")
     return frames, trade_map
 
 
@@ -1291,9 +1311,11 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
         key = str(source._location(item["artifact"]))
         source._scan_row_limits[key] = limits["max_market_rows"]
         source._scan_native_scopes[key] = (manifest, limits)
-    for frame in manifest.get("prediction_input", {}).get("frames", []):
-        source._scan_row_limits[str(_path(frame["prediction_artifact"]))] = limits["max_prediction_rows"]
-    source._prediction_paths = {str(_path(frame["prediction_artifact"])) for frame in manifest.get("prediction_input", {}).get("frames", [])}
+    from .stock_stream_contracts import score_artifacts
+    score_inputs=list(score_artifacts(manifest.get('prediction_input',{})))
+    for artifact in score_inputs:
+        source._scan_row_limits[str(_path(artifact))] = limits['max_prediction_rows']
+    source._prediction_paths={str(_path(a)) for a in score_inputs}
     source._prediction_remaining = limits["max_prediction_rows"]
     scope = manifest["scope"]; calendar = scope["calendar"]; universe = scope["execution_universe"]
     require(scope["prediction_universe"] == universe, "Full-stock prediction/execution union mismatch")
@@ -1415,12 +1437,9 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
                             require(len(checked) == len(universe), "Incomplete original saved prediction date group")
                             membership, _, member_bindings = source._native("execution", "membership", [feature], budget, reservation=stage)
                             members, member_metadata = _grid(membership, [feature], universe)
-                            for key, row in checked.items():
-                                require(row["member"] == members[key]["is_member"] and
-                                        instant(row["feature_knowledge_cutoff"]) == instant(feature+"T20:30:00+08:00") and
-                                        instant(row["knowledge_cutoff"]) == instant(row["available_at"]) == instant(feature+"T21:00:00+08:00") and
-                                        instant(row["simulated_model_available_at"]) == instant(trade_map[trade][0]["model"]["simulated_available_at"]),
-                                        "Saved prediction membership/fixed clock mismatch")
+                            from .stock_signal_inputs import validate_day
+                            validate_day(trade_map[trade][0],feature,checked,members,member_metadata,
+                                         source._prepared['native_by_day']['execution','membership',feature].content_digest)
                             prediction_rows += len(checked)
                             require(prediction_rows <= limits["max_prediction_rows"], "Stock prediction row budget exceeded")
                         finally:
@@ -1467,7 +1486,9 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
                    "prediction_ref": manifest.get("prediction_input", {}).get("prediction_ref"),
                    "profile_ref": manifest["profile_input"]["profile_ref"], "implementation_ref": implementation_ref,
                    "counts": {"input_bytes": inventory["input_bytes"], "input_files": len(inventory["files"]),
-                              "folds": len(frames), "prediction_rows": prediction_rows, "market_rows": market_rows,
+                              "folds": inventory['folds'], "prediction_rows":
+                                  limits['max_prediction_rows']-source._prediction_remaining if manifest.get('prediction_input',{}).get('contract_version')=='stock_prediction_input_refs_v2' else prediction_rows,
+                              "market_rows": market_rows,
                               "cash_actions": len(cash), "action_diagnostics": len(diagnostics), "action_blocks": len(blocks)},
                    "limitations": limitations}
         source._memory.reserve_global(("projected", "audit_receipt"), _encoded_size(receipt))
