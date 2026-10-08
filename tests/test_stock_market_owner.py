@@ -6,6 +6,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import weakref
 from unittest.mock import patch
 
 from axiom_engine.core.contracts import ContractError, Document, canonical
@@ -77,6 +78,92 @@ def bind(market, plan, **kwargs):
 
 
 class StockMarketOwnerTests(unittest.TestCase):
+    def test_current_membership_block_only_cross_block_exact_and_failure_retirement(self):
+        from datetime import date, timedelta
+        from test_csi300 import BOARD_IDS, rules_for
+        from test_csi300_runtime import full_request
+        from test_stock_stream_inputs import source_fixture
+        from axiom_engine.runtime.stock_market_owner import AdmittedStockMarket
+        from axiom_engine.runtime.stock_stream_inputs import _DecodedStage
+        class WeakMap(dict):
+            pass
+        limits = {**LIMITS, "max_block_bytes": 2_000_000}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            days = [(date(2023, 12, 29)+timedelta(days=i)).isoformat() for i in range(28)
+                    if (date(2023, 12, 29)+timedelta(days=i)).weekday() < 5]
+            boards = {security: board for board, security in BOARD_IDS.items()}
+            boards.update({"cnstock.000101.SZ.20000101": "SZSE_MAIN", "cnstock.000102.SZ.20000101": "SZSE_MAIN"})
+            first = source_fixture(root, full_request(rules=rules_for(boards=boards, days=days)).to_dict())[0]
+            second = different_signal(root/"second", first)
+            bad = different_signal(root/"bad", first, change=lambda f: f["rows"][-1].update(
+                available_at=f["rows"][-1]["session"]+"T22:00:00+08:00"))
+            expected, projection, _ = execute(root/"out", second, limits=limits, block_sessions=8)
+            shutil.rmtree(root/"out")
+            with admit_stock_market_inputs(StockMarketSpec.from_request(BacktestRequest.from_dict(first)),
+                    source=StockInputSource(), block_sessions=8, limits=limits, max_market_bytes=2_000_000) as market:
+                with bind(market, first, limits=limits):
+                    pass  # Pair proof is already admitted; measure only Signal binding.
+                loads, tracked, retired = [], {}, []
+                actual_view, actual_close = AdmittedStockMarket._native_view, _DecodedStage.close
+                def view(owner, kind, selected, memory, budget, reservation):
+                    if kind == "membership":
+                        self.assertFalse(tracked, "previous membership block still charged before next decode")
+                    value = actual_view(owner, kind, selected, memory, budget, reservation)
+                    if kind == "membership":
+                        value = WeakMap(value)
+                        value["records"] = [WeakMap(r) for r in value["records"]]
+                        tracked[id(reservation)] = [weakref.ref(value)]+[weakref.ref(r) for r in value["records"]]
+                        loads.append(tuple(selected))
+                    return value
+                def close(stage):
+                    if id(stage) in tracked:
+                        self.assertTrue(all(ref() is None for ref in tracked.pop(id(stage))), "membership borrower outlived its budget")
+                        retired.append(id(stage))
+                    return actual_close(stage)
+                with patch.object(AdmittedStockMarket, "_native_view", view), patch.object(_DecodedStage, "close", close):
+                    with self.assertRaises(ContractError):
+                        bind(market, bad, limits=limits)
+                    self.assertFalse(tracked)
+                    self.assertEqual(market.statistics["signal_borrows"], 0)
+                    loads.clear()
+                    with bind(market, second, limits=limits) as inputs:
+                        self.assertEqual(loads, [tuple(days[i:i+8]) for i in range(0, len(days), 8)])
+                        self.assertFalse(tracked)
+                        wire, actual = run_owned(root/"out", second, inputs, limits=limits, block_sessions=8)
+                        self.assertEqual(wire, expected)
+                        self.assertEqual(actual.rows, projection.rows)
+                self.assertTrue(retired)
+
+    def test_combined_private_read_counters_equal_observed_market_and_signal_reads(self):
+        from axiom_engine.runtime.stock_market_owner import _Store
+        from axiom_engine.runtime.stock_owned_inputs import AdmittedStockInputs
+        from test_stock_owned_inputs import imported
+        actual_market, actual_signal = _Store.read, AdmittedStockInputs._AdmittedStockInputs__read
+        observed = {"owned_read_bytes": 0, "owned_record_decodes": 0}
+        def market_read(store, number, memory, budget):
+            value = actual_market(store, number, memory, budget)
+            observed["owned_read_bytes"] += store.offsets[2*number+1]
+            observed["owned_record_decodes"] += 1
+            return value
+        def signal_read(inputs, number, budget):
+            value = actual_signal(inputs, number, budget)
+            observed["owned_read_bytes"] += inputs._AdmittedStockInputs__offsets[2*number+1]
+            observed["owned_record_decodes"] += 1
+            return value
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); first = request_for(root)
+            with patch.object(_Store, "read", market_read), \
+                    patch.object(AdmittedStockInputs, "_AdmittedStockInputs__read", signal_read), imported(first) as inputs:
+                self.assertEqual({k: inputs.statistics[k] for k in observed}, observed)
+                before = dict(observed)
+                with patch("axiom_engine.runtime.stock_stream_inputs._CanonicalIndex", side_effect=AssertionError("native reopened")):
+                    run_owned(root/"out", first, inputs)
+                self.assertEqual({k: inputs.statistics[k] for k in observed}, observed)
+                self.assertEqual(observed["owned_record_decodes"]-before["owned_record_decodes"],
+                                 2*(1+inputs.statistics["owned_blocks"]))
+            self.assertEqual({k: inputs.statistics[k] for k in observed}, observed)
+
     def test_market_before_signal_and_two_distinct_signals_scan_market_once_and_match_full_oracles(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); first = request_for(root); second = different_signal(root/"second", first)

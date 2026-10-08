@@ -184,6 +184,7 @@ class AdmittedStockMarket:
     def _read(self, number, memory, budget):
         self._assert_lease()
         value, stage = self._store.read(number, memory, budget)
+        self._statistics["owned_read_bytes"] += self._store.offsets[2*number+1]
         self._statistics["owned_record_decodes"] += 1
         return value, stage
 
@@ -193,10 +194,15 @@ class AdmittedStockMarket:
     def _market_block(self, number, memory, budget):
         return self._read(self._blocks[number], memory, budget)
 
-    def _native_view(self, kind, days, memory, budget, reservation):
-        days = tuple(days)
+    def _native_key(self, kind, days):
+        self._check()
         selected = next((key for key in self._native if key[0] == kind and set(days) <= set(key[1])), None)
         require(selected is not None, "Missing admitted original market view")
+        return selected
+
+    def _native_view(self, kind, days, memory, budget, reservation):
+        days = tuple(days)
+        selected = self._native_key(kind, days)
         value, stage = self._read(self._native[selected], memory, budget)
         try:
             view = value["view"]
@@ -288,7 +294,8 @@ def admit_stock_market_inputs(spec, *, source, block_sessions, limits, max_marke
                 "source_operations": source.statistics["source_operations"],
                 "source_decoded_bytes_peak": source.statistics["decoded_bytes_peak"],
                 "source_scalar_cache_evictions": source.statistics["scalar_cache_evictions"],
-                "owned_record_decodes": 0, "basis_pairings": 0, "basis_reuses": 0, "signal_bindings": 0}
+                "owned_read_bytes": 0, "owned_record_decodes": 0,
+                "basis_pairings": 0, "basis_reuses": 0, "signal_bindings": 0}
             return AdmittedStockMarket(_TOKEN, store, key, plan["scope"]["calendar"], block_sessions,
                                        native, blocks, meta, inventory_wire, stats)
     except (KeyError, IndexError, TypeError, OSError) as exc:
@@ -364,6 +371,20 @@ def _bind(market, plan, source, limits, maximum):
         source._scan_row_limits[path] = limits["max_prediction_rows"]; source._prediction_paths.add(path)
     meta, meta_stage = market._globals(source._memory, budget)
     store = None
+    member_key = member_stage = member_view = members = member_metadata = None
+    def membership_for(feature):
+        nonlocal member_key, member_stage, member_view, members, member_metadata
+        selected = market._native_key("membership", [feature])
+        if selected != member_key:
+            # Retire every borrower before releasing the previous block's charge.
+            member_view = members = member_metadata = None
+            if member_stage is not None:
+                member_stage.close()
+            member_stage = source._memory.stage()
+            member_view = market._native_view("membership", selected[1], source._memory, budget, member_stage)
+            member_stage.reserve(64*(len(member_view["records"])+sum(len(f["by_key"]) for f in member_view["field_meta"].values())))
+            members, member_metadata = _grid(member_view, selected[1], universe)
+            member_key = selected
     try:
         require(meta["implementation_ref"] == IMPLEMENTATION_REF, "Admitted stock implementation differs")
         validate_top_k(plan["portfolio_policy"]["top_k"], universe)
@@ -445,8 +466,7 @@ def _bind(market, plan, source, limits, maximum):
                         validation.reserve(3*(_encoded_size(frame["header"])+sum(_encoded_size(r) for r in rows)+32))
                         wire, checked = validate_stock_predictions(StockPredictionFrame.from_dict({**frame["header"], "rows": rows}))
                         require(len(checked) == len(universe), "Incomplete original saved prediction date group")
-                        membership = market._native_view("membership", [feature], source._memory, budget, validation)
-                        members, metadata = _grid(membership, [feature], universe)
+                        membership_for(feature)
                         for row_key, row in checked.items():
                             require(row["member"] == members[row_key]["is_member"] and
                                 instant(row["feature_knowledge_cutoff"]) == instant(feature+"T20:30:00+08:00") and
@@ -455,10 +475,10 @@ def _bind(market, plan, source, limits, maximum):
                                 "Saved prediction membership/fixed clock mismatch")
                         prediction_rows += len(checked)
                         require(prediction_rows <= limits["max_prediction_rows"], "Stock prediction row budget exceeded")
-                        wire = checked = membership = members = metadata = row = None
+                        wire = checked = row = None
                     stage.reserve(64*len(rows)+512)
                     signals.append({"session": trade, "header": frame["header"], "rows": rows})
-                    wire = checked = membership = members = metadata = row = refs = None
+                    wire = checked = row = refs = None
                 stage.reserve(512)
                 store.write({"sessions": list(days), "signals": signals, "bindings": bindings}, source._memory)
                 signals = bindings = rows = None
@@ -499,6 +519,9 @@ def _bind(market, plan, source, limits, maximum):
         store = None
         return result
     finally:
+        member_view = members = member_metadata = None
+        if member_stage is not None:
+            member_stage.close()
         meta_stage.close()
         if store is not None:
             store.close()

@@ -31,10 +31,10 @@ def imported(manifest, source=None, **kwargs):
         block_sessions=2, limits=LIMITS, max_owned_bytes=kwargs.pop("max_owned_bytes", 2_000_000), **kwargs)
 
 
-def run_owned(root, manifest, inputs, limits=LIMITS):
+def run_owned(root, manifest, inputs, limits=LIMITS, *, block_sessions=2):
     sink = StockResultSink(root/"parts", run_id=stock_run_id(manifest))
     result = run_stock_backtest(BacktestRequest.from_dict(manifest), source=inputs,
-        sink=sink, block_sessions=2, limits=limits)
+        sink=sink, block_sessions=block_sessions, limits=limits)
     save_backtest_run(result, root/"run.json")
     projection = load_stock_backtest_projection(root/"run.json",
         artifact_reader=lambda ref: Path(ref["manifest_uri"]), limits=limits)
@@ -142,6 +142,7 @@ class StockOwnedInputTests(unittest.TestCase):
                 self.assertEqual(audit.call_count, 0); self.assertEqual(blocks.call_count, 0)
                 self.assertEqual(inputs._AdmittedStockInputs__market.statistics["source_admissions"], 1)
                 self.assertEqual(source._indexes, {})
+                before_decode = inputs.statistics["owned_record_decodes"]
                 with inputs, patch.object(source, "audit", side_effect=AssertionError("original source reopened")), \
                         patch("axiom_engine.runtime.stock_stream_inputs._CanonicalIndex", side_effect=AssertionError("scanner reused")):
                     for i, item in enumerate(cases):
@@ -150,7 +151,7 @@ class StockOwnedInputTests(unittest.TestCase):
                         self.assertEqual(projection.rows, expected[i][1])
                 self.assertEqual(inputs.statistics["source_admissions"], 1)
                 self.assertEqual(inputs.statistics["account_bindings"], 3)
-                self.assertEqual(inputs.statistics["owned_record_decodes"], 3*(1+inputs.statistics["owned_blocks"]))
+                self.assertEqual(inputs.statistics["owned_record_decodes"]-before_decode, 6*(1+inputs.statistics["owned_blocks"]))
             self.assertNotEqual(expected[0][0]["final_account"], expected[1][0]["final_account"])
             self.assertEqual(expected[0][0]["signal_ref"], expected[1][0]["signal_ref"])
 

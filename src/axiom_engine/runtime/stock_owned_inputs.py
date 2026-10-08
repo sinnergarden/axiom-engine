@@ -64,7 +64,8 @@ class AdmittedStockInputs(StockInputSource):
             value["source_operations"] = {name: (max(left.get(name, 0), right.get(name, 0))
                 if name == "cjson_peak_tree_rss_bytes" else left.get(name, 0)+right.get(name, 0))
                 for name in left.keys() | right.keys()}
-            for name in ("source_audit_seconds", "capture_seconds", "owned_bytes", "source_scalar_cache_evictions"):
+            for name in ("source_audit_seconds", "capture_seconds", "owned_bytes", "source_scalar_cache_evictions",
+                         "owned_read_bytes", "owned_record_decodes"):
                 value[name] += shared[name]
             for name in ("source_decoded_bytes_peak", "max_owned_decoded_bytes"):
                 value[name] = max(value[name], shared["source_decoded_bytes_peak"])
