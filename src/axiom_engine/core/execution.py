@@ -13,7 +13,7 @@ from .plan import CS, validate_plan
 @dataclass(frozen=True)
 class _Cell:
     value: object
-    available: str | None
+    available: str | int | None
     sources: tuple
     issues: tuple = ()
     reason: str | None = None
@@ -47,13 +47,29 @@ def _key_list(values):
     return keys
 
 
-def _cells(row, columns, source_ids):
+_INPUT_TIMESTAMP_CACHE_LIMIT = 128
+
+
+def _timestamp_once(value, checked):
+    # Only successfully admitted, exact strings enter this call-local memo.
+    # Each is exactly 20 characters; capacity and borrowed-key storage are bounded.
+    if type(value) is str and value in checked:
+        return
+    timestamp(value)
+    if len(checked) == _INPUT_TIMESTAMP_CACHE_LIMIT:
+        del checked[next(iter(checked))]
+    checked[value] = None
+
+
+def _cells(row, columns, source_ids, *, _timestamps=None):
     size = len(columns)
     for k in ('values', 'availability', 'sources', 'missing_reasons'):
         require(type(row[k]) is list and len(row[k]) == size, 'Missing/misaligned row columns')
     out = []
     for v, a, refs, reason, col in zip(row['values'], row['availability'], row['sources'], row['missing_reasons'], columns):
-        check_value(v, col); timestamp(a)
+        check_value(v, col)
+        if _timestamps is None: timestamp(a)
+        else: _timestamp_once(a, _timestamps)
         require(type(refs) is list and bool(refs) and all(type(s) is str and s in source_ids for s in refs),
                 'Unbound cell source')
         require(len(refs) == len(set(refs)), 'Duplicate cell source')
@@ -64,6 +80,13 @@ def _cells(row, columns, source_ids):
         out.append(_Cell(float(v) if col['dtype'] == 'float64' and v is not None else v,
                          a, tuple(sorted(refs)), (), reason))
     return out
+
+
+def _reference_members_by_day(refs):
+    members = {}
+    for key, row in refs.items():
+        if row['member']: members.setdefault(key[1], {})[key[0]] = row['industry']
+    return members
 
 
 def _inputs(p, facts, context):
@@ -81,13 +104,15 @@ def _inputs(p, facts, context):
     require(type(sessions) is list and bool(sessions), 'Explicit calendar sessions required')
     for s in sessions: session(s)
     require(sessions == sorted(set(sessions)), 'Calendar sessions must be sorted and unique')
+    session_positions = {s: i for i, s in enumerate(sessions)}
+    checked_timestamps = {}
     require(type(c['cutoffs']) is dict and set(c['cutoffs']) == set(sessions), 'Every session needs its own cutoff')
-    for t in c['cutoffs'].values(): timestamp(t)
+    for t in c['cutoffs'].values(): _timestamp_once(t, checked_timestamps)
     require(list(c['cutoffs'][s] for s in sessions) == sorted(c['cutoffs'][s] for s in sessions), 'Cutoffs must be monotonic')
     history, outputs = _key_list(c['history_keys']), _key_list(c['output_keys'])
     history_set = set(history)
     require(bool(history) and bool(outputs) and set(outputs) <= history_set, 'Output/history coverage')
-    require(all(k[1] in sessions for k in history), 'Unknown session')
+    require(all(k[1] in session_positions for k in history), 'Unknown session')
     history = sorted(history)
     source_ids = {s['id'] for s in p['sources']}
     require(type(f['rows']) is list, 'Rows must be array')
@@ -96,7 +121,7 @@ def _inputs(p, facts, context):
         fields(r, 'security_id session values availability sources missing_reasons')
         key = _key(r)
         require(key not in rows, 'Duplicate fact key')
-        cells = _cells(r, f['schema'], source_ids)
+        cells = _cells(r, f['schema'], source_ids, _timestamps=checked_timestamps)
         require(key in history_set, 'Undeclared fact key')
         cutoff = c['cutoffs'][key[1]]
         rows[key] = [_Cell(None, v.available, v.sources, ('UNAVAILABLE_AT_SESSION_CUTOFF',), 'UNAVAILABLE')
@@ -106,7 +131,7 @@ def _inputs(p, facts, context):
     for key in history: by_security.setdefault(key[0], []).append(key)
     if p['observation_domain'] == 'sessions':
         for keys in by_security.values():
-            start, end = sessions.index(keys[0][1]), sessions.index(keys[-1][1])
+            start, end = session_positions[keys[0][1]], session_positions[keys[-1][1]]
             require([k[1] for k in keys] == sessions[start:end+1], 'MISSING_SESSION: history cannot compress calendar gaps')
     refs = {}
     require(type(c['reference']) is list, 'Explicit reference rows required')
@@ -116,12 +141,13 @@ def _inputs(p, facts, context):
         require(key not in refs and key in rows, 'Duplicate/undeclared reference key')
         require(type(r['member']) is bool, 'Membership must be explicit bool')
         require(r['industry'] is None or type(r['industry']) is str and bool(r['industry'].strip()), 'Industry must be string or null')
-        timestamp(r['available_at'])
+        _timestamp_once(r['available_at'], checked_timestamps)
         require(r['available_at'] <= c['cutoffs'][key[1]] and r['source'] in source_ids, 'Unavailable/unbound reference')
         refs[key] = r
     require(set(refs) == history_set, 'Complete frozen reference mask required for history')
+    members_by_day = _reference_members_by_day(refs)
     for day in {k[1] for k in history}:
-        actual = {k[0]: r['industry'] for k, r in refs.items() if k[1] == day and r['member']}
+        actual = members_by_day.get(day, {})
         require(day in p['reference_members'] and actual == p['reference_members'][day],
                 'INCOMPLETE_REFERENCE: members/industry differ from frozen plan')
     events = {name: {} for name in p['event_schema']}
@@ -134,7 +160,7 @@ def _inputs(p, facts, context):
         session(e['event_session']); session(e['report_period'])
         ident = (e['stream'], e['security_id'], e['event_id'])
         require(ident not in seen_ids, 'Duplicate event ID'); seen_ids.add(ident)
-        cells = _cells(e, p['event_schema'][e['stream']], source_ids)
+        cells = _cells(e, p['event_schema'][e['stream']], source_ids, _timestamps=checked_timestamps)
         stream = events[e['stream']].setdefault(e['security_id'], [])
         require(all(x[0] != e['event_session'] for x in stream), 'Ambiguous event date: Data must resolve fixed stream')
         stream.append((e['event_session'], e['report_period'], cells))
@@ -163,6 +189,7 @@ def _required_cells(p, outputs, by_security, refs, reference_index):
     positions = {k: i for keys in by_security.values() for i, k in enumerate(keys)}
     pending = [(o['node'], k) for o in p['outputs'] for k in outputs]
     seen = set()
+    expanded_cs = set()
     needed = {name: set() for name in nodes}
     while pending:
         name, key = pending.pop()
@@ -186,9 +213,14 @@ def _required_cells(p, outputs, by_security, refs, reference_index):
                 dependencies = history[max(0, start):end]
         elif op in CS:
             industry = refs[key]['industry']
-            reference_keys = (by_session[key[1]] if q['group'] == 'session' else
-                              by_industry[(key[1], industry)] if industry is not None else ())
-            dependencies += [k for k in reference_keys if refs[k]['member']]
+            group = (name, key[1], industry if q['group'] == 'industry' else '')
+            if group not in expanded_cs:
+                expanded_cs.add(group)
+                reference_keys = (by_session[key[1]] if q['group'] == 'session' else
+                                  by_industry[(key[1], industry)] if industry is not None else ())
+                dependencies += [k for k in reference_keys if refs[k]['member']]
+            # The first expansion drains all group parents before another key
+            # of this node is visited. Each key still needs its own parent.
         for parent in n['inputs']:
             pending.extend((parent, k) for k in dependencies)
     return needed
@@ -211,6 +243,23 @@ def _std(vals, ddof):
     # statistics retains exact ratios until its scaled square root: no float
     # intermediate squared deviations to underflow for representable small std.
     return statistics.pstdev(vals) if ddof == 0 else statistics.stdev(vals)
+
+
+def _cs_zscore_scale(vals, q):
+    """Shared ordered scale calculation for row-wire and packed CS inputs."""
+    std = _std(vals, q['ddof']) if vals else None
+    return std, std is None or std == 0 or std < q.get('epsilon', 0)
+
+
+def _cs_zscore_value(x, vals, std, undefined, q, mean):
+    """Keep the original arithmetic and lazily calculate a group's mean once."""
+    if undefined:
+        require(q['constant'] != 'reject', 'UNDEFINED_CS_SCALE')
+        value = 0.0 if x is not None and q['constant'] == 'zero' else None
+    else:
+        if mean is None: mean = math.fsum(vals) / len(vals)
+        value = (x - mean) / std
+    return value, mean
 
 
 def _quantile(vals, q):
@@ -260,10 +309,8 @@ def _element(op, cells, q):
     return _merge(value, cells)
 
 
-def _rolling(cells, q):
-    vals = [c.value for c in cells if c.value is not None]
-    if len(vals) < q['min_periods'] or q['missing'] == 'propagate' and len(vals) != len(cells):
-        return _merge(None, cells, 'WINDOW_MISSING')
+def _rolling_value(vals, last, q):
+    """The original ordered reduction; provenance is merged by each view."""
     op = q['reduction']
     if op == 'mean': value = math.fsum(vals) / len(vals)
     elif op == 'sum': value = math.fsum(vals)
@@ -271,11 +318,24 @@ def _rolling(cells, q):
     elif op == 'max': value = max(vals)
     elif op == 'median': value = statistics.median(vals)
     elif op == 'std': value = _std(vals, q['ddof'])
-    else: value = _rank(cells[-1].value, vals) if cells[-1].value is not None else None
+    else: value = _rank(last, vals) if last is not None else None
+    return value
+
+
+def _rolling(cells, q, *, reuse=None, scope=None, node_index=None, source_name=None):
+    vals = [c.value for c in cells if c.value is not None]
+    if len(vals) < q['min_periods'] or q['missing'] == 'propagate' and len(vals) != len(cells):
+        return _merge(None, cells, 'WINDOW_MISSING')
+    args = (vals, cells[-1].value, q)
+    if reuse is not None and q['reduction'] == 'std':
+        value = reuse.evaluate('rolling.std', node_index, scope, cells, _rolling_value, args,
+                               source_name=source_name)
+    else:
+        value = _rolling_value(*args)
     return _merge(value, cells)
 
 
-def _cross_section(op, source, keys, refs, q, reference_index):
+def _cross_section(op, source, keys, refs, q, reference_index, *, reuse=None, node_index=None, source_name=None):
     groups = {}
     for key in keys:
         r = refs[key]
@@ -298,8 +358,16 @@ def _cross_section(op, source, keys, refs, q, reference_index):
         if q['missing'] == 'fill_zero': vals = [0.0 if v is None else v for v in vals]
         vals = [v for v in vals if v is not None]
         blocked = absent and q['missing'] == 'propagate'
-        std = _std(vals, q['ddof']) if op == 'cs_zscore' and vals else None
-        undefined = std is None or std == 0 or std < q.get('epsilon', 0)
+        if op == 'cs_zscore':
+            std, undefined = (_cs_zscore_scale(vals, q) if reuse is None else
+                reuse.evaluate('cs_zscore.scale', node_index, reference_keys, deps,
+                               _cs_zscore_scale, (vals, q), refs=refs,
+                               source_name=source_name, dependency_scope=eligible))
+        else:
+            std, undefined = None, True
+        eligible = set(eligible)
+        group_dependency = _merge(None, deps + refs_cells)
+        mean = None
         for key in group_keys:
             x = source[key].value
             if x is None and q['missing'] == 'fill_zero': x = 0.0
@@ -307,19 +375,15 @@ def _cross_section(op, source, keys, refs, q, reference_index):
             if key in eligible and vals and not blocked and x is not None:
                 if op == 'cs_rank': value = _rank(x, vals)
                 elif op == 'cs_winsorize': value = min(max(x, _quantile(vals, q['lower'])), _quantile(vals, q['upper']))
-                elif undefined:
-                    require(q['constant'] != 'reject', 'UNDEFINED_CS_SCALE')
-                    value = 0.0 if q['constant'] == 'zero' else None
-                else: value = (x - math.fsum(vals)/len(vals)) / std
+                else: value, mean = _cs_zscore_value(x, vals, std, undefined, q, mean)
             elif op == 'cs_zscore' and key in eligible and not blocked and undefined:
-                require(q['constant'] != 'reject', 'UNDEFINED_CS_SCALE')
-                if x is not None and q['constant'] == 'zero': value = 0.0
+                value, mean = _cs_zscore_value(x, vals, std, undefined, q, mean)
             if op == 'cs_zscore' and key not in eligible and q['excluded'] == 'zero_if_undefined' and source[key].value is not None:
                 # R0 industry mask: excluded rows have unmapped (missing) scale.
                 value = 0.0
             if op == 'cs_zscore' and value is not None and q['clip'] is not None:
                 value = min(max(value, q['clip'][0]), q['clip'][1])
-            out[key] = _merge(value, deps + refs_cells + [source[key]], 'REFERENCE_MISSING')
+            out[key] = _merge(value, [group_dependency, source[key]], 'REFERENCE_MISSING')
     return out
 
 
@@ -330,19 +394,28 @@ def execute_feature_plan(plan, facts, context):
     values always use their own session cutoffs, including rolling dependencies.
     Caller supplies a complete bound reference universe, even for one output key.
     """
+    return _execute_feature_plan(plan, facts, context)
+
+
+def _execute_feature_plan(plan, facts, context, *, reuse=None, profile=None):
+    """The shared execution path; only call-local numeric reuse is optional."""
     p = validate_plan(plan, execution=True)
     c, keys, outputs, rows, by_security, refs, events = _inputs(p, facts, context)
+    if profile is not None:
+        profile.observe(p, c, keys, outputs)
+        reuse.begin_view(profile.universe)
     reference_index = _reference_index(refs)
     needed = _required_cells(p, outputs, by_security, refs, reference_index)
     positions = {k: i for security_keys in by_security.values() for i, k in enumerate(security_keys)}
     env = {col['name']: {k: rows[k][i] for k in keys} for i, col in enumerate(p['input_schema'])}
-    for n in p['nodes']:
+    for node_index, n in enumerate(p['nodes']):
         op, q, args = n['op'], n['params'], n['inputs']
         node_keys = sorted(needed[n['name']])
         if not node_keys:
             continue
         if op in CS:
-            out = _cross_section(op, env[args[0]], node_keys, refs, q, reference_index)
+            out = _cross_section(op, env[args[0]], node_keys, refs, q, reference_index,
+                                 reuse=reuse, node_index=node_index, source_name=args[0])
         elif op in ('shift', 'pct_change', 'rolling'):
             out = {}
             source = env.get(args[0], {})
@@ -359,7 +432,9 @@ def execute_feature_plan(plan, facts, context):
                 else:
                     end = i + int(q['inclusive_current'])
                     start = max(0, end - q['window'])
-                    out[key] = _rolling([source[k] for k in security_keys[start:end]], q)
+                    window = security_keys[start:end]
+                    out[key] = _rolling([source[k] for k in window], q, reuse=reuse,
+                                        scope=window, node_index=node_index, source_name=args[0])
         elif op == 'asof':
             columns = p['event_schema'][q['stream']]
             ix = next(i for i, col in enumerate(columns) if col['name'] == q['field'])

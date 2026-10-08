@@ -44,8 +44,10 @@ def _admit(manifest, source, block_sessions, limits):
 
 def audit_stock_backtest_source(manifest, *, source, block_sessions: int, limits: dict) -> dict:
     """Complete this call's fixed source audit without creating an account."""
-    _, audit, _ = _admit(manifest, source, block_sessions, limits)
-    return audit.receipt
+    require(isinstance(source, StockInputSource), "StockInputSource required")
+    with source.execution_scope():
+        _, audit, _ = _admit(manifest, source, block_sessions, limits)
+        return audit.receipt
 
 
 class _BlockCursor:
@@ -56,6 +58,12 @@ class _BlockCursor:
         self._offset = 0
         self._block = None
         self._day = None
+
+    def close(self):
+        self._block = None
+        close = getattr(self._blocks, "close", None)
+        if close is not None:
+            close()
 
     def day(self, day):
         if self._day == day:
@@ -258,6 +266,13 @@ class _StreamStorage:
 def run_stock_backtest(manifest: BacktestRequest, *, source: StockInputSource,
                        sink: StockResultSink, block_sessions: int, limits: dict) -> BacktestRun:
     """Audit fixed input fully, then use the existing Core/SimBroker/ledger loop."""
+    require(isinstance(source, StockInputSource), "StockInputSource required")
+    with source.execution_scope():
+        return _run_stock_backtest(manifest, source=source, sink=sink,
+                                   block_sessions=block_sessions, limits=limits)
+
+
+def _run_stock_backtest(manifest, *, source, sink, block_sessions, limits):
     plan, audit, limits = _admit(manifest, source, block_sessions, limits)
     require(isinstance(sink, StockResultSink) and sink.run_id == stock_run_id(plan),
             "fresh result sink bound to this stock run required")
@@ -273,9 +288,12 @@ def run_stock_backtest(manifest: BacktestRequest, *, source: StockInputSource,
     admitted = (execution_plan, signal, _Signals(cursor), audit.globals["market_header"],
                 audit.globals["calendar"], _Rows(cursor), audit.globals["profile"])
     storage = _StreamStorage(plan, audit, sink, limits)
-    with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
-        result = _run(manifest, admitted=admitted, storage=storage)
-    # A blocked account may stop before the source tail, already audited first.
-    if result.to_dict()["status"] == "COMPLETE":
-        cursor.finish()
-    return result
+    try:
+        with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
+            result = _run(manifest, admitted=admitted, storage=storage)
+        # A blocked account may stop before the source tail, already audited first.
+        if result.to_dict()["status"] == "COMPLETE":
+            cursor.finish()
+        return result
+    finally:
+        cursor.close()

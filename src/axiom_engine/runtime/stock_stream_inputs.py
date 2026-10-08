@@ -5,6 +5,8 @@ DataBatch/PredictionFrame: byte spans remain bound to the original parent.
 No supplier, Research loader, training or account execution belongs here.
 """
 from array import array
+from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass
 import hashlib
 import json
@@ -40,12 +42,13 @@ def _budget(value):
 
 class _DecodedMemory:
     """Canonical byte-volume accounting, separate from RSS and compact indexes."""
-    def __init__(self, limit):
+    def __init__(self, limit, *, scalar_cache_bytes=0):
         self.limit = limit
         self.globals = {}
         self.global_bytes = 0
         self.temporary_bytes = 0
         self.peak_bytes = 0
+        self.scalar_cache = _ScalarCache(self, scalar_cache_bytes)
 
     @property
     def available(self):
@@ -55,12 +58,14 @@ class _DecodedMemory:
         if key in self.globals:
             require(self.globals[key] == size, "Conflicting decoded cache reservation")
             return
+        self.make_room(size)
         require(size <= self.available, "Stock cumulative decoded budget exceeded before cache allocation")
         self.globals[key] = size; self.global_bytes += size
         self.peak_bytes = max(self.peak_bytes, self.global_bytes + self.temporary_bytes)
 
     def replace_global(self, key, size):
         old = self.globals.get(key, 0)
+        self.make_room(size-old)
         require(size-old <= self.available, "Stock cumulative decoded budget exceeded before state growth")
         self.globals[key] = size; self.global_bytes += size-old
         self.peak_bytes = max(self.peak_bytes, self.global_bytes + self.temporary_bytes)
@@ -71,6 +76,55 @@ class _DecodedMemory:
     def stage(self):
         return _DecodedStage(self)
 
+    def make_room(self, size):
+        # Optional scalar reuse never steals space from required input growth.
+        self.scalar_cache.make_room(size)
+
+
+class _ScalarCache:
+    """Bounded immutable literals, each admitted by the original scalar path.
+
+    This is only an optimization within this source admission. Exact raw bytes
+    are the keys; no document, row, ordering or Unknown validation is skipped.
+    """
+    def __init__(self, memory, limit):
+        self.memory = memory
+        self.limit = limit
+        self.entries = OrderedDict()
+        self.used = 0
+        self.evictions = 0
+
+    def _evict(self):
+        raw, (_, size) = self.entries.popitem(last=False)
+        self.used -= size
+        self.memory.release_global(("scalar_literal", raw))
+        self.evictions += 1
+
+    def make_room(self, size):
+        while self.entries and size > self.memory.available:
+            self._evict()
+
+    def get(self, raw):
+        entry = self.entries.get(raw)
+        if entry is None:
+            return False, None
+        self.entries.move_to_end(raw)
+        return True, entry[0]
+
+    def put(self, raw, value):
+        # Bound encoded key/value volume plus conservative per-entry overhead.
+        size = 2*len(raw)+128
+        if size > self.limit:
+            return
+        while self.entries and self.used+size > self.limit:
+            self._evict()
+        self.make_room(size)
+        if size > self.memory.available:
+            return
+        self.memory.reserve_global(("scalar_literal", raw), size)
+        self.entries[raw] = value, size
+        self.used += size
+
 
 class _DecodedStage:
     def __init__(self, memory):
@@ -78,6 +132,7 @@ class _DecodedStage:
         self.used = 0
 
     def reserve(self, size):
+        self.memory.make_room(size)
         require(size <= self.memory.available, "Stock cumulative decoded budget exceeded before temporary growth")
         self.memory.temporary_bytes += size; self.used += size
         self.memory.peak_bytes = max(self.memory.peak_bytes,
@@ -164,6 +219,7 @@ class _CanonicalIndex:
             "read_calls": 0, "scan_read_bytes": 0, "read_seconds": 0.0, "hash_seconds": 0.0,
             "content_hash_bytes": 0, "file_hash_bytes": 0,
             "scalar_count": 0, "scalar_batches": 0, "scalar_bytes": 0,
+            "scalar_cache_hits": 0, "scalar_decode_count": 0, "scalar_canonical_count": 0,
             "scalar_decode_seconds": 0.0, "scalar_canonical_seconds": 0.0,
             "row_decode_count": 0, "row_decode_seconds": 0.0,
             "reread_bytes": 0, "reread_calls": 0,
@@ -230,6 +286,7 @@ class _CanonicalIndex:
             if self._stream.tell() == self.size:
                 return None
             # Bound each allocation before read, including at EOF.
+            self._memory.make_room(min(65536, self.budget["max_read_bytes"]))
             count = min(65536, self.budget["max_read_bytes"], self._memory.available)
             require(count > 0, "Stock cumulative decoded budget exceeded before scan buffer allocation")
             self._scan_stage.reserve(count)
@@ -309,20 +366,39 @@ class _CanonicalIndex:
                     count = (boundary.start() if boundary is not None else len(self._buffer))-self._cursor
                     take(count)
             size = len(raw)
+            cache = self._memory.scalar_cache
+            key = None
+            if cache.limit and size <= 256:
+                self._memory.make_room(4*size)
+            if cache.limit and size <= 256 and 4*size <= self._memory.available:
+                stage.reserve(size)
+                key = bytes(raw)
+                found, value = cache.get(key)
+                if found:
+                    self.statistics["scalar_cache_hits"] += 1
+                    raw = key = None
+                    stage.release(size)
+                    return value, stage
             # Raw, decoded scalar, canonical text and encoded comparison can
             # coexist. Reserve that growth before invoking either decoder.
             stage.reserve(3*size)
             try:
                 decoding = perf_counter()
                 value = json.loads(raw, object_pairs_hook=_pairs)
+                self.statistics["scalar_decode_count"] += 1
                 self.statistics["scalar_decode_seconds"] += perf_counter()-decoding
             except (ValueError, UnicodeError) as exc:
                 raise ContractError("Malformed stock JSON scalar") from exc
             encoding = perf_counter()
             require(canonical(value).encode() == raw, "Noncanonical stock JSON scalar")
+            self.statistics["scalar_canonical_count"] += 1
             self.statistics["scalar_canonical_seconds"] += perf_counter()-encoding
             raw = None
             stage.release(3*size)
+            if key is not None:
+                cache.put(key, value)
+                key = None
+                stage.release(size)
             return value, stage
         except Exception:
             stage.close()
@@ -724,7 +800,9 @@ class _CanonicalIndex:
 
 class StockInputSource:
     """Explicit local source. Inventory never opens a source payload."""
-    def __init__(self):
+    def __init__(self, *, scalar_cache_bytes=0):
+        integer(scalar_cache_bytes)
+        self._scalar_cache_bytes = scalar_cache_bytes
         self._indexes = {}
         self._prepared = None
         self._inventory_sizes = {}
@@ -734,6 +812,19 @@ class StockInputSource:
         self._prediction_paths = set()
         self._prediction_remaining = 0
         self._memory = None
+
+    def execution_scope(self):
+        """Original sources retain their existing invocation-local behavior."""
+        return nullcontext()
+
+    @property
+    def statistics(self):
+        """Read-only operation counters; never a persisted admission capability."""
+        files = [{"path": str(index.path), **index.statistics} for index in self._indexes.values()]
+        return {"files": files, "source_operations": {
+                    name: sum(item[name] for item in files) for name in (files[0].keys()-{"path"})} if files else {},
+                "decoded_bytes_peak": 0 if self._memory is None else self._memory.peak_bytes,
+                "scalar_cache_evictions": 0 if self._memory is None else self._memory.scalar_cache.evictions}
 
     @staticmethod
     def _artifacts(manifest):
@@ -793,7 +884,7 @@ class StockInputSource:
         fields(descriptor, "contract_version fold_ref files")
         names = {"fold.json", "feature-slice.json", "label-slice.json", "dataset.json", "model.json",
                  "predictions.json", "signal-evidence.json", "booster.txt"}
-        require(descriptor["contract_version"] == "stock_ml_fold_manifest_v1" and type(descriptor["files"]) is dict and
+        require(descriptor["contract_version"] in ("stock_ml_fold_manifest_v1", "stock_ml_fold_manifest_v2") and type(descriptor["files"]) is dict and
                 set(descriptor["files"]) == names, "Original saved fold manifest required")
         for reference in descriptor["files"].values():
             digest(reference)
@@ -801,7 +892,11 @@ class StockInputSource:
         header = index.object_header(("definition",))
         fields(header, "contract_version content_digest definition_ref status feature_ref label_ref dataset_ref model_ref signal_run_ref evidence_ref fold_ref engine_admission limitations")
         refs = {name: header[name] for name in ("feature_ref", "label_ref", "dataset_ref", "model_ref", "signal_run_ref", "evidence_ref")}
-        require(header["contract_version"] == {"stock_ml_fold_spec_v1": "stock_ml_fold_v1", "stock_ml_fold_spec_v2": "stock_ml_fold_v2"}.get(spec.get("contract_version")) and header["status"] == "COMPLETE" and
+        require((descriptor["contract_version"], header["contract_version"], spec.get("contract_version")) in {
+                    ("stock_ml_fold_manifest_v1", "stock_ml_fold_v1", "stock_ml_fold_spec_v1"),
+                    ("stock_ml_fold_manifest_v1", "stock_ml_fold_v2", "stock_ml_fold_spec_v2"),
+                    ("stock_ml_fold_manifest_v2", "stock_ml_fold_v3", "stock_ml_fold_spec_v1"),
+                    ("stock_ml_fold_manifest_v2", "stock_ml_fold_v3", "stock_ml_fold_spec_v2")} and header["status"] == "COMPLETE" and
                 header["content_digest"] == index.unsigned_digest("content_digest") and
                 header["definition_ref"] == index.span_digest(("definition",)) and
                 header["fold_ref"] == Document.from_dict({"definition_ref": header["definition_ref"], **refs}).identity ==
@@ -1108,7 +1203,7 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
             "Stock source inventory exceeds declared row budget")
     # An audit is never a cache exemption across invocations.
     source._indexes = {}; source._prepared = None
-    source._memory = _DecodedMemory(budget["max_decoded_bytes"])
+    source._memory = _DecodedMemory(budget["max_decoded_bytes"], scalar_cache_bytes=source._scalar_cache_bytes)
     source._memory.reserve_global(("request", manifest["request_ref"]), _encoded_size(manifest))
     source._inventory_sizes = {str(_path(item["artifact"])) if "artifact" in item else item["manifest_uri"]: item["file_bytes"]
                                for item in inventory["files"]}
