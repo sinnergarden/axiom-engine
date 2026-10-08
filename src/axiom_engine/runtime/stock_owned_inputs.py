@@ -203,8 +203,14 @@ def admit_stock_inputs(manifest, *, source, block_sessions: int, limits: dict,
     The original source path remains available as an exact account oracle.
     No saved accounts, Data access, Research loaders or model calls occur.
     """
-    from .stock_stream import _admit
     require(not isinstance(source, AdmittedStockInputs), "Import original stock sources, not an admission marker")
+    require(isinstance(source, StockInputSource), "StockInputSource required")
+    with source.execution_scope():
+        return _capture_owned_inputs(manifest, source, block_sessions, limits, max_owned_bytes)
+
+
+def _capture_owned_inputs(manifest, source, block_sessions, limits, max_owned_bytes):
+    from .stock_stream import _admit
     integer(max_owned_bytes, 1)
     started = perf_counter()
     plan, audit, limits = _admit(manifest, source, block_sessions, limits)
@@ -262,12 +268,13 @@ def admit_stock_inputs(manifest, *, source, block_sessions: int, limits: dict,
                       "source_decoded_bytes_peak": source.statistics["decoded_bytes_peak"],
                       "source_scalar_cache_evictions": source.statistics["scalar_cache_evictions"]}
         return AdmittedStockInputs(_IMPORT, store, offsets, key, block_sessions, inventory, statistics)
-    except Exception:
+    except BaseException:
         store.close()
         raise
     finally:
         offset_stage.close()
         # The caller can still run the original source, which admits afresh.
         # Its full-history span index is unnecessary after ownership transfer.
+        source._close_private_views()
         source._indexes = {}; source._prepared = None; source._audited = False
         source._memory = None; source._scan_native_scopes = {}; source._scan_row_limits = {}
