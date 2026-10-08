@@ -102,16 +102,54 @@ def _stock_metadata(batch, name, keys=("session", "security_id")):
         result[key] = row
     return result
 
+
+def _stock_lifecycle_active(identity, day, state, metadata):
+    """Use original per-session state; nullable identity end is not immortality.
+
+    The admitted state batch binds its original event revision/Raw references.
+    Missing state usable_from stays missing; best-effort query clocks are not
+    upgraded to strict historical receipt evidence. No event date is inferred.
+    """
+    first, last = identity["listing_date"], identity["delisting_date"]
+    location = identity["security_id"] + "/" + day
+    if state == "not_listed":
+        require(day < first, "native not_listed contradicts canonical lifecycle: " + location)
+        return False
+    if state == "delisted":
+        require(first <= day and (last is None or last <= day),
+                "native delisted contradicts canonical lifecycle: " + location)
+        require(metadata.get("missing_reason") is None and
+                metadata.get("evidence_domain") in ("listing_events", "security_master") and
+                all(type(metadata.get(name)) is str and bool(metadata[name])
+                    for name in ("revision_id", "raw_batch_id")),
+                "native delisted lacks bound lifecycle evidence: " + location)
+        if identity.get('_stock_identity_version') == 2:
+            proof = identity.get('_stock_delisting_evidence')
+            require(proof is not None and metadata.get('evidence_domain')=='listing_events' and
+                    all(metadata[name]==proof[name] for name in ('revision_id','raw_batch_id')),
+                    "native lifecycle selects a different original event revision: " + location)
+        available = metadata.get("usable_from")
+        require(available is None or instant(available) <= instant(day + "T20:30:00+08:00"),
+                "future native lifecycle evidence: " + location)
+        return False
+    active = listed(identity, day)
+    require(state == "unknown_status" or active,
+            "native stock state contradicts canonical listing lifecycle: " + location)
+    return active
+
 def _project_stock_rows(*, batches, universe, calendar, identities, source_refs,
                         membership_batch=None, expanded=False):
     """Project admitted original row views with the same v6 visibility rules."""
     states, prices, limits, factors = batches
     full = identities is not None
+    members = (_membership_rows(membership_batch, universe=universe, calendar=calendar, identities=identities)
+               if full else None)
     p, s, l, f = map(_keyed_stock, (prices, states, limits, factors))
     meta = {name: _stock_metadata(batch, native) for name, batch, native in
         (("open", prices, "open"), ("close", prices, "close"), ("volume_shares", prices, "volume_shares"),
          ("limit_up", limits, "up_limit"), ("limit_down", limits, "down_limit"), ("market_state", states, "market_state"))}
     rows = []
+    ended = set()
     for day in calendar:
         for security in universe:
             key = day, security
@@ -127,13 +165,22 @@ def _project_stock_rows(*, batches, universe, calendar, identities, source_refs,
             allowed = ("normal_trading", "unknown_status", "suspended", "source_gap")
             if full:
                 allowed += ("not_listed", "delisted")
-                is_listed = listed(identities[security], day)
-                require((s[key]["market_state"] not in ("not_listed", "delisted")) == is_listed,
-                        "native stock state contradicts canonical listing lifecycle")
+                is_listed = _stock_lifecycle_active(identities[security], day,
+                    s[key]["market_state"], meta["market_state"][key])
+                require(not is_listed or security not in ended,
+                        "native lifecycle reopens a delisted canonical identity: " + security + "/" + day)
+                if s[key]["market_state"] == "delisted":
+                    ended.add(security)
                 require(is_listed or all(p[key][n] is None for n in ("open", "close", "volume_shares")),
                         "unlisted stock carries observed market facts")
+                require(is_listed or not members[key]["is_member"], "PIT member outside native lifecycle")
+                if day < identities[security]['listing_date']:
+                    require(f[key]['factor'] is None and all(l[key][name] is None for name in ('up_limit','down_limit')),
+                            "pre-listing diagnostic carries factor/limit facts")
             require(s[key]["market_state"] in allowed and
-                    not (reason or "").startswith(("identity_", "calendar_", "listing_")), "stock lifecycle/calendar admission failed")
+                    (full and not is_listed or
+                     not (reason or "").startswith(("identity_", "calendar_", "listing_"))),
+                    "stock lifecycle/calendar admission failed")
             availability = {name: index[key].get("usable_from") for name, index in meta.items()}
             row = {"security_id": security, "session": day, "market_state": s[key]["market_state"], "state_reason": reason,
                 "source_refs": source_refs[:3], "execution_evidence_cutoff": day + "T20:30:00+08:00",
@@ -146,10 +193,10 @@ def _project_stock_rows(*, batches, universe, calendar, identities, source_refs,
             rows.append(row)
     if expanded:
         require(full and membership_batch is not None, "expanded stock rows need original membership")
-        members = _membership_rows(membership_batch, universe=universe, calendar=calendar, identities=identities)
         factor_meta = _stock_metadata(factors, "factor")
         close_meta = _stock_metadata(prices, "close")
-        rows = [{**row, "_stock_listed": listed(identities[row["security_id"]], row["session"]),
+        rows = [{**row, "_stock_listed": _stock_lifecycle_active(identities[row["security_id"]], row["session"],
+            row["market_state"], meta["market_state"][row["session"], row["security_id"]]),
             "_stock_factor_valid": f[row["session"], row["security_id"]]["factor"] is not None,
             "_stock_factor_missing_reason": factor_meta[row["session"], row["security_id"]].get("missing_reason"),
             "_stock_factor_source_ref": source_refs[3],
@@ -344,7 +391,8 @@ def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, cove
     source_refs = ([native_ref(batch) for batch in all_batches] if saved_evidence is None else
                    [entry["reference"] for entry in saved_evidence])
     rows = _project_stock_rows(batches=batches[:4], universe=universe, calendar=calendar,
-                              identities=identities if full else None, source_refs=source_refs)
+                              identities=identities if full else None, source_refs=source_refs,
+                              membership_batch=membership_batch)
     cash_actions, diagnostics, blocks = _project_stock_actions(batches=batches[4:6], universe=universe,
                                                             source_refs=source_refs)
     f = _keyed_stock(factors)
@@ -354,6 +402,8 @@ def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, cove
         if item not in blocks:
             blocks.append(item)
     factor_meta = _stock_metadata(factors, "factor")
+    state_rows = _keyed_stock(states) if full else None
+    state_meta = _stock_metadata(states, "market_state") if full else None
     for security in universe:
         previous = None
         for day in calendar:
@@ -364,10 +414,13 @@ def _stock_market_wire(*, batches, universe, calendar, saved_evidence=None, cove
                     require(bool(factor_meta[day, security].get("missing_reason")), "null stock factor requires native missing reason")
                     previous = None
                     continue
-                require(listed(identities[security], day), "unlisted stock carries observed factor")
             require((day, security) in factor_meta and _visible(factor_meta[day, security], day + "T20:30:00+08:00"),
                     "unavailable stock factor capability evidence")
             require(factor is not None and decimal(str(factor), minimum=0) > 0, "missing stock factor capability evidence")
+            if full and not _stock_lifecycle_active(identities[security], day,
+                    state_rows[day, security]["market_state"], state_meta[day, security]):
+                previous = None
+                continue
             # A same-day cash EX cannot prove the magnitude or quantity effect of a factor transition.
             if previous is not None and factor != previous:
                 block(security, day, factor_meta[day, security]["usable_from"], "UNEXPLAINED_FACTOR_CHANGE", source_refs[3])

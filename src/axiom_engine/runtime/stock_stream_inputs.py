@@ -1418,6 +1418,7 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
         lifecycle = {"pre_listing_null": 0, "listed_nonmember_gap": 0, "member_gap": 0, "held_gap": 0}
         previous_factor = {}
         factor_blocks = []
+        ended = set()
         for offset in range(0, len(calendar), block_sessions):
             days = tuple(calendar[offset:offset+block_sessions])
             # Pair original price/factor/member facts and provenance, not synthetic PASS flags.
@@ -1437,6 +1438,9 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
             with source._memory.stage() as stage:
                 factor, _, factor_bindings = source._native("execution", "factor", days, budget, reservation=stage)
                 frows, fmeta = _grid(factor, days, universe)
+                from .stock_market import _stock_lifecycle_active
+                state, _, state_bindings = source._native("execution", "states", days, budget, reservation=stage)
+                srows, smeta = _grid(state, days, universe)
                 require(factor["field_meta"]["factor"]["unit"] == "dimensionless", "Unexpected stock factor unit")
                 for day in days:
                     for security in universe:
@@ -1446,8 +1450,13 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
                             source._memory.replace_global(("previous_factor", security), _encoded_size({security: None}))
                             previous_factor[security] = None
                         else:
-                            require(listed(rules_index[0][security], day) and _visible(metadata, day+"T20:30:00+08:00") and
+                            require(_visible(metadata, day+"T20:30:00+08:00") and
                                     decimal(str(value), minimum=0) > 0, "Unavailable/invalid original stock factor")
+                            if not _stock_lifecycle_active(rules_index[0][security], day,
+                                    srows[key]["market_state"], smeta["market_state"][key]):
+                                source._memory.replace_global(("previous_factor", security), _encoded_size({security: None}))
+                                previous_factor[security] = None
+                                continue
                             old = previous_factor.get(security)
                             if old is not None and old != value:
                                 size = _object_size([(name, _encoded_size(item)) for name, item in (
@@ -1459,13 +1468,19 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
                                 factor_blocks.append(item)
                             source._memory.replace_global(("previous_factor", security), _encoded_size({security: value}))
                             previous_factor[security] = value
-                del factor, frows, fmeta, factor_bindings, metadata
+                del factor, frows, fmeta, factor_bindings, metadata, state, state_bindings, srows, smeta
             block = source._block(manifest, days, budget)
             try:
                 market_rows += len(block.market_rows)
                 require(market_rows <= limits["max_market_rows"], "Stock market row budget exceeded")
                 for row in block.market_rows.values():
-                    if row["market_state"] == "not_listed":
+                    security = row["security_id"]
+                    require(not row["_stock_listed"] or security not in ended,
+                            "native lifecycle reopens a delisted canonical identity: " + security + "/" + row["session"])
+                    if row["market_state"] == "delisted" and security not in ended:
+                        source._memory.reserve_global(("delisted", security), _encoded_size(security)+128)
+                        ended.add(security)
+                    if row["session"] < rules_index[0][row["security_id"]]["listing_date"]:
                         lifecycle["pre_listing_null"] += 1
                     elif row["_stock_listed"] and (not row["_stock_factor_valid"] or
                             any(row[name] is None for name in ("open", "close", "volume_shares", "limit_up", "limit_down"))):
@@ -1519,6 +1534,9 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
         del previous_factor
         for security in universe:
             source._memory.release_global(("previous_factor", security))
+        for security in ended:
+            source._memory.release_global(("delisted", security))
+        del ended
         limitations = sorted({x for c in contexts for x in c.get("limitations", [])}) + [
             "OBSERVED IMPLEMENTED ACTIONS ONLY: nonimplemented uncertainty remains diagnostic; no complete action-history claim.",
             "Stock cash source lacks PAY dates; gross-before-tax receivables remain pending until verified native payment.",
