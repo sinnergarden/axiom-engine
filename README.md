@@ -76,6 +76,9 @@ scan/read/hash, scalar decode/canonical counts/timings and selected-row operatio
 The synthetic exact/performance probe is
 `PYTHONPATH=src:tests python tools/bench_stock_owned_inputs.py`; it uses no real
 saved inputs, Data access, features, fitting or prediction calls.
+Recorded synthetic/real measurement scopes, source bindings, CJSON counters and
+test coverage are in [stock input benchmark notes](tools/stock_input_benchmarks.md).
+Authoritative input-reuse design remains in Axiom design 04.
 
 `load_stock_backtest_projection(path, *, artifact_reader, limits)` validates a
 saved v7 run, its result parts, and small profile/event views for evaluation and
