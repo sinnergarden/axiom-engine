@@ -8,6 +8,7 @@ from .stock_rules import stock_execution_rules, stock_fee_schedule, csi300_stock
 from ..core.etf_buy_hold import etf_buy_and_hold_policy
 from .stock_market import read_stock_market_replay, stock_market_from_batches, stock_dividend_scope
 from .stock_inputs import stock_portfolio_policy
+from .stock_equity import StockActionFacts, equity_profile, equity_request
 from .stock_schedule import StockPredictionSchedule, stock_prediction_schedule
 from .evaluation import (BenchmarkSeries, DividendScope, EvaluationSpec, EvaluationReport,
                          daily_evaluation_spec, long_history_evaluation_spec, evaluate_backtest,
@@ -26,7 +27,7 @@ from .stock_market_owner import (StockMarketSpec, AdmittedStockMarket, admit_sto
 from .stock_stream_outputs import StockResultSink
 from .stock_stream_projection import SavedRunProjection, load_stock_backtest_projection
 
-__all__ = ["BatchReference", "DecisionBatchGate", "InputGateError", "stale_price_mark",
+__all__ = ["StockActionFacts", "equity_profile", "equity_request", "BatchReference", "DecisionBatchGate", "InputGateError", "stale_price_mark",
            "BacktestRequest", "BacktestRun", "MarketReplay", "run_backtest",
            "save_backtest_run", "load_backtest_run", "read_etf_market_replay", "daily_open_profile", "etf_buy_and_hold_policy",
            "BenchmarkSeries", "DividendScope", "EvaluationSpec", "EvaluationReport",
