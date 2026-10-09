@@ -190,7 +190,7 @@ def _execution_trace(saved):
                     requested_quantity=order.get("requested_quantity", order.get("quantity")),filled_quantity=order.get("filled_quantity"),
                     unfilled_quantity=order.get("unfilled_quantity"),execution_admission=order.get("execution_admission"),
                     committed_sequence=order.get("committed_sequence"),fill_ids=[f.get("fill_id") for f in actual],fills=actual))
-                if saved.get("contract_version") in ("backtest_run_v6", "backtest_run_v7"):
+                if saved.get("contract_version") in ("backtest_run_v6", "backtest_run_v7", "backtest_run_v8"):
                     matched[-1].update(submitted_quantity=order.get("submitted_quantity"),
                                        unsubmitted_quantity=order.get("unsubmitted_quantity"))
             linked.append(dict(intent_id=intent.get("intent_id"),intent=intent,orders=matched))

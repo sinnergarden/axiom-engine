@@ -32,10 +32,12 @@ class StockMarketSpec(Document):
     def __post_init__(self):
         super().__post_init__()
         value = self.to_dict()
-        fields(value, "scope profile_input market_input stock_action_policy clock_policy")
+        equity = value.get("stock_action_policy") == "registered_equity_v1"
+        fields(value, "scope profile_input market_input stock_action_policy clock_policy" + (" action_facts_artifact" if equity else ""))
+        if equity: validate_artifact_ref(value["action_facts_artifact"])
         scope = value["scope"]; _validate_scope(scope)
         require(scope["prediction_universe"] == scope["execution_universe"], "Full-stock prediction/execution union mismatch")
-        require(value["stock_action_policy"] == ACTION_POLICY and value["clock_policy"] == CLOCK_POLICY,
+        require(value["stock_action_policy"] in (ACTION_POLICY, "registered_equity_v1") and value["clock_policy"] == CLOCK_POLICY,
                 "stock action/clock policy mismatch")
         profile = value["profile_input"]
         fields(profile, "artifact profile_ref stock_execution_rules_ref stock_fee_schedule_ref")
@@ -62,7 +64,7 @@ class StockMarketSpec(Document):
         require(isinstance(request, BacktestRequest), "BacktestRequest required")
         plan = validate_manifest(request)
         market = plan["market_input"]
-        return cls.from_dict({"scope": plan["scope"], "profile_input": plan["profile_input"],
+        return cls.from_dict({**({"action_facts_artifact": plan["action_facts_artifact"]} if "action_facts_artifact" in plan else {}), "scope": plan["scope"], "profile_input": plan["profile_input"],
             "market_input": {**{name: market[name] for name in
                 ("contract_version", "execution_snapshot_id", "warmup_sessions", "price_basis", "projection_version")},
                 "native_inputs": [item for item in market["native_inputs"] if item["role"] == "execution"]},

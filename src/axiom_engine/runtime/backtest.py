@@ -159,8 +159,8 @@ def _fees(price, quantity, side, profile):
 
 
 def _fee_components(price, quantity, side, profile, day=None):
-    full = profile["contract_version"] == "stock_daily_open_profile_v2"
-    if profile["contract_version"] not in ("stock_daily_open_profile_v1", "stock_daily_open_profile_v2"):
+    full = profile["contract_version"] in ("stock_daily_open_profile_v2", "stock_daily_open_profile_v3")
+    if profile["contract_version"] not in ("stock_daily_open_profile_v1", "stock_daily_open_profile_v2", "stock_daily_open_profile_v3"):
         return (*_fees(price, quantity, side, profile), 0)
     if quantity == 0:
         return 0, 0, 0, 0
@@ -184,8 +184,8 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
     order["market_state"] = row["market_state"]
     order["state_reason"] = row["state_reason"]
     order["execution_admission"] = "CONFIRMED_STATUS"
-    full = profile["contract_version"] == "stock_daily_open_profile_v2"
-    stock = profile["contract_version"] in ("stock_daily_open_profile_v1", "stock_daily_open_profile_v2")
+    full = profile["contract_version"] in ("stock_daily_open_profile_v2", "stock_daily_open_profile_v3")
+    stock = profile["contract_version"] in ("stock_daily_open_profile_v1", "stock_daily_open_profile_v2", "stock_daily_open_profile_v3")
     if full:
         order.update(requested_quantity=intent["quantity"], submitted_quantity=0,
                      unsubmitted_quantity=intent["quantity"], quantity=0, unfilled_quantity=0,
@@ -365,9 +365,11 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
     v5 = plan["contract_version"] == "backtest_request_v5"
     v2 = plan["contract_version"] in ("backtest_request_v2", "backtest_request_v5")
     v4 = plan["contract_version"] == "backtest_request_v4"
-    v6 = plan["contract_version"] in ("backtest_request_v6", "backtest_request_v7")
+    equity = plan["contract_version"] == "backtest_request_v8"
+    from . import stock_equity
+    v6 = plan["contract_version"] in ("backtest_request_v6", "backtest_request_v7", "backtest_request_v8")
     scheduled = v4 or v6
-    stock = plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4", "backtest_request_v6", "backtest_request_v7")
+    stock = plan["contract_version"] in ("backtest_request_v3", "backtest_request_v4", "backtest_request_v6", "backtest_request_v7", "backtest_request_v8")
     hold = v5 and plan["portfolio_policy"]["contract_version"] == "etf_buy_and_hold_policy_v1"
     from ..core.etf_buy_hold import BUY_HOLD_VERSION, plan_etf_buy_and_hold
     runtime = "axiom.backtest/6" if v6 else ("axiom.backtest/5" if v5 else ("axiom.backtest/4" if v4 else ("axiom.backtest/3" if stock else (RUNTIME_VERSION if v2 else LEGACY_RUNTIME_VERSION))))
@@ -376,6 +378,7 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
     if v6:
         from ..core.stock_rules import validate_execution_rules
         rules_index = storage.audit.globals["rules_index"] if streaming else validate_execution_rules(profile["stock_execution_rules"])
+    equity_actions = market["equity_facts"]["actions"] if equity else []
     splits = market.get("unit_splits", [])
     run_id = storage.run_id if streaming else Document.from_dict({"request": plan, "core": core_version, "runtime": runtime,
                                 "implementation_ref": IMPLEMENTATION_REF}).identity
@@ -414,16 +417,26 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                                                    for s, p in ledger.positions.items())
                 require(initial_value > 0, "positive initial NAV required")
             ledger.advance(day)
+            if equity:
+                equity_gaps = stock_equity.gaps(ledger, equity_actions, day, profile["decision_time_utc"])
+                if equity_gaps:
+                    stopped = dict(session=day, reason="HELD_EQUITY_FACT_GAP", gaps=equity_gaps, committed_sequence=ledger.sequence)
+                    storage.flush(day, "STOPPED_BEFORE_NAV", ledger.sequence)
+                    break
+                stock_equity.advance(ledger, equity_actions, day)
+            account_positions = ledger.positions
+            if equity:
+                account_positions = {s:{**ledger.positions.get(s,{}), "quantity":ledger.positions.get(s,{}).get("quantity",0)+stock_equity.pending(ledger).get(s,0)} for s in set(ledger.positions)|set(stock_equity.pending(ledger))}
             if stock:
                 from .stock_inputs import applicable_blocks
                 if v6:
-                    lifecycle["held_gap"] += sum(1 for security, position in ledger.positions.items() if position["quantity"] and
+                    lifecycle["held_gap"] += sum(1 for security, position in account_positions.items() if position["quantity"] and
                         (not rows[day, security]["_stock_listed"] or not rows[day, security]["_stock_factor_valid"] or
                          any(rows[day, security][name] is None for name in ("open", "close", "volume_shares", "limit_up", "limit_down"))))
                     gaps = [{"security_id": security, "listed": rows[day, security]["_stock_listed"],
                         "factor_missing_reason": rows[day, security]["_stock_factor_missing_reason"],
                         "factor_source_ref": rows[day, security]["_stock_factor_source_ref"]}
-                        for security, position in ledger.positions.items() if position["quantity"] and
+                        for security, position in account_positions.items() if position["quantity"] and
                         (not rows[day, security]["_stock_listed"] or not rows[day, security]["_stock_factor_valid"])]
                     if gaps:
                         stopped = {"session": day, "reason": "HELD_MISSING_STOCK_LIFECYCLE_CAPABILITY", "gaps": gaps,
@@ -431,7 +444,7 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                         if streaming:
                             storage.flush(day, "STOPPED_BEFORE_NAV", ledger.sequence)
                         break
-                blocking = [block for security, position in ledger.positions.items() if position["quantity"]
+                blocking = [block for security, position in account_positions.items() if position["quantity"]
                             for block in applicable_blocks(market, security, day)]
                 if blocking:
                     stopped = {"session": day, "reason": "HELD_UNSUPPORTED_STOCK_ACTION", "blocks": blocking,
@@ -439,7 +452,7 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                     if streaming:
                         storage.flush(day, "STOPPED_BEFORE_NAV", ledger.sequence)
                     break
-            for phase, key in (("EX", "ex_session"), ("PAY", "pay_session")):
+            for phase, key in (() if equity else (("EX", "ex_session"), ("PAY", "pay_session"))):
                 for action in sorted(market["cash_dividends"], key=lambda a: a["event_id"]):
                     if action[key] == day and action["event_id"] in entitlements:
                         ledger.dividend(action, phase, entitlements.get(action["event_id"], 0))
@@ -487,7 +500,14 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                     # These borrow the current source block or pending output.
                     # Drop them before a later session can advance that block.
                     active = active_rows = first = context = decision = intent = order = None
-            for action in market["cash_dividends"]:
+            if equity:
+                for security, position in ledger.positions.items():
+                    if position["quantity"]: ledger.equity_owned.setdefault(security, day)
+                for action in equity_actions:
+                    if action["record_date"] == day:
+                        ledger.equity_history[day, action["security_id"]] = ledger.positions.get(action["security_id"], {}).get("quantity", 0)
+                        stock_equity.register(ledger, action, day)
+            for action in ([] if equity else market["cash_dividends"]):
                 if action["record_session"] == day:
                     entitlements[action["event_id"]] = ledger.positions.get(action["security_id"], {"quantity": 0})["quantity"]
             for item in splits:
@@ -521,18 +541,23 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                     mark_basis[event["security_id"]] = event["event_id"]
         ledger.sequence += 1  # commit the session valuation at one shared watermark
         value = 0
-        for security, position in sorted(ledger.positions.items()):
-            if not position["quantity"]:
+        share_pending = stock_equity.pending(ledger) if equity else {}
+        marked_positions = {**{s:dict(quantity=0,sellable_quantity=0,cost_minor=0) for s in share_pending}, **ledger.positions}
+        for security, position in sorted(marked_positions.items()):
+            if not position["quantity"] and not share_pending.get(security):
                 continue
             require(security in marks, "held position lacks observed valuation price")
             mark = marks[security]
-            amount = minor(decimal(mark["price"]) * position["quantity"] * 100)
+            if equity and share_pending.get(security):
+                require(mark["session"] == day, "pending shares require current original-unit close")
+            amount = minor(decimal(mark["price"]) * (position["quantity"] + share_pending.get(security, 0)) * 100)
             value += amount
             point = {"session": day, "security_id": security, **position,
                 "mark_price": mark["price"], "mark_session": mark["session"],
                 "is_stale": mark["session"] != day, "stale_sessions": index - calendar_index[mark["session"]],
                 "mark_source_refs": mark["source_refs"], "market_value_minor": amount,
                 "committed_sequence": ledger.sequence}
+            if equity: point["pending_share_quantity"] = share_pending.get(security, 0)
             if v2:
                 point["mark_basis_event_id"] = mark_basis.get(security)
             if v6:
@@ -552,7 +577,8 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
         limitations = [profile["limitation"],
             "Daily open-price approximation; full-day volume is an execution-side capacity proxy, not known opening liquidity.",
             "Day orders expire after one simulated fill; no live broker, SQLite recovery, general stock quantity-action or delisting support.",
-            "Dividend handling supports explicit record/ex/pay cash events; unsupported economic events must be rejected by the caller adapter.",
+            ("Registered equity simulation uses Data-selected record/EX/PAY/listing facts; unresolved qualified rights stop before NAV." if equity else
+             "Dividend handling supports explicit record/ex/pay cash events; unsupported economic events must be rejected by the caller adapter."),
             "Metrics cover the frozen stock sample; separate saved evaluation owns annualization.",
             *market["limitations"], *signal["limitations"], *plan["limitations"]]
         return storage.result(ledger=ledger, initial_value=initial_value, stopped=stopped,
