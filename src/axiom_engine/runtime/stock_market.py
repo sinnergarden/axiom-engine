@@ -128,6 +128,11 @@ def _stock_lifecycle_active(identity, day, state, metadata):
             require(proof is not None and metadata.get('evidence_domain')=='listing_events' and
                     all(metadata[name]==proof[name] for name in ('revision_id','raw_batch_id')),
                     "native lifecycle selects a different original event revision: " + location)
+            if metadata.get('availability_basis') == 'first_observed_at':
+                require(all(metadata.get(name) is None or
+                            instant(metadata[name]) == instant(proof[name])
+                            for name in ('first_observed_at', 'usable_from')),
+                        "native lifecycle observation time differs from original event proof: " + location)
         available = metadata.get("usable_from")
         require(available is None or instant(available) <= instant(day + "T20:30:00+08:00"),
                 "future native lifecycle evidence: " + location)

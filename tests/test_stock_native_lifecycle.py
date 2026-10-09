@@ -117,6 +117,56 @@ class NativeLifecycleTests(unittest.TestCase):
         for mutation in mutations:
             with self.subTest(mutation=mutation),self.assertRaises(ContractError):event_rules(mutation)
 
+    def test_first_observed_basis_cannot_backdate_original_event_in_either_path(self):
+        rules = event_rules()
+        observed = '2026-10-03T16:00:00+00:00'
+        historical = DAYS[2] + 'T00:00:00+08:00'
+        baseline = full_request(rules=rules, mutate_native=terminal, mutate_frame=terminal_frame).to_dict()
+        cases = [
+            (dict(availability_basis='first_observed_at', first_observed_at=observed,
+                  usable_from=historical), False),
+            (dict(availability_basis='first_observed_at', first_observed_at=historical,
+                  usable_from=historical), False),
+            (dict(availability_basis='first_observed_at', first_observed_at=observed,
+                  usable_from=None), True),
+            (dict(availability_basis='declared_vendor_assumption', first_observed_at=observed,
+                  usable_from=historical), True),
+        ]
+        for clocks, allowed in cases:
+            def mutate_state(wire):
+                for meta in wire['field_meta']['market_state']['by_key']:
+                    if meta['security_id'] == BOARD_IDS['SSE_MAIN'] and meta['session'] >= DAYS[2]:
+                        meta.update(clocks)
+            def mutate_native(batches, membership):
+                terminal(batches, membership)
+                mutate_state(batches[0])
+            with self.subTest(clocks=clocks), patch(
+                    'axiom_engine.runtime.backtest.AccountLedger', side_effect=AssertionError('account started')):
+                if allowed:
+                    plan = full_request(rules=rules, mutate_native=mutate_native,
+                                        mutate_frame=terminal_frame).to_dict()
+                    before = deepcopy(plan)
+                    row = validate_stock_request(plan)[5][DAYS[2], BOARD_IDS['SSE_MAIN']]
+                    self.assertEqual(row['field_available_at']['market_state'], clocks['usable_from'])
+                    self.assertEqual(plan, before)
+                else:
+                    with self.assertRaisesRegex(ContractError, 'observation time differs from original event proof'):
+                        full_request(rules=rules, mutate_native=mutate_native, mutate_frame=terminal_frame)
+                with TemporaryDirectory() as tmp:
+                    manifest = source_fixture(Path(tmp), baseline)[0]
+                    rebind_native(manifest, 'native-0', mutate_state)
+                    source = StockInputSource()
+                    try:
+                        if allowed:
+                            source.audit(manifest, block_sessions=1, read_budget=read_budget(LIMITS),
+                                         limits=LIMITS, implementation_ref=IMPLEMENTATION_REF)
+                        else:
+                            with self.assertRaisesRegex(ContractError, 'observation time differs from original event proof'):
+                                source.audit(manifest, block_sessions=1, read_budget=read_budget(LIMITS),
+                                             limits=LIMITS, implementation_ref=IMPLEMENTATION_REF)
+                    finally:
+                        source._close_private_views()
+
     def test_unknown_is_not_evidence_of_listing_and_true_conflicts_reject(self):
         identity = dict(security_id='synthetic',listing_date=DAYS[1],delisting_date=None)
         self.assertFalse(_stock_lifecycle_active(identity,DAYS[0],'unknown_status',{}))
