@@ -908,6 +908,9 @@ class StockInputSource:
                                                       if manifest.get("prediction_input", {}).get("frames") else 0)},
                 "declared_scope": manifest["scope"]}
 
+    def _location(self, artifact):
+        return _path(artifact)
+
     def _index(self, artifact, budget):
         key = (str(_path(artifact)), artifact["content_digest"])
         if key not in self._indexes:
@@ -1285,7 +1288,7 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
     source._scan_row_limits = {}
     source._scan_native_scopes = {}
     for item in manifest["market_input"]["native_inputs"]:
-        key = str(_path(item["artifact"]))
+        key = str(source._location(item["artifact"]))
         source._scan_row_limits[key] = limits["max_market_rows"]
         source._scan_native_scopes[key] = (manifest, limits)
     for frame in manifest.get("prediction_input", {}).get("frames", []):
@@ -1329,10 +1332,10 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
             for kind in ("actions-ex", "actions-record"):
                 view, _, action_bindings = source._native("execution", kind, [None], budget, reservation=stage)
                 actions.append(view)
-            margin = 10 + 2*sum(len(view["records"]) for view in actions)
+            margin = 10 + 2*sum(getattr(view, "row_count", len(view["records"])) for view in actions)
             require(source._memory.available > margin, "Stock decoded event cache budget exceeded")
             cash, diagnostics, blocks = _project_stock_actions(batches=actions, universe=universe,
-                source_refs=source_refs, max_event_bytes=source._memory.available-margin)
+                source_refs=source_refs, max_event_bytes=source._memory.available-margin, reservation=stage)
             source._memory.reserve_global(("projected", "events"), _encoded_size([cash, diagnostics, blocks]))
             del actions, view, action_bindings
         for action in cash:

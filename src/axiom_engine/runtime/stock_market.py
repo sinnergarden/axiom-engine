@@ -158,22 +158,70 @@ def _project_stock_rows(*, batches, universe, calendar, identities, source_refs,
     return rows
 
 
-def _project_stock_actions(*, batches, universe, source_refs, max_event_bytes=None):
+class _StockActionStream(dict):
+    """Private bounded block input to the one stock action projector."""
+    def __init__(self, *, context, field_meta, row_count, blocks):
+        super().__init__(context=context, field_meta=field_meta, records=[])
+        self.row_count, self.blocks = row_count, blocks
+
+
+def _stock_action_rows(batch, reservation):
+    blocks = batch.blocks() if isinstance(batch, _StockActionStream) else iter((batch,))
+    view = native = facts = metadata = key = stage = None
+    try:
+        for view in blocks:
+            if reservation is not None:
+                stage = reservation.memory.stage()
+                stage.reserve(192*(len(view["records"])+sum(len(v["by_key"]) for v in view["field_meta"].values()))+512)
+            metadata = {name: _stock_metadata(view, name, EVENT_KEY) for name in STOCK_EVENT_FIELDS}
+            for native in view["records"]:
+                key = tuple(native[name] for name in EVENT_KEY)
+                require(all(key in indexed for indexed in metadata.values()), "missing stock action field metadata")
+                facts = {name: indexed[key] for name, indexed in metadata.items()}
+                yield native, facts
+                native = facts = None
+            view = metadata = key = None
+            if stage is not None:
+                stage.close(); stage = None
+    finally:
+        view = native = facts = metadata = key = None
+        if stage is not None:
+            stage.close()
+        close = getattr(blocks, "close", None)
+        if close is not None:
+            close()
+
+
+def _project_stock_actions(*, batches, universe, source_refs, max_event_bytes=None, reservation=None):
     """Project original action views; retain uncertainty and source identities."""
     ex_actions, record_actions = batches
     actions, diagnostics, blocks, seen_native = {}, [], [], {}
     event_bytes = 0
     def reserve(value, previous=None):
         nonlocal event_bytes
-        if max_event_bytes is not None:
+        if max_event_bytes is not None or reservation is not None:
             from .stock_stream_outputs import canonical_size
             from ..core.contracts import integer
-            integer(max_event_bytes, 1)
-            size = canonical_size(value, max_event_bytes)
-            old_size = 0 if previous is None else canonical_size(previous, max_event_bytes)
-            require(event_bytes + size - old_size <= max_event_bytes,
+            maximum = max_event_bytes if max_event_bytes is not None else reservation.memory.limit
+            integer(maximum, 1)
+            size = 3*canonical_size(value, maximum)+128
+            old_size = 0 if previous is None else 3*canonical_size(previous, maximum)+128
+            require(event_bytes + size - old_size <= maximum,
                     "stock event projection budget exceeded before addition")
-            event_bytes += size - old_size
+            growth = size-old_size
+            if reservation is not None:
+                if growth >= 0:
+                    reservation.reserve(growth)
+                else:
+                    reservation.release(-growth)
+            event_bytes += growth
+            return growth
+        return 0
+    def retire(size):
+        nonlocal event_bytes
+        if reservation is not None:
+            reservation.release(size)
+        event_bytes -= size
     def diagnostic_row(value):
         reserve(value)
         diagnostics.append(value)
@@ -183,68 +231,81 @@ def _project_stock_actions(*, batches, universe, source_refs, max_event_bytes=No
         if item not in blocks:
             reserve(item)
             blocks.append(item)
+    state_bytes = 0
     for batch, ref in zip((ex_actions, record_actions), source_refs[4:6]):
-        action_meta = {name: _stock_metadata(batch, name, EVENT_KEY) for name in STOCK_EVENT_FIELDS}
-        seen_query = set()
-        for native in batch["records"]:
-            security = native["security_id"]
-            require(security in universe, "stock event outside execution scope")
-            business_key = tuple(native[name] for name in EVENT_KEY)
-            require(business_key not in seen_query, "duplicate native stock action business key")
-            seen_query.add(business_key)
-            require(business_key not in seen_native or seen_native[business_key] == native,
-                    "conflicting native stock action payload across queries")
-            seen_native[business_key] = native
-            require(all(business_key in index for index in action_meta.values()), "missing stock action field metadata")
-            dates = [native.get(name) for name in ("record_date", "ex_date")]
-            available = [index[business_key]["usable_from"] for index in action_meta.values()
-                         if index[business_key].get("usable_from")]
-            require(bool(available), "stock event visibility proof required")
-            available_at = max(available, key=instant)
-            require(instant(available_at) <= instant(batch["context"]["query"]["cutoff"]), "future stock action evidence")
-            diagnostic = {"native_record": native, "available_at": available_at, "source_refs": [ref], "policy": "observed_implemented_only"}
-            if native["process_status"] in ("预案", "股东大会通过"):
-                diagnostic["admission"] = "NONIMPLEMENTED_DIAGNOSTIC_ONLY"
-                diagnostic_row(diagnostic)
-                continue
-            if native["process_status"] != "实施":
-                diagnostic["admission"] = "UNKNOWN_IMPLEMENTATION_STATUS"
-                diagnostic_row(diagnostic)
-                block(security, native.get("ex_date"), available_at, diagnostic["admission"], ref)
-                continue
-            if native.get("source_issue"):
-                diagnostic["admission"] = "AMBIGUOUS_IMPLEMENTED_ACTION"
-                diagnostic_row(diagnostic)
-                block(security, native.get("ex_date"), available_at, diagnostic["admission"], ref)
-                continue
-            needed = ("implementation_announcement_date", "record_date", "ex_date", "cash_dividend_before_tax_per_share",
-                      "bonus_shares_per_share", "capital_transfer_shares_per_share")
-            require(all(_visible(action_meta[name][business_key], batch["context"]["query"]["cutoff"])
-                        for name in needed if native.get(name) is not None), "unavailable implemented stock action fact")
-            quantity_rates = [native.get(name) for name in ("bonus_shares_per_share", "capital_transfer_shares_per_share")]
-            if any(value is None or value != 0 for value in quantity_rates):
-                diagnostic["admission"] = "UNSUPPORTED_QUANTITY_ACTION"
-                diagnostic_row(diagnostic)
-                block(security, native.get("ex_date"), available_at, diagnostic["admission"], ref)
-                continue
-            cash = native.get("cash_dividend_before_tax_per_share")
-            if any(day is None for day in dates) or cash is None or cash <= 0:
-                diagnostic["admission"] = "MISSING_IMPLEMENTED_CASH_FACT"
-                diagnostic_row(diagnostic)
-                block(security, native.get("ex_date"), available_at, diagnostic["admission"], ref)
-                continue
-            identity = Document.from_dict(native).identity
-            action = {"contract_version": "stock_cash_action_v1", "event_id": identity, "security_id": security,
-                "record_session": native["record_date"], "ex_session": native["ex_date"], "pay_session": None,
-                "cash_before_tax_per_share": str(cash), "tax_convention": TAX_CONVENTION,
-                "available_at": available_at, "source_refs": [ref]}
-            if identity in actions:
-                revised = {**actions[identity], "source_refs": sorted(set(actions[identity]["source_refs"] + [ref]))}
-                reserve(revised, actions[identity])
-                actions[identity]["source_refs"] = revised["source_refs"]
-            else:
-                reserve(action)
-                actions[identity] = action
+        seen_query = set(); query_bytes = 0
+        rows = _stock_action_rows(batch, reservation)
+        native = action_meta = None
+        try:
+            for native, action_meta in rows:
+                try:
+                    security = native["security_id"]
+                    require(security in universe, "stock event outside execution scope")
+                    business_key = tuple(native[name] for name in EVENT_KEY)
+                    require(business_key not in seen_query, "duplicate native stock action business key")
+                    query_bytes += reserve(list(business_key))
+                    seen_query.add(business_key)
+                    require(business_key not in seen_native or seen_native[business_key] == native,
+                            "conflicting native stock action payload across queries")
+                    if business_key not in seen_native:
+                        state_bytes += reserve([list(business_key), native])
+                    seen_native[business_key] = native
+                    dates = [native.get(name) for name in ("record_date", "ex_date")]
+                    available = [index["usable_from"] for index in action_meta.values()
+                                 if index.get("usable_from")]
+                    require(bool(available), "stock event visibility proof required")
+                    available_at = max(available, key=instant)
+                    require(instant(available_at) <= instant(batch["context"]["query"]["cutoff"]), "future stock action evidence")
+                    diagnostic = {"native_record": native, "available_at": available_at, "source_refs": [ref], "policy": "observed_implemented_only"}
+                    if native["process_status"] in ("预案", "股东大会通过"):
+                        diagnostic["admission"] = "NONIMPLEMENTED_DIAGNOSTIC_ONLY"
+                        diagnostic_row(diagnostic)
+                        continue
+                    if native["process_status"] != "实施":
+                        diagnostic["admission"] = "UNKNOWN_IMPLEMENTATION_STATUS"
+                        diagnostic_row(diagnostic)
+                        block(security, native.get("ex_date"), available_at, diagnostic["admission"], ref)
+                        continue
+                    if native.get("source_issue"):
+                        diagnostic["admission"] = "AMBIGUOUS_IMPLEMENTED_ACTION"
+                        diagnostic_row(diagnostic)
+                        block(security, native.get("ex_date"), available_at, diagnostic["admission"], ref)
+                        continue
+                    needed = ("implementation_announcement_date", "record_date", "ex_date", "cash_dividend_before_tax_per_share",
+                              "bonus_shares_per_share", "capital_transfer_shares_per_share")
+                    require(all(_visible(action_meta[name], batch["context"]["query"]["cutoff"])
+                                for name in needed if native.get(name) is not None), "unavailable implemented stock action fact")
+                    quantity_rates = [native.get(name) for name in ("bonus_shares_per_share", "capital_transfer_shares_per_share")]
+                    if any(value is None or value != 0 for value in quantity_rates):
+                        diagnostic["admission"] = "UNSUPPORTED_QUANTITY_ACTION"
+                        diagnostic_row(diagnostic)
+                        block(security, native.get("ex_date"), available_at, diagnostic["admission"], ref)
+                        continue
+                    cash = native.get("cash_dividend_before_tax_per_share")
+                    if any(day is None for day in dates) or cash is None or cash <= 0:
+                        diagnostic["admission"] = "MISSING_IMPLEMENTED_CASH_FACT"
+                        diagnostic_row(diagnostic)
+                        block(security, native.get("ex_date"), available_at, diagnostic["admission"], ref)
+                        continue
+                    identity = Document.from_dict(native).identity
+                    action = {"contract_version": "stock_cash_action_v1", "event_id": identity, "security_id": security,
+                        "record_session": native["record_date"], "ex_session": native["ex_date"], "pay_session": None,
+                        "cash_before_tax_per_share": str(cash), "tax_convention": TAX_CONVENTION,
+                        "available_at": available_at, "source_refs": [ref]}
+                    if identity in actions:
+                        revised = {**actions[identity], "source_refs": sorted(set(actions[identity]["source_refs"] + [ref]))}
+                        reserve(revised, actions[identity])
+                        actions[identity]["source_refs"] = revised["source_refs"]
+                    else:
+                        reserve(action)
+                        actions[identity] = action
+                finally:
+                    native = action_meta = diagnostic = None
+        finally:
+            rows.close()
+            native = action_meta = business_key = None
+            seen_query.clear(); retire(query_bytes)
+    seen_native.clear(); retire(state_bytes)
     return sorted(actions.values(), key=lambda a: a["event_id"]), diagnostics, blocks
 
 
