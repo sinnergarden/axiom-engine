@@ -5,7 +5,7 @@ import re
 
 from .contracts import Document, digest, fields, integer, number, require, session, text
 from .portfolio import PortfolioDecision, decimal, minor
-from .stock_rules import (validate_execution_rules, rule_at, listed, floor_quantity, legal_quantity,
+from .stock_rules import (validate_execution_rules, rule_at, interval_at, listed, floor_quantity, legal_quantity,
                           support_ref as csi300_support_ref, CSI300_ELIGIBILITY, CANDIDATE_POLICY)
 
 STOCK_PORTFOLIO_VERSION = "axiom.stock_portfolio/1"
@@ -261,8 +261,14 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
     if strategy:
         from .stock_strategy import ConfiguredStockStrategy
         quantity_rules = {}
+        require(rules["verified_from"] <= context["trade_session"] <= rules["verified_through"],
+                "stock strategy outside verified rule window")
         for security in supported:
-            rule = rule_at(rules, security, context["trade_session"], validated=rule_index)
+            # The frozen union also contains nonmembers before listing and after
+            # delisting. Board constraints do not grant order eligibility; the
+            # actual sizing path still calls rule_at for every selected/held name.
+            rule = interval_at(rule_index[1].get(rule_index[0][security]["board"], []),
+                               context["trade_session"])
             quantity_rules[security] = {name: rule[name] for name in
                 ("buy_minimum", "buy_increment", "sell_minimum", "sell_increment", "daily_proxy_maximum")}
         strategy_targets = ConfiguredStockStrategy(context["portfolio_policy"]["strategy_spec"]).plan(inputs={
