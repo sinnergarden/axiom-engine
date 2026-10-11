@@ -134,6 +134,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
     derived=wire['contract_version']=='derived_signal_run_v1'
     modern=v2 or derived or wire['contract_version']=='stock_prediction_run_v3'
     full = "stock_execution_rules" in context
+    strategy = full and context["portfolio_policy"].get("contract_version") == "stock_portfolio_policy_v4"
     require(admitted_rules is None or (admitted is not None and full), "validated rules require private Runtime admission")
     if full and admitted is None and not modern:
         unsigned = dict(wire); reference = unsigned.pop("signal_run_ref")
@@ -146,6 +147,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
             require(Document.from_dict(unsigned).identity == reference, "Saved v2 prediction identity mismatch")
     fields(context, "trade_session feature_session decision_time knowledge_cutoff reference_prices commission_rate minimum_commission_minor slippage_bps account_state_version supported_security_ids supported_universe_ref" +
            (" portfolio_policy stock_execution_rules stock_execution_rules_ref" if full else " lot_size") +
+           (" strategy_state pending_share_quantities reserved_security_ids risk_observations" if strategy else "") +
            (" feature_knowledge_cutoff" if modern else ""))
     session(context["trade_session"]); session(context["feature_session"])
     cutoff, decision = instant(context["knowledge_cutoff"]), instant(context["decision_time"])
@@ -164,20 +166,29 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         # The public Core entry always validates the complete rule and native identity closure.
         rule_index = validate_execution_rules(rules) if admitted_rules is None else admitted_rules
         digest(context["stock_execution_rules_ref"])
+        from .stock_strategy import strategy_support_ref, validate_strategy_policy
+        expected_support = strategy_support_ref(supported, context["portfolio_policy"]["universe_id"]) if strategy else csi300_support_ref(supported)
         require(supported == wire["universe"] == rules["universe"] and
-                context["supported_universe_ref"] == csi300_support_ref(supported) and
+                context["supported_universe_ref"] == expected_support and
                 (admitted_rules is not None or context["stock_execution_rules_ref"] == Document.from_dict(rules).identity),
                 "complete CSI300 rules/union identity required")
-        require(context["portfolio_policy"] == {"eligibility_id": CSI300_ELIGIBILITY, "top_k": top_k,
+        if strategy:
+            validate_strategy_policy(context["portfolio_policy"], supported, context["stock_execution_rules_ref"])
+            require(context["portfolio_policy"]["top_k"] == top_k, "strategy capacity differs from caller")
+        else:
+            require(context["portfolio_policy"] == {"eligibility_id": CSI300_ELIGIBILITY, "top_k": top_k,
             "rebalance": "weekly_first_trading_session", "budget_basis": BUDGET_BASIS,
             "candidate_policy": CANDIDATE_POLICY, "stock_execution_rules_ref": context["stock_execution_rules_ref"]},
-            "explicit CSI300 valid-member policy required")
+                "explicit CSI300 valid-member policy required")
         require(top_k is not None, "CSI300 policy requires explicit top_k")
     legacy = top_k is None
     k = 5 if legacy else top_k
     if not legacy:
         validate_top_k(k, supported)
     version = CSI300_PORTFOLIO_VERSION if full else (STOCK_PORTFOLIO_VERSION if legacy else TOPK_PORTFOLIO_VERSION)
+    if strategy:
+        from .stock_strategy import STRATEGY_PORTFOLIO_VERSION
+        version = STRATEGY_PORTFOLIO_VERSION
     fields(account, "cash_minor positions version")
     integer(account["cash_minor"]); integer(account["version"])
     require(account["version"] == context["account_state_version"], "account version conflict")
@@ -236,7 +247,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
             "pit_member_count": len(eligible), "valid_candidate_count": valid_count,
             "excluded_invalid_member_count": len(invalid), "excluded_invalid_members": [
                 {"security_id": row["security_id"], "invalid_reason": row["invalid_reason"]} for row in invalid]})
-    if (invalid and not full) or valid_count < k:
+    if (invalid and not full) or (valid_count < k and not strategy):
         result["status"] = "NO_DECISION"
         if not full:
             result["trace"] = [{"reason": "INVALID_SIGNAL", "security_id": row["security_id"], "detail": row["invalid_reason"]} for row in invalid]
@@ -246,9 +257,38 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         return PortfolioDecision.from_dict(result)
     candidates = [row for row in eligible if row["valid"]] if full else eligible
     selected = [row["security_id"] for row in sorted(candidates, key=lambda row: (-row["score"], row["security_id"]))[:k]]
+    strategy_targets = None
+    if strategy:
+        from .stock_strategy import ConfiguredStockStrategy
+        quantity_rules = {}
+        for security in supported:
+            rule = rule_at(rules, security, context["trade_session"], validated=rule_index)
+            quantity_rules[security] = {name: rule[name] for name in
+                ("buy_minimum", "buy_increment", "sell_minimum", "sell_increment", "daily_proxy_maximum")}
+        strategy_targets = ConfiguredStockStrategy(context["portfolio_policy"]["strategy_spec"]).plan(inputs={
+            "feature_session": context["feature_session"], "trade_session": context["trade_session"],
+            "universe": supported, "candidates": [{name: row[name] for name in ("security_id", "score", "member", "valid")} for row in batch],
+            "positions": account["positions"], "pending_share_quantities": context["pending_share_quantities"],
+            "cash_minor": account["cash_minor"], "reference_prices": context["reference_prices"],
+            "risk_observations": context["risk_observations"], "constraints": {"max_positions": k, "quantity_rules": quantity_rules,
+                "reserved_security_ids": context["reserved_security_ids"]}},
+            state=context["strategy_state"]).to_dict()
+        selected = strategy_targets["selected_security_ids"]
+        result.update(strategy_spec_ref=context["portfolio_policy"]["strategy_spec_ref"],
+                      strategy_state_before=context["strategy_state"],
+                      strategy_state_before_ref=Document.from_dict(context["strategy_state"]).identity,
+                      strategy_targets=strategy_targets, strategy_targets_ref=Document.from_dict(strategy_targets).identity,
+                      strategy_state_after_ref=Document.from_dict(strategy_targets["next_state"]).identity)
+        result["trace"].extend(strategy_targets["trace"])
+        result["selected_security_ids"] = selected
+        if strategy_targets["status"] == "NO_DECISION":
+            result["status"] = "NO_DECISION"
+            return PortfolioDecision.from_dict(result)
     result["selected_security_ids"] = selected
     held = {s for s, p in account["positions"].items() if p["quantity"]} if full else set(account["positions"])
     needed = set(selected) | held
+    if strategy_targets is not None:
+        needed = set(strategy_targets["target_weights"]) | held
     prices = {}
     missing = []
     for security in sorted(needed):
@@ -279,8 +319,19 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         return PortfolioDecision.from_dict(result)
     budget = Decimal(account["cash_minor"]) + sum(Decimal(position["quantity"]) * prices[security] * 100
                                                   for security, position in account["positions"].items() if security in held)
+    if strategy_targets is not None:
+        result["targets"].update(strategy_targets["preserve_quantities"])
     for security in sorted(needed):
-        raw = int(budget / k / (prices[security] * 100)) if security in selected else 0
+        if strategy_targets is not None:
+            from fractions import Fraction
+            ratio = strategy_targets["allocation_ratios"].get(security, {"numerator": 0, "denominator": 1})
+            exact = Fraction(budget)*Fraction(ratio["numerator"], ratio["denominator"])/(Fraction(prices[security])*100)
+            raw = exact.numerator//exact.denominator
+        else:
+            raw = int(budget / k / (prices[security] * 100)) if security in selected else 0
+        if strategy_targets is not None and security in strategy_targets["preserve_quantities"]:
+            result["targets"][security] = strategy_targets["preserve_quantities"][security]
+            continue
         if full:
             rule = rule_at(rules, security, context["trade_session"], validated=rule_index)
             result["targets"][security] = floor_quantity(raw, rule["buy_minimum"], rule["buy_increment"])
@@ -305,6 +356,8 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         if reduction > available:
             result["trace"].append({"reason": "T_PLUS_ONE_OR_UNSELLABLE", "security_id": security, "quantity": reduction - available})
     for security in sorted(selected):
+        if strategy_targets is not None and security in strategy_targets["preserve_quantities"]:
+            continue
         current = account["positions"].get(security, {"quantity": 0})["quantity"]
         increase = max(0, result["targets"][security] - current)
         if full:
@@ -317,7 +370,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
             quantity = increase // 100 * 100
         if quantity:
             result["intents"].append({"security_id": security, "side": "BUY", "quantity": quantity})
-    result["trace"].append({"reason": "RAW_TOP5" if legacy else "RAW_TOP_K", "eligible_count": len(eligible),
+    result["trace"].append({"reason": "COMPOSED_STOCK_STRATEGY" if strategy else ("RAW_TOP5" if legacy else "RAW_TOP_K"), "eligible_count": len(eligible),
         **({} if legacy else {"top_k": k}), "tie_break": "security_id_asc",
         "budget_basis": BUDGET_BASIS, "reference_budget_minor": minor(budget), "sizing": "previous_native_close",
         "score_semantics": wire["score_semantics"], "cash_check": "actual_fill_cash"})

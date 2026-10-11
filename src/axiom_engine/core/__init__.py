@@ -11,10 +11,13 @@ from .stock_portfolio import StockPredictionFrame, plan_stock_portfolio, validat
 from .stock_signal import execute_signal_plan, validate_signal_plan, validate_label_spec, signal_plan_ref
 from .signal_statistics import SignalStatistics, evaluate_signal_statistics
 from .etf_buy_hold import etf_buy_and_hold_policy, plan_etf_buy_and_hold
+from .stock_strategy import (StockStrategy, StrategyTargets, ConfiguredStockStrategy,
+                             stock_strategy_spec, initial_strategy_state)
 
 __all__ = ['ABI', 'SEMANTICS', 'ContractError', 'ExecutionContext', 'FactBatch',
            'FeatureFrame', 'FeaturePlan', 'unresolved', 'execute_feature_plan', 'execute_cs_zscore_batch', 'execute_feature_plan_batch', 'execute_forward_returns',
            'required_history', 'validate_plan', 'SignalFrame', 'PortfolioDecision', 'plan_rotation',
            'StockPredictionFrame', 'plan_stock_portfolio', 'validate_stock_predictions',
            'execute_signal_plan', 'validate_signal_plan', 'validate_label_spec', 'signal_plan_ref',
-           'SignalStatistics', 'evaluate_signal_statistics', 'etf_buy_and_hold_policy', 'plan_etf_buy_and_hold']
+           'SignalStatistics', 'evaluate_signal_statistics', 'etf_buy_and_hold_policy', 'plan_etf_buy_and_hold',
+           'StockStrategy', 'StrategyTargets', 'ConfiguredStockStrategy', 'stock_strategy_spec', 'initial_strategy_state']

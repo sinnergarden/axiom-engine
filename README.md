@@ -130,3 +130,59 @@ cumulative theoretical tails, possible additional shares, and local original-pri
 mark sensitivity. These are disclosures, not account assets or a P&L correction.
 They do not bound full-path return differences or establish conservative returns.
 No persisted market admission or checkpoint/resume support is introduced.
+
+The opt-in stock strategy API uses the same bounded v7/v8 account path and a
+new `axiom.stock_portfolio/4` decision. The existing TopK factories and v1/v2/v3
+decisions retain their original configuration. The pure `StockStrategy` protocol
+and built-in `ConfiguredStockStrategy` are exported by `axiom_engine.core`;
+the approved input/output and economic conventions are in the
+[shared strategy design](https://github.com/sinnergarden/axiom-docs/blob/codex/docs-engine-strategy-protocol-20261011/docs/design/engine-strategy-protocol-v1.md).
+
+```python
+from axiom_engine.core import stock_strategy_spec
+from axiom_engine.runtime import stock_portfolio_policy
+
+specs = [
+    stock_strategy_spec(top_k=5),
+    stock_strategy_spec(selection="rank_buffer", top_k=5,
+                        rank_buffer={"keep_rank": 10}),
+    stock_strategy_spec(top_k=5, exit_overlay={
+        "take_profit": "0.20", "stop_loss": "0.10",
+        "cost_basis": "fee_inclusive_ledger_cost_per_owned_share_v1",
+        "check": "rebalance_sessions_only", "cooldown_rebalance_sessions": 1,
+        "reentry": "after_flat_and_cooldown",
+    }),
+]
+policy = stock_portfolio_policy(strategy_spec=specs[0], universe_id="csi300",
+    execution_universe=frozen_union, execution_rules=frozen_rules)
+```
+
+Bind `policy` to the original bounded request and recompute its `request_ref`;
+keep the saved daily prediction bindings, market and profile unchanged. Accounts
+remain isolated. CSI300 keeps its existing support reference; another pool must
+bind `portfolio_support_ref(policy, frozen_union)` and pass original native
+membership admission. The admitted market owner can reuse its CSI300 market for
+these policies, then bind each request's saved signals; its existing capability
+does not authorize a different membership pool.
+
+All three strategies check weekly and execute through the next session's
+existing daily-open simulation. Weekly-close exits include buying fees and
+confirmed share entitlements in their average-cost basis; cash dividends do not
+reduce that basis. Frozen shares, pending grants and registered future stock
+rights occupy slots. Reserved slots add no asset or NAV value. A new buy that
+would exceed the actual owned-position limit records `MAX_OWNED_POSITIONS`.
+The saved loader checks strategy/state identities, exit observations against the
+prior original-unit position snapshot, and capacity from the saved journal; it
+does not replay the strategy or reopen signals/native inputs.
+`allocation_ratios` stores each weight as an exact integer numerator and
+denominator. Core floors the exact rational budget/price quantity before applying
+the existing lot rules; the decimal `target_weights` are its readable projection.
+This retains K=3 lot boundaries without epsilon or upward quantity adjustments.
+Preserve-only rights explicitly have zero quantity targets and produce no buys.
+
+This release's evidence is synthetic source validation. The designated real
+case is Research's 2023 historical CSI300 cross-section with 88 features; a
+CSI800 input or historical nonfinancial classification is not claimed here.
+Source changes also change the global implementation reference: previously
+derived signals must still follow the existing explicit raw-to-Derived migration
+when necessary. Original saved accounts and raw signal identities remain intact.

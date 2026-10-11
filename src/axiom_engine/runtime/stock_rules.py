@@ -51,3 +51,45 @@ def csi300_stock_portfolio_policy(*, top_k: int, execution_universe: list[str], 
     return dict(eligibility_id=CSI300_ELIGIBILITY, top_k=top_k, rebalance="weekly_first_trading_session",
                 budget_basis=BUDGET_BASIS, candidate_policy=CANDIDATE_POLICY,
                 stock_execution_rules_ref=Document.from_dict(execution_rules).identity)
+
+
+def strategy_support_ref(universe, universe_id):
+    from ..core.stock_strategy import strategy_support_ref as core_support_ref
+    return core_support_ref(universe, universe_id)
+
+
+def strategy_stock_portfolio_policy(*, strategy_spec, universe_id, execution_universe, execution_rules):
+    """The original PIT membership query must independently admit this pool ID."""
+    from ..core.stock_strategy import validate_strategy_spec
+    validate_execution_rules(execution_rules)
+    require(type(execution_universe) is list and execution_universe == execution_rules["universe"],
+            "complete frozen strategy execution union required")
+    validate_strategy_spec(strategy_spec)
+    validate_top_k(strategy_spec["top_k"], execution_universe)
+    strategy_support_ref(execution_universe, universe_id)
+    return dict(contract_version="stock_portfolio_policy_v4", eligibility_id="pit_a_share_strategy_v1",
+                universe_id=universe_id, top_k=strategy_spec["top_k"], rebalance="weekly_first_trading_session",
+                budget_basis=BUDGET_BASIS, candidate_policy=CANDIDATE_POLICY,
+                stock_execution_rules_ref=Document.from_dict(execution_rules).identity,
+                strategy_spec=deepcopy(strategy_spec), strategy_spec_ref=Document.from_dict(strategy_spec).identity)
+
+
+def validate_full_stock_policy(policy, *, execution_universe, execution_rules):
+    if policy.get("contract_version") == "stock_portfolio_policy_v4":
+        expected = strategy_stock_portfolio_policy(strategy_spec=policy.get("strategy_spec"),
+            universe_id=policy.get("universe_id"), execution_universe=execution_universe, execution_rules=execution_rules)
+    else:
+        expected = csi300_stock_portfolio_policy(top_k=policy.get("top_k"), execution_universe=execution_universe,
+                                               execution_rules=execution_rules)
+    require(policy == expected, "stock portfolio policy identity mismatch")
+    return policy
+
+
+def portfolio_support_ref(policy, universe):
+    from ..core.stock_rules import support_ref
+    return (strategy_support_ref(universe, policy["universe_id"])
+            if policy.get("contract_version") == "stock_portfolio_policy_v4" else support_ref(universe))
+
+
+def stock_core_version(policy):
+    return "axiom.stock_portfolio/4" if policy.get("contract_version") == "stock_portfolio_policy_v4" else "axiom.stock_portfolio/3"

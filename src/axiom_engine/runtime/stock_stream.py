@@ -9,11 +9,12 @@ from .stock_stream_contracts import (RESULT_GROUPS, RUN_VERSION,
     validate_manifest, write_budget)
 from .stock_stream_inputs import StockInputSource
 from .stock_stream_outputs import StockResultSink, canonical_size
+from .stock_rules import stock_core_version
 
 
 def stock_run_id(manifest, implementation_ref=IMPLEMENTATION_REF):
     return Document.from_dict({"request_ref": manifest["request_ref"],
-        "core_version": "axiom.stock_portfolio/3", "runtime_version": ("axiom.backtest/8" if manifest["contract_version"] == "backtest_request_v8" else STREAM_RUNTIME_VERSION),
+        "core_version": stock_core_version(manifest["portfolio_policy"]), "runtime_version": ("axiom.backtest/8" if manifest["contract_version"] == "backtest_request_v8" else STREAM_RUNTIME_VERSION),
         "implementation_ref": implementation_ref}).identity
 
 
@@ -245,7 +246,7 @@ class _StreamStorage:
             "signal_ref": self.manifest["prediction_input"]["prediction_ref"],
             "market_ref": self.manifest["market_input"]["market_ref"],
             "profile_ref": self.manifest["profile_input"]["profile_ref"],
-            "core_version": "axiom.stock_portfolio/3", "runtime_version": "axiom.backtest/8" if equity else STREAM_RUNTIME_VERSION,
+            "core_version": stock_core_version(self.manifest["portfolio_policy"]), "runtime_version": "axiom.backtest/8" if equity else STREAM_RUNTIME_VERSION,
             "implementation_ref": IMPLEMENTATION_REF, "committed_sequence": ledger.sequence,
             "initial_nav_minor": initial_value, "final_account": {"cash_minor": ledger.cash,
                 "receivable_minor": sum(ledger.receivables.values()), "positions": ledger.positions,
