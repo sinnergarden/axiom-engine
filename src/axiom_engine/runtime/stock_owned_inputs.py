@@ -151,7 +151,7 @@ class AdmittedStockInputs(StockInputSource):
         require(all(receipt["counts"][name] <= limits["max_"+name]
                     for name in ("market_rows", "prediction_rows")), "Admitted stock actual row limit exceeded")
         receipt["request_ref"] = plan["request_ref"]
-        self._prepared = {"request_ref": plan["request_ref"]}
+        self._prepared = {'request_ref':plan['request_ref'],'signal_headers':meta.get('signal_headers',{})}
         self.__statistics["account_bindings"] += 1
         if self.__market is None:
             globals_value, lifecycle = meta["globals"], meta["lifecycle"]
@@ -194,7 +194,7 @@ class AdmittedStockInputs(StockInputSource):
                 count = len(value["market_rows"]) + sum(len(item["rows"]) for item in value["signals"])
                 stage.reserve(64*count)
                 rows = {(row["session"], row["security_id"]): row for row in value["market_rows"]}
-                signals = {item["session"]: (item["header"],
+                signals = {item["session"]: (item['header'] if 'header' in item else self._prepared['signal_headers'][item['signal_ref']],
                     {(row["session"], row["security_id"]): row for row in item["rows"]}) for item in value["signals"]}
                 if market_stage is not None:
                     stage.used += market_stage.used

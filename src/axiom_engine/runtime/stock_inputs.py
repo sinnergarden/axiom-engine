@@ -254,6 +254,9 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
     # Verify frozen native projections, without Data access or account execution.
     projection = {}
     if full:
+        from .stock_market import _stock_lifecycle_active, _stock_metadata, _keyed_stock
+        states = _keyed_stock(batches[0])
+        state_metadata = _stock_metadata(batches[0], "market_state")
         rules = profile["stock_execution_rules"]
         identities, _ = validate_execution_rules(rules)
         require(rules["calendar"] == calendar and plan["stock_execution_rules_ref"] == profile["stock_execution_rules_ref"] ==
@@ -283,7 +286,8 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
         factor_meta = {(r["session"], r["security_id"]): r for r in batches[3]["field_meta"]["factor"]["by_key"]}
         factor_ref = native_ref(batches[3])
         close_meta = {(r["session"], r["security_id"]): r for r in batches[1]["field_meta"]["close"]["by_key"]}
-        indexed = {key: {**row, "_stock_listed": listed(identities[key[1]], key[0]),
+        indexed = {key: {**row, "_stock_listed": _stock_lifecycle_active(identities[key[1]], key[0],
+            states[key]["market_state"], state_metadata[key]),
             "_stock_factor_valid": factors[key] is not None,
             "_stock_factor_missing_reason": factor_meta[key].get("missing_reason"),
             "_stock_factor_source_ref": factor_ref, "_stock_close_missing_reason": close_meta[key].get("missing_reason"),

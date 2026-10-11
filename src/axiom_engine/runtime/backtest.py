@@ -402,7 +402,7 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
             for row in rows.values():
                 gap = not row["_stock_factor_valid"] or any(row[name] is None for name in
                     ("open", "close", "volume_shares", "limit_up", "limit_down"))
-                if row["market_state"] == "not_listed": lifecycle["pre_listing_null"] += 1
+                if row["session"] < rules_index[0][row["security_id"]]["listing_date"]: lifecycle["pre_listing_null"] += 1
                 elif row["_stock_listed"] and gap: lifecycle["member_gap" if row["_stock_member"] else "listed_nonmember_gap"] += 1
     for index, day in enumerate(calendar):
         if day > plan["end_session"]:

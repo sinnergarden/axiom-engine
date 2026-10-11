@@ -70,6 +70,56 @@ def interval_at(rows, day, *, label="stock rule"):
     return matched[0]
 
 
+def _identity_event_evidence(batches, universe, through):
+    """Validate original public retrospective event evidence, not historic receipt."""
+    from .stock_portfolio import instant
+    masters = [(ref, batch) for ref, batch in batches.items() if batch['context']['domain']=='security_master']
+    events = [(ref, batch) for ref, batch in batches.items() if batch['context']['domain']=='listing_events']
+    require(len(masters)==len(events)==1, "identity v2 needs one original master and event batch")
+    master_ref, master = masters[0]; event_ref, batch = events[0]
+    query, original = batch['context']['query'], master['context']['query']
+    require(batch['context']['snapshot_id']==master['context']['snapshot_id'] and
+            query['symbols']==original['symbols']==universe and query['start']=='1900-01-01' and
+            query['end']==through and query['cutoff']==original['cutoff'] and
+            original['pit_policy']=='operational_pit_v1' and original['purpose']=='historical_exploration' and
+            original['start']=='1900-01-01' and original['end']==through and
+            query['pit_policy']=='operational_pit_v1' and query['purpose']=='historical_exploration' and
+            query['time_field']=='event_date' and query['filters']=={'event_type':'delisting'} and
+            query['fields']==['exchange','listing_date','delisting_date','event_date','event_state'],
+            "identity event query/Snapshot/observation closure mismatch")
+    selected = {}
+    indexed = {}
+    for name in query['fields']:
+        indexed[name] = {}
+        for meta in batch['field_meta'][name]['by_key']:
+            key = meta['security_id'], meta['event_type']
+            require(key not in indexed[name], "duplicate identity event metadata")
+            indexed[name][key] = meta
+    for row in batch['records']:
+        security = row['security_id']; key = security, row['event_type']
+        require(security in universe and security not in selected and row['event_type']=='delisting' and
+                row['event_state']=='value' and row['event_date']==row['delisting_date'] and
+                query['start']<=row['event_date']<=through, "ambiguous/invalid original delisting event")
+        metadata = []
+        for name in query['fields']:
+            require(key in indexed[name], "missing identity event metadata")
+            meta = indexed[name][key]
+            require(meta.get('status')=='value' and meta.get('missing_reason') is None and
+                    all(type(meta.get(n)) is str and bool(meta[n]) for n in
+                        ('revision_id','raw_batch_id','usable_from','availability_basis','first_observed_at')) and
+                    meta['availability_basis']=='first_observed_at' and
+                    instant(meta['usable_from'])==instant(meta['first_observed_at'])<=instant(query['cutoff']),
+                    "unavailable/unbound original identity event")
+            metadata.append(meta)
+        proof = {n:metadata[0][n] for n in ('revision_id','raw_batch_id','usable_from','availability_basis','first_observed_at')}
+        require(all(all(m[n]==value for n,value in proof.items()) for m in metadata),
+                "identity event fields select different revisions")
+        selected[security] = (row, {'source_ref':event_ref,'event_date':row['event_date'],**proof})
+    require(all(set(values)=={(s,'delisting') for s in selected} for values in indexed.values()),
+            "identity event metadata grid mismatch")
+    return master_ref, event_ref, selected
+
+
 def validate_execution_rules(wire):
     fields(wire, "contract_version universe calendar identity_input identity_input_ref quantity_rules sources "
                  "verified_from verified_through limitations")
@@ -87,13 +137,14 @@ def validate_execution_rules(wire):
     sources = _sources(wire["sources"])
     identity = wire["identity_input"]
     fields(identity, "contract_version rows source_refs source_evidence limitations")
-    require(identity["contract_version"] == "stock_execution_identity_v1" and
+    v2 = identity["contract_version"] == "stock_execution_identity_v2"
+    require(identity["contract_version"] in ("stock_execution_identity_v1", "stock_execution_identity_v2") and
             wire["identity_input_ref"] == Document.from_dict(identity).identity, "stock identity input mismatch")
     require(type(identity["limitations"]) is list and all(type(x) is str for x in identity["limitations"]),
             "identity provenance limitations required")
     require(type(identity["source_refs"]) is list and bool(identity["source_refs"]) and
             len(set(identity["source_refs"])) == len(identity["source_refs"]), "identity source closure required")
-    native = {}
+    native = {}; batches = {}
     require(type(identity["source_evidence"]) is list and bool(identity["source_evidence"]), "native identity evidence required")
     for entry in identity["source_evidence"]:
         fields(entry, "reference batch"); digest(entry["reference"])
@@ -101,7 +152,8 @@ def validate_execution_rules(wire):
         require(entry["reference"] not in native and Document.from_dict(batch).identity == entry["reference"],
                 "stock native identity hash mismatch")
         require(batch.get("context", {}).get("contract_version") == "data_batch_v1" and
-                batch["context"].get("domain") == "security_master", "native security master required")
+                batch["context"].get("domain") in (("security_master","listing_events") if v2 else ("security_master",)),
+                "native security master/event required")
         records = {}
         require(type(batch.get("records")) is list, "native identity records required")
         for row in batch["records"]:
@@ -109,7 +161,10 @@ def validate_execution_rules(wire):
             require(type(security) is str and security not in records, "duplicate native identity")
             records[security] = row
         native[entry["reference"]] = records
+        batches[entry["reference"]] = batch
     require(set(native) == set(identity["source_refs"]), "unbound native identity source")
+    if v2:
+        master_ref, event_ref, events = _identity_event_evidence(batches, universe, wire['verified_through'])
     index = {}
     require(type(identity["rows"]) is list, "stock classification rows required")
     for row in identity["rows"]:
@@ -130,13 +185,24 @@ def validate_execution_rules(wire):
         require(type(row["source_refs"]) is list and bool(row["source_refs"]) and
                 len(set(row["source_refs"])) == len(row["source_refs"]) and set(row["source_refs"]) <= set(native),
                 "stock classification lacks native identity binding")
-        for ref in row["source_refs"]:
+        for ref in ([master_ref] if v2 else row["source_refs"]):
             original = native[ref].get(security)
             require(original is not None and all(original.get(name) == row[name] for name in
-                    ("exchange", "listing_date", "delisting_date")), "classification differs from native identity")
+                    (("exchange", "listing_date") if v2 else ("exchange", "listing_date", "delisting_date"))),
+                    "classification differs from native identity")
+        proof = None
+        if v2:
+            event = events.get(security)
+            require(row['source_refs']==[master_ref]+([event_ref] if event else []), "identity row event source closure mismatch")
+            if event:
+                original_event, proof = event
+                require(all(original_event[n]==row[n] for n in ('exchange','listing_date','delisting_date')) and
+                        original['delisting_date'] in (None,row['delisting_date']), "identity boundary contradicts original sources")
+            else:
+                require(row['delisting_date']==original['delisting_date'], "identity boundary lacks original event")
         # Board is an explicit source-backed mapping. Code prefixes do not filter the union;
         # documented exceptional assignments, such as 302132 on ChiNext, remain representable.
-        index[security] = row
+        index[security] = ({**row,'_stock_identity_version':2,'_stock_delisting_evidence':proof} if v2 else row)
     require(list(index) == universe, "complete ordered canonical stock identity union required")
     require(type(wire["quantity_rules"]) is list and bool(wire["quantity_rules"]), "frozen stock quantity intervals required")
     for rule in wire["quantity_rules"]:

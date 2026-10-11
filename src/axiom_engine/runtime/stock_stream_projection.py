@@ -131,8 +131,9 @@ def _run_header(wire):
             "core_version": wire["core_version"], "runtime_version": wire["runtime_version"],
             "implementation_ref": wire["implementation_ref"]}), "saved v7 run identity mismatch")
     audit = wire["source_audit"]
-    fields(audit, "contract_version request_ref market_ref prediction_ref profile_ref implementation_ref counts limitations")
-    require(audit["contract_version"] == "stock_input_audit_v1" and
+    from .stock_stream_contracts import validate_source_audit
+    validate_source_audit(audit,request)
+    require(
             wire["source_audit_ref"] == _hash_wire(audit) and
             all(audit[name] == wire[name] for name in
                 ("request_ref", "market_ref", "profile_ref", "implementation_ref")) and
@@ -269,8 +270,25 @@ def _saved_business(wire, rows, profile):
         decision_days.add(day)
         frame = frames.get(decision.get("signal_ref"))
         clock = decision.get("prediction_clock")
-        require(frame is not None and type(clock) is dict and clock.get("model_ref") == frame["model_ref"] and
-                clock.get("fold_spec_ref") == frame["fold_spec_ref"], "saved decision/Signal metadata mismatch")
+        require(frame is not None and type(clock) is dict,'Saved decision/Signal metadata required')
+        if frame.get('kind')=='derived':
+            require(clock.get('contract_version')=='stock_signal_clock_v2' and clock.get('kind')=='derived' and
+                    clock.get('parent_signal_refs')=={a:p['signal_run_ref'] for a,p in frame['parent_inputs'].items()} and
+                    all(clock.get(k)==frame[k] for k in ('signal_plan_ref','score_ref','implementation_ref','signal_stage')) and
+                    'model_ref' not in clock and 'fold_spec_ref' not in clock,'Saved Derived parent metadata mismatch')
+            for name in ('signal_plan_ref','score_ref','implementation_ref'): digest(clock.get(name))
+        else:
+            require(clock.get('model_ref')==frame['model_ref'] and clock.get('fold_spec_ref')==frame['fold_spec_ref'],
+                    'Saved decision/Signal metadata mismatch')
+            target=wire['source_audit'].get('prediction_targets',{}).get(decision['signal_ref'])
+            if target is not None:
+                require(clock.get('contract_version')=='stock_signal_clock_v2',
+                        'Saved raw clock differs from admitted LabelSpec')
+            if clock.get('contract_version')=='stock_signal_clock_v2':
+                require(clock.get('kind')=='raw' and clock.get('signal_stage')=='raw_prediction','Saved raw Signal stage mismatch')
+                digest(clock.get('label_spec_ref'))
+                require(clock['label_spec_ref']==target,
+                        'Saved raw target differs from admitted LabelSpec')
         require(type(decision.get("intents")) is list, "saved decision intents required")
         for intent in decision["intents"]:
             key = intent.get("intent_id")

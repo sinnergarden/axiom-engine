@@ -114,6 +114,15 @@ class _Store:
         self.write_seconds += perf_counter()-started
         return len(self.offsets)//2-1
 
+    def write_metadata(self,reference,header,memory):
+        """Retain a full original header once, outside account day offsets."""
+        number=self.write({'contract_version':'stock_signal_metadata_v1','signal_ref':reference,'header':header},memory)
+        start,length=self.offsets[2*number:2*number+2]
+        del self.offsets[2*number:2*number+2]
+        self.charge(16+len(reference))
+        memory.replace_global(('private_offsets',id(self)),len(self.offsets)*8)
+        return {'signal_ref':reference,'offset':start,'length':length}
+
     def read(self, number, memory, budget):
         start, length = self.offsets[2*number:2*number+2]
         stage = memory.stage()
@@ -340,10 +349,12 @@ def _binding_inventory(market, plan, source, proof):
         if urlparse(artifact["manifest_uri"]).fragment:
             descriptor = path.with_name("manifest.json")
             files.setdefault(str(descriptor), {"manifest_uri": str(descriptor), "file_bytes": descriptor.stat().st_size})
+    from .stock_stream_contracts import prediction_inventory
+    folds,prediction_rows=prediction_inventory(plan['prediction_input'],plan['scope'])
     value = {"files": list(files.values()), "input_bytes": sum(f["file_bytes"] for f in files.values()),
-        "folds": len(plan["prediction_input"]["frames"]), "declared_rows": {
+        "folds": folds, "declared_rows": {
             "market_rows": len(plan["scope"]["calendar"])*len(plan["scope"]["execution_universe"]),
-            "prediction_rows": (len(plan["scope"]["calendar"])-1)*len(plan["scope"]["prediction_universe"])},
+            "prediction_rows": prediction_rows},
         "declared_scope": plan["scope"]}
     if native:
         value["native_artifacts"] = list(native.values())
@@ -378,16 +389,17 @@ def _bind(market, plan, source, limits, maximum):
     inventory = _binding_inventory(market, plan, source, proof)
     require(inventory["input_bytes"] <= limits["max_input_bytes"] and inventory["folds"] <= limits["max_folds"],
             "Stock source inventory exceeds input/fold budget")
-    require(all(inventory["declared_rows"][n] <= limits["max_"+n] for n in ("market_rows", "prediction_rows")),
-            "Stock source inventory exceeds declared row budget")
+    from .stock_stream_contracts import check_inventory_rows,resolve_prediction_inventory
+    check_inventory_rows(inventory,limits)
     source._memory = _DecodedMemory(budget["max_decoded_bytes"], scalar_cache_bytes=source._scalar_cache_bytes)
     source._memory.reserve_global("request", _encoded_size(plan))
     source._inventory_sizes = {str(_path(f["artifact"], must_exist=False)) if "artifact" in f else f["manifest_uri"]: f["file_bytes"] for f in inventory["files"]}
     source._scan_row_limits = {}; source._scan_native_scopes = {}; source._prediction_paths = set()
     source._prediction_remaining = limits["max_prediction_rows"]
-    for frame in plan["prediction_input"]["frames"]:
-        path = str(_path(frame["prediction_artifact"]))
-        source._scan_row_limits[path] = limits["max_prediction_rows"]; source._prediction_paths.add(path)
+    from .stock_stream_contracts import score_artifacts
+    for artifact in score_artifacts(plan['prediction_input']):
+        path=str(_path(artifact))
+        source._scan_row_limits[path]=limits['max_prediction_rows'];source._prediction_paths.add(path)
     meta, meta_stage = market._globals(source._memory, budget)
     store = None
     member_key = member_stage = member_view = members = member_metadata = None
@@ -458,6 +470,8 @@ def _bind(market, plan, source, limits, maximum):
                 refs = {i["native_view_ref"] for i in selected_native}
                 proof["native_files"] = [f for f in inventory["files"] if f.get("native_view_ref") in refs]
         frames, trade_map = _frames(source, plan, budget)
+        resolve_prediction_inventory(inventory,source,limits)
+        modern=plan['prediction_input']['contract_version']=='stock_prediction_input_refs_v2'
         binding_key = _input_key(plan); inventory_wire = canonical(inventory).encode()
         proof_cost = 0 if key in market._proofs else len(key)+_encoded_size(proof)+64
         require(market._store.used+proof_cost <= market._store.maximum,
@@ -470,6 +484,12 @@ def _bind(market, plan, source, limits, maximum):
         require(store.used+16 <= store.maximum, "max_signal_bytes exceeds quota before index growth")
         source._memory.reserve_global(("private_offsets", id(store)), 16)
         store.offsets.extend((0, 0))
+        headers={};metadata_locations=[]
+        if modern:
+            for frame in frames:
+                reference=frame['header']['signal_run_ref'];headers[reference]=frame['header']
+                if frame.get('kind')=='derived':
+                    metadata_locations.append(store.write_metadata(reference,frame['original_header'],source._memory))
         prediction_rows = 0
         for offset in range(0, len(calendar), market._block_sessions):
             days = tuple(calendar[offset:offset+market._block_sessions]); signals, bindings, parents = [], [], set()
@@ -478,31 +498,33 @@ def _bind(market, plan, source, limits, maximum):
                     if trade not in trade_map:
                         continue
                     frame, feature = trade_map[trade]
-                    frame["spec_index"].unchanged(); frame["model_index"].unchanged()
-                    parent = frame["parent_binding"]
-                    if parent is not None and parent["parent_ref"] not in parents:
-                        parents.add(parent["parent_ref"])
-                        require(frame["spec_index"].span_digest(frame["spec_index"].selector) == parent["child_ref"],
-                                "Original saved fold child changed after admission")
-                        bindings.append(parent)
-                    rows, used, refs = frame["index"].rows(("rows",), [feature], budget, reservation=stage)
+                    if frame.get('kind')=='derived':
+                        from .stock_signal_inputs import read_derived
+                        rows,refs=read_derived(source,frame,feature,budget,stage)
+                    else:
+                        frame["spec_index"].unchanged(); frame["model_index"].unchanged()
+                        parent = frame["parent_binding"]
+                        if parent is not None and parent["parent_ref"] not in parents:
+                            parents.add(parent["parent_ref"])
+                            require(frame["spec_index"].span_digest(frame["spec_index"].selector) == parent["child_ref"],
+                                    "Original saved fold child changed after admission")
+                            bindings.append(parent)
+                        rows, used, refs = frame["index"].rows(("rows",), [feature], budget, reservation=stage)
                     bindings += refs
                     with source._memory.stage() as validation:
                         validation.reserve(3*(_encoded_size(frame["header"])+sum(_encoded_size(r) for r in rows)+32))
-                        wire, checked = validate_stock_predictions(StockPredictionFrame.from_dict({**frame["header"], "rows": rows}))
+                        from .stock_signal_inputs import check_day_rows
+                        checked=check_day_rows(frame,feature,rows)
                         require(len(checked) == len(universe), "Incomplete original saved prediction date group")
                         membership_for(feature)
-                        for row_key, row in checked.items():
-                            require(row["member"] == members[row_key]["is_member"] and
-                                instant(row["feature_knowledge_cutoff"]) == instant(feature+"T20:30:00+08:00") and
-                                instant(row["knowledge_cutoff"]) == instant(row["available_at"]) == instant(feature+"T21:00:00+08:00") and
-                                instant(row["simulated_model_available_at"]) == instant(frame["model"]["simulated_available_at"]),
-                                "Saved prediction membership/fixed clock mismatch")
+                        from .stock_signal_inputs import validate_day
+                        validate_day(frame,feature,checked,members,member_metadata,
+                            next(d['entry']['native_ref'] for d in meta['descriptors'] if d['kind']=='membership' and feature in d['days']))
                         prediction_rows += len(checked)
                         require(prediction_rows <= limits["max_prediction_rows"], "Stock prediction row budget exceeded")
                         wire = checked = row = None
                     stage.reserve(64*len(rows)+512)
-                    signals.append({"session": trade, "header": frame["header"], "rows": rows})
+                    signals.append({'session':trade,'rows':rows,**({'signal_ref':frame['header']['signal_run_ref']} if modern else {'header':frame['header']})})
                     wire = checked = row = refs = None
                 stage.reserve(512)
                 store.write({"sessions": list(days), "signals": signals, "bindings": bindings}, source._memory)
@@ -510,12 +532,17 @@ def _bind(market, plan, source, limits, maximum):
         contexts = [d["context"] for d in meta["descriptors"]] + proof["contexts"]
         limitations = sorted({x for c in contexts for x in c.get("limitations", [])}) + meta["globals"]["market_header"]["limitations"][-3:]
         counts = {**meta["counts"], "input_bytes": inventory["input_bytes"], "input_files": len(inventory["files"]),
-                  "folds": len(frames), "prediction_rows": prediction_rows}
+                  "folds": inventory['folds'], "prediction_rows":
+                      limits['max_prediction_rows']-source._prediction_remaining if plan['prediction_input']['contract_version']=='stock_prediction_input_refs_v2' else prediction_rows}
         receipt = {"contract_version": "stock_input_audit_v1", "request_ref": plan["request_ref"],
             "market_ref": plan["market_input"]["market_ref"], "prediction_ref": plan["prediction_input"]["prediction_ref"],
             "profile_ref": plan["profile_input"]["profile_ref"], "implementation_ref": IMPLEMENTATION_REF,
             "counts": counts, "limitations": limitations}
-        number = store.write({"receipt": receipt, "signal_limitations": sorted({v for f in frames for v in f["header"]["limitations"]})}, source._memory)
+        if modern:
+            from .stock_signal_inputs import prediction_targets
+            receipt.update(contract_version='stock_input_audit_v2',prediction_targets=prediction_targets(frames))
+        number = store.write({"receipt": receipt, "signal_limitations": sorted({v for f in frames for v in f["header"]["limitations"]}),
+            **({'signal_headers':headers,'signal_metadata_locations':metadata_locations} if modern else {})}, source._memory)
         # Place metadata at logical slot zero without moving private bytes.
         store.offsets[:2] = store.offsets[2*number:2*number+2]; del store.offsets[2*number:2*number+2]
         for index in source._indexes.values():
@@ -527,6 +554,8 @@ def _bind(market, plan, source, limits, maximum):
             "account_bindings": 0, "source_operations": source.statistics["source_operations"],
             "source_decoded_bytes_peak": source.statistics["decoded_bytes_peak"],
             "source_scalar_cache_evictions": source.statistics["scalar_cache_evictions"]}
+        if modern:
+            stats.update(signal_metadata_records=len(metadata_locations),signal_metadata_bytes=sum(i['length'] for i in metadata_locations))
         result = AdmittedStockInputs(_IMPORT, store.file, store.offsets, binding_key, market._block_sessions,
                                      inventory_wire, stats, market=market)
         if key not in market._proofs:

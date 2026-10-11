@@ -16,12 +16,25 @@ LIMITATIONS = ["Model and prediction clocks are declared simulation, not histori
 
 
 def _verify_model(model):
-    fields(model, "contract_version dataset_ref feature_ref label_ref raw_label_refs fit_cutoff simulated_available_at clock_basis ordered_features feature_selection catalog_ref target_semantics parameters num_boost_round environment implementation_ref booster_digest feature_normalization label_normalization model_ref")
-    require(model["contract_version"] == "stock_model_release_v2" and
+    modern=model.get('contract_version')=='stock_model_release_v3'
+    fields(model, "contract_version dataset_ref feature_ref label_ref raw_label_refs fit_cutoff simulated_available_at clock_basis ordered_features feature_selection catalog_ref target_semantics parameters num_boost_round environment implementation_ref booster_digest feature_normalization label_normalization model_ref"+
+           (' label_spec label_spec_ref' if modern else ''))
+    require(model["contract_version"] in ("stock_model_release_v2","stock_model_release_v3") and
             model["clock_basis"] == "declared_simulation", "Saved stock model contract required")
     unsigned = dict(model); reference = unsigned.pop("model_ref")
     digest(reference)
     require(Document.from_dict(unsigned).identity == reference, "Saved model metadata identity mismatch")
+    if modern:
+        from ..core.stock_signal import validate_label_spec, validate_label_normalization, _ref
+        from ..core.contracts import integer, text
+        validate_label_spec(model['label_spec']);validate_label_normalization(model['label_normalization'])
+        require(model['label_spec_ref']==_ref(model['label_spec']), 'Saved model LabelSpec identity mismatch')
+        text(model['target_semantics'])
+        features=model['ordered_features']
+        require(type(features) is list and bool(features) and len(features)==len(set(features)), 'Explicit unique model features required')
+        for feature in features: text(feature)
+        integer(model['num_boost_round'],1)
+        require(type(model['parameters']) is dict and model['parameters'].get('objective')=='regression', 'Unsupported stock model objective')
 
 
 def _compile_folds(folds, calendar):
