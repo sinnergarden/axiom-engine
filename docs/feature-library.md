@@ -20,7 +20,17 @@ The adapter supplies `dependency_refs(definitions, days, physical_security_ids)`
 and `prepare(plan, day, physical_security_ids, dependencies)`. It owns source
 selection, the original output-day anchor/cutoff and exact local leaf provenance;
 prepare must bind `feature_dependency_ref=digest(dependencies)` in Core input_refs.
+An optional `execution_plan(plan, day, physical_security_ids, dependencies)`
+may project only the actual day's source bindings before compilation. Every
+other plan field must remain identical. The original Core source limit stays
+unchanged; historical source generations are never merged into one global plan.
 The library does not broaden a source's supported universe or PIT policy.
+
+Coverage builds one local tuple-key index, then looks up each requested column
+once. Ensure reuses that plan while publishing its newly sealed tiles. An
+explicit `execution_session()` shares bounded store admission for raw ensure,
+saved raw projection and CS ensure; file epochs are checked during the session,
+and a fresh session hashes the actual files again.
 
 Feature identity binds the actual DAG/input interpretation and scoped operator
 semantic revisions. Catalog/selection hashes, entire source manifests and code
@@ -35,9 +45,11 @@ and source sets. Existing hit bytes are admitted before a COMPLETE view is
 published; a persisted index is never a trusted flag. Sealed partitions precede
 the atomic index and can be recovered after interruption.
 
-At this checkpoint, two short synthetic cases verify subset zero-computation,
+At this checkpoint, four short synthetic cases verify subset zero-computation,
 column/date expansion, exact original-Core/raw-to-CS equivalence, reference and
-input changes, split column blocks, and one recovery. Full Research
-label/model/strategy integration, a real expansion and legacy Feature-matrix
+input changes, split column blocks, ten source generations with one daily CS
+gap, admission reuse with mutation detection, and one recovery. Research has
+an explicit training projection adapter over the unchanged Label/fit owner.
+A real label/model/strategy run, a real expansion and legacy Feature-matrix
 read-only attachment are the next vertical step. Old Research loaders remain
 unchanged in their business admission and continue to own those artifacts.

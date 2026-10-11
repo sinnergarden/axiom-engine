@@ -62,6 +62,40 @@ def configured(manifest, spec, *, universe_id="csi300"):
 
 
 class StockStrategyTests(unittest.TestCase):
+    def test_future_listed_nonmember_does_not_block_complete_strategy_union(self):
+        future = "cnstock.600999.SH.20240103"
+        rules = rules_for({"cnstock.600100.SH.20000101": "SSE_MAIN",
+                           "cnstock.600101.SH.20000101": "SSE_MAIN", future: "SSE_MAIN"})
+        frame = frame_for(rules)
+        for row in frame["rows"]:
+            if row["security_id"] == future:
+                row.update(member=False, valid=False, score=None, invalid_reason="FEATURE_MISSING")
+        unsigned = dict(frame); unsigned.pop("signal_run_ref")
+        frame["signal_run_ref"] = Document.from_dict(unsigned).identity
+        account = dict(cash_minor=1_000_000, positions={}, version=0)
+        for spec in (stock_strategy_spec(top_k=1),
+                     stock_strategy_spec(selection="rank_buffer", top_k=1, rank_buffer={"keep_rank": 2}),
+                     stock_strategy_spec(top_k=1, exit_overlay=overlay())):
+            context = core_context(rules, 1)
+            context.update(portfolio_policy=stock_portfolio_policy(strategy_spec=spec,
+                universe_id="csi300", execution_universe=rules["universe"], execution_rules=rules),
+                strategy_state=initial_strategy_state(), pending_share_quantities={},
+                reserved_security_ids=[], risk_observations={})
+            with self.subTest(spec=spec):
+                result = plan_stock_portfolio(StockPredictionFrame.from_dict(frame),
+                    account=account, context=context, top_k=1).to_dict()
+                self.assertEqual(result["status"], "DECISION_COMPLETE")
+                self.assertNotIn(future, result["selected_security_ids"])
+                self.assertNotIn(future, result["targets"])
+                bad = deepcopy(frame)
+                bad["rows"][next(i for i, row in enumerate(bad["rows"])
+                    if row["security_id"] == future)]["member"] = True
+                unsigned = dict(bad); unsigned.pop("signal_run_ref")
+                bad["signal_run_ref"] = Document.from_dict(unsigned).identity
+                with self.assertRaisesRegex(ContractError, "PIT member contradicts"):
+                    plan_stock_portfolio(StockPredictionFrame.from_dict(bad),
+                        account=account, context=context, top_k=1)
+
     def test_configuration_and_legacy_factory_remain_explicit(self):
         from axiom_engine.runtime.stock_inputs import ELIGIBILITY_ID
         from axiom_engine.core.stock_portfolio import BUDGET_BASIS

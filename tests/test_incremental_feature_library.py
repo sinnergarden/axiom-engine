@@ -71,6 +71,30 @@ def decoded(projection, name):
 
 
 class IncrementalFeatureLibraryTests(unittest.TestCase):
+    def test_shared_admission_epoch_reuses_hashes_but_detects_mutation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            library=FeatureLibrary(temp,maximum_working_bytes=2**20); source=FixedSource()
+            request=source.request(['raw_x'],source.c['sessions'][2:3])
+            with self.assertRaisesRegex(ValueError,'saved matrix source changed'):
+                with library.execution_session():
+                    descriptor,_=library.ensure_features(request,source)
+                    with library.open_feature_view(descriptor) as view:
+                        view.project(); hashes=view._store.metrics['file_hash_calls']
+                        _,stats=library.ensure_features(request,source)
+                        self.assertEqual(stats['core_calls'],0)
+                        self.assertEqual(stats['admission_file_hash_calls'],0)
+                        self.assertEqual(view._store.metrics['file_hash_calls'],hashes)
+                        tile=view._view['tiles'][0]['partition']
+                        part=view._store.read_json({k:tile[k] for k in ('path','file_digest','partition_ref')},'partition_ref')
+                        path=Path(part['buffers']['values']['path'])
+                        original=path.read_bytes(); path.write_bytes(original)
+                        view.project()
+            # New admission uses the actual unchanged bytes, without inheriting trust.
+            descriptor,stats=library.ensure_features(request,source)
+            self.assertGreater(stats['admission_file_hash_calls'],0)
+            with library.open_feature_view(descriptor) as view:
+                self.assertEqual(view.project()['values'][:,0].tolist(),[3,6,9])
+
     def test_rectangle_subset_append_pool_revision_and_one_recovery(self):
         with tempfile.TemporaryDirectory() as temp:
             source=FixedSource(); days=source.c['sessions']; library=FeatureLibrary(Path(temp)/'incremental',maximum_working_bytes=2**20,column_block=1)

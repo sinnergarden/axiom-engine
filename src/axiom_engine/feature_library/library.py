@@ -5,6 +5,7 @@ dependency receipts. This module calls the original Core and never substitutes
 Feature arithmetic. Sample rows do not change the physical/reference universe.
 """
 from copy import deepcopy
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from hashlib import sha256
 import fcntl
@@ -133,6 +134,14 @@ def _read_codes(store, descriptor, shape):
     return value
 
 
+def _column_sources(header, codes, columns):
+    import numpy as np
+    bindings={b['id']:b for b in header['source_bindings']}
+    return {column:[bindings[source] for source in sorted({source
+        for code in np.unique(codes[:,:,j]) for source in header['source_sets'][int(code)]})]
+        for j,column in enumerate(columns)}
+
+
 def _partition_arrays(store, part):
     require(part['contract_version'] == PARTITION_VERSION, 'unsupported Feature partition')
     shape = (len(part['sessions']), len(part['security_ids']), len(part['columns']))
@@ -161,6 +170,8 @@ def _partition_arrays(store, part):
     require(store.np.all((arrays['reason_codes'] >= 0) & (arrays['reason_codes'] < len(header['reason_dictionary']))) and
             store.np.all((arrays['source_codes'] >= 0) & (arrays['source_codes'] < len(header['source_sets']))),
             'partition dictionary range')
+    require(part['column_source_bindings']==_column_sources(header,arrays['source_codes'],part['columns']),
+            'partition column source projection mismatch')
     types = {'values':'float64', 'validity':'bool', 'available_at_utc_us':'int64',
              'reason_codes':'int32', 'source_codes':'int32'}
     for name, array in arrays.items():
@@ -178,6 +189,17 @@ class FeatureLibrary:
         self.limits = {'maximum_source_bytes': maximum_source_bytes, 'maximum_matrix_bytes': maximum_working_bytes}
         require(type(column_block) is int and 0<column_block<=128, 'bounded positive column block required')
         self.column_block=column_block
+        self._session=None
+
+    @contextmanager
+    def execution_session(self):
+        """Bounded same-process admission epoch; fresh sessions hash actual files."""
+        require(self._session is None, 'Feature execution session already active')
+        with VerifiedMatrixStore(**self.limits) as store:
+            self._session={'store':store,'arrays':{}}
+            try: yield self
+            finally:
+                self._session['arrays'].clear(); self._session=None
 
     def _index(self):
         path = self.root / 'index.json'
@@ -198,14 +220,14 @@ class FeatureLibrary:
             write_json(temporary, value); os.replace(temporary, self.root/'index.json')
         finally: temporary.unlink(missing_ok=True)
 
-    def _recover(self, partitions):
+    def _recover(self, partitions, store, validated):
         known = {p['partition_ref'] for p in partitions}; recovered = 0
-        with VerifiedMatrixStore(**self.limits) as store:
-            for path in sorted((self.root/'partitions').glob('*.json')):
-                if 'sha256:' + path.stem in known: continue
-                descriptor = {'path': str(path), 'file_digest': file_digest(path), 'partition_ref': 'sha256:' + path.stem}
-                part = store.read_json(descriptor, 'partition_ref'); _partition_arrays(store, part)
-                partitions.append(self._summary(descriptor, part)); known.add(descriptor['partition_ref']); recovered += 1
+        for path in sorted((self.root/'partitions').glob('*.json')):
+            if 'sha256:' + path.stem in known: continue
+            descriptor = {'path': str(path), 'file_digest': file_digest(path), 'partition_ref': 'sha256:' + path.stem}
+            part = store.read_json(descriptor, 'partition_ref')
+            validated[part['partition_ref']]=_partition_arrays(store, part)
+            partitions.append(self._summary(descriptor, part)); known.add(descriptor['partition_ref']); recovered += 1
         if recovered: self._publish_index(partitions)
         return recovered
 
@@ -213,24 +235,34 @@ class FeatureLibrary:
     def _summary(descriptor, part):
         return {**descriptor, 'sessions': part['sessions'], 'security_axis_ref': digest(part['security_ids']),
             'columns': part['columns'], 'semantic_refs': part['semantic_refs'],
-            'dependency_refs': part['dependency_refs']}
+            'dependency_refs': part['dependency_refs'],'source_bindings':part['column_source_bindings']}
 
-    def plan_coverage(self, request, source_adapter):
+    @staticmethod
+    def _coverage_lookup(parts):
+        lookup = {}
+        for part in parts:
+            require(len(part['sessions']) == 1, 'one output day per Feature partition required')
+            for column in part['columns']:
+                key=(part['sessions'][0],part['security_axis_ref'],column,
+                     part['semantic_refs'][column],part['dependency_refs'][column])
+                lookup[key]=part
+        return lookup
+
+    def plan_coverage(self, request, source_adapter, *, _partitions=None):
         """Read metadata and source dependency receipts; never run Core or write."""
         days, securities, sample, definitions = request.admitted()
         security_axis_ref=digest(securities)
         dependencies = source_adapter.dependency_refs(definitions, days, securities)
         require(set(dependencies) == set(days), 'complete daily dependency bindings required')
-        parts = self._index()['partitions']; hits, gaps = [], []
+        parts = self._index()['partitions'] if _partitions is None else _partitions
+        lookup=self._coverage_lookup(parts); hits, gaps = [], []
         for day in days:
             require(set(dependencies[day]) == set(definitions) and
                     all(is_ref(ref) for ref in dependencies[day].values()), 'exact column dependency bindings required')
             for column, definition in definitions.items():
-                matches = [p for p in parts if p['sessions'] == [day] and p['security_axis_ref'] == security_axis_ref and
-                    column in p['columns'] and p['semantic_refs'][column] == definition['semantic_ref'] and
-                    p['dependency_refs'][column] == dependencies[day][column]]
-                if matches:
-                    hits.append({'session':day, 'column':column, 'partition':deepcopy(matches[-1])})
+                match=lookup.get((day,security_axis_ref,column,definition['semantic_ref'],dependencies[day][column]))
+                if match is not None:
+                    hits.append({'session':day, 'column':column, 'partition':deepcopy(match)})
                 else: gaps.append({'session':day, 'column':column})
         return {'hits':hits, 'gaps':gaps, 'dependencies':dependencies, 'definitions':definitions,
             'sessions':days, 'security_ids':securities, 'sample_universe':sample}
@@ -246,27 +278,44 @@ class FeatureLibrary:
         with (self.root/'.write.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             partitions = self._index()['partitions']
-            recovered = self._recover(partitions)
-            coverage = self.plan_coverage(request, source_adapter)
             # An index is a hint, never admission of its existing bytes.
-            with VerifiedMatrixStore(**self.limits) as admitted:
+            owner=VerifiedMatrixStore(**self.limits) if self._session is None else self._session['store']
+            with (owner if self._session is None else nullcontext(owner)) as admitted:
+                validated={} if self._session is None else self._session['arrays']
+                baseline=deepcopy(admitted.metrics)
+                admitted.check()
+                recovered = self._recover(partitions,admitted,validated)
+                coverage = self.plan_coverage(request, source_adapter,_partitions=partitions)
                 hits={h['partition']['partition_ref']:h['partition'] for h in coverage['hits']}
                 for summary in hits.values():
                     descriptor={k:summary[k] for k in ('path','file_digest','partition_ref')}
                     part=admitted.read_json(descriptor,'partition_ref')
                     require(self._summary(descriptor,part)==summary, 'coverage differs from admitted partition')
-                    _partition_arrays(admitted,part)
-                admission_metrics=deepcopy(admitted.metrics)
+                    if part['partition_ref'] not in validated:
+                        validated[part['partition_ref']]=_partition_arrays(admitted,part)
+                admitted.check()
+                admission_metrics={k:v-baseline[k] for k,v in admitted.metrics.items()}
             stats = {'core_calls':0, 'computed_output_cells':0, 'hit_columns':len(coverage['hits']),
                      'gap_columns':len(coverage['gaps']), 'recovered_partitions':recovered,
+                     'maximum_execution_source_ids':0,
                      'admission_file_hash_calls':admission_metrics['file_hash_calls'],
                      'admission_hash_bytes':admission_metrics['hash_bytes']}
-            compiled = {}
+            compiled = {}; by_day={day:[] for day in coverage['sessions']}
+            final_hits={(h['session'],h['column']):h for h in coverage['hits']}
+            for gap in coverage['gaps']: by_day[gap['session']].append(gap['column'])
             for day in coverage['sessions']:
-                columns = [g['column'] for g in coverage['gaps'] if g['session'] == day]
+                columns = by_day[day]
                 if not columns: continue
                 plan = select_feature_plan(request.plan, columns)
                 bindings = {c:coverage['dependencies'][day][c] for c in columns}
+                if hasattr(source_adapter,'execution_plan'):
+                    actual=source_adapter.execution_plan(plan,day,coverage['security_ids'],bindings)
+                    before=plan.to_dict(); after=actual.to_dict()
+                    require({k:v for k,v in before.items() if k!='sources'}==
+                            {k:v for k,v in after.items() if k!='sources'},
+                            'execution source projection changed Feature semantics')
+                    plan=actual
+                stats['maximum_execution_source_ids']=max(stats['maximum_execution_source_ids'],len(plan.to_dict()['sources']))
                 inputs = source_adapter.prepare(plan, day, coverage['security_ids'], bindings)
                 require(inputs['input_refs'].get('feature_dependency_ref') == digest(bindings),
                         'prepared inputs do not bind planned dependencies')
@@ -296,37 +345,47 @@ class FeatureLibrary:
                         'schema':[coverage['definitions'][c]['schema'] for c in block_columns],
                         'semantic_refs':{c:coverage['definitions'][c]['semantic_ref'] for c in block_columns},
                         'dependency_refs':{c:bindings[c] for c in block_columns},'buffers':buffers,
+                        'column_source_bindings':_column_sources(header,block['source_codes'],block_columns),
                         'core_header':header,'core_output_projection':projection},'partition_ref')
                     descriptor=write_part(self.root,part,'partition_ref')
                     records=self.root/'partitions'; records.mkdir(exist_ok=True)
                     record=records/(part['partition_ref'][7:]+'.json')
                     try: os.link(descriptor['path'],record)
                     except FileExistsError: require(file_digest(record)==descriptor['file_digest'],'Feature partition conflict')
-                    descriptor['path']=str(record); partitions.append(self._summary(descriptor,part))
+                    descriptor['path']=str(record); summary=self._summary(descriptor,part); partitions.append(summary)
+                    for column in block_columns:
+                        final_hits[day,column]={'session':day,'column':column,'partition':deepcopy(summary)}
                     if progress is not None: progress({'stage':'partition_sealed','session':day,**deepcopy(stats)})
                 self._publish_index(partitions)
                 del result, arrays, inputs
-            final = self.plan_coverage(request, source_adapter)
-            require(not final['gaps'], 'Feature coverage remains incomplete')
+            require(len(final_hits)==len(coverage['sessions'])*len(coverage['definitions']),
+                    'Feature coverage remains incomplete')
+            final = coverage
             view = seal({'contract_version':VIEW_VERSION, 'sessions':final['sessions'],
                 'security_ids':final['security_ids'], 'sample_universe':final['sample_universe'],
                 'columns':list(final['definitions']), 'definitions':final['definitions'],
-                'tiles':final['hits']}, 'view_ref')
+                'tiles':[final_hits[day,column] for day in final['sessions'] for column in final['definitions']]}, 'view_ref')
             descriptor = write_part(self.root, view, 'view_ref')
+            if self._session is not None:
+                self._session['store'].check()
+                stats['admission_file_hash_calls']=admitted.metrics['file_hash_calls']-baseline['file_hash_calls']
+                stats['admission_hash_bytes']=admitted.metrics['hash_bytes']-baseline['hash_bytes']
             return descriptor, stats
 
     def open_feature_view(self, descriptor):
         """Open a fixed saved view. Reading never calls Data/Core or modifies index."""
-        return FeatureView(descriptor, **self.limits)
+        return FeatureView(descriptor,_session=self._session, **self.limits)
 
 
 class FeatureView:
-    def __init__(self, descriptor, **limits):
-        self._store = VerifiedMatrixStore(**limits)
+    def __init__(self, descriptor, _session=None, **limits):
+        self._own_store=_session is None
+        self._store = VerifiedMatrixStore(**limits) if _session is None else _session['store']
         self._view = self._store.read_json(descriptor, 'view_ref')
         require(self._view['contract_version'] == VIEW_VERSION, 'unsupported Feature view')
         self.descriptor = deepcopy(descriptor)
-        self._loaded = {}
+        self._loaded = {} if _session is None else _session['arrays']
+        self._tiles={(t['session'],t['column']):t['partition'] for t in self._view['tiles']}
 
     @property
     def identity(self): return self._view['view_ref']
@@ -353,9 +412,10 @@ class FeatureView:
         out = {name:np.zeros(shape, dtype='bool' if name == 'validity' else 'float64' if name == 'values'
                            else 'int64' if name == 'available_at_utc_us' else 'int32') for name in ARRAYS}
         reasons = [None]; source_sets = [[]]; bindings = {}; used = {}
-        tiles = {(t['session'],t['column']):t['partition'] for t in view['tiles']}
-        for day in dict.fromkeys(d for _,d in keys):
-            target = [i for i,(_,d) in enumerate(keys) if d == day]
+        targets={}
+        for i,(_,day) in enumerate(keys): targets.setdefault(day,[]).append(i)
+        tiles=self._tiles
+        for day,target in targets.items():
             for j, column in enumerate(columns):
                 desc = tiles[day,column]; ref = desc['partition_ref']
                 if ref not in used:
@@ -374,24 +434,35 @@ class FeatureView:
                     for binding in part['core_header']['source_bindings']:
                         require(binding['id'] not in bindings or bindings[binding['id']] == binding, 'conflicting source ID')
                         bindings[binding['id']] = binding
-                    used[ref]=(part,arrays,np.asarray(reason_map),np.asarray(source_map))
-                part,arrays,reason_map,source_map = used[ref]
+                    used[ref]=(part,arrays,np.asarray(reason_map),np.asarray(source_map),
+                        {s:i for i,s in enumerate(part['security_ids'])},
+                        {c:i for i,c in enumerate(part['columns'])})
+                part,arrays,reason_map,source_map,axis,positions = used[ref]
                 require(part['semantic_refs'][column] == view['definitions'][column]['semantic_ref'], 'view Feature semantics mismatch')
-                col = part['columns'].index(column)
-                rows = [part['security_ids'].index(keys[i][0]) for i in target]
+                col = positions[column]
+                rows = [axis[keys[i][0]] for i in target]
                 for name in ARRAYS:
                     values = arrays[name][0,rows,col]
                     if name == 'reason_codes': values = reason_map[values]
                     if name == 'source_codes': values = source_map[values]
                     out[name][target,j] = values
         self._store.check()
+        selected=sorted(set(int(code) for code in np.unique(out['source_codes'])))
+        remap=np.zeros(len(source_sets),dtype='int32')
+        for code,old in enumerate(selected): remap[old]=code
+        source_sets=[source_sets[old] for old in selected]
+        out['source_codes']=remap[out['source_codes']]
+        actual_sources={source for group in source_sets for source in group}
         for name, array in out.items(): out[name]=np.frombuffer(array.tobytes(),dtype=array.dtype).reshape(shape)
         return {**out, 'keys':keys, 'schema':[deepcopy(view['definitions'][c]['schema']) for c in columns],
-            'reason_dictionary':reasons, 'source_sets':source_sets, 'source_bindings':list(bindings.values()),
+            'reason_dictionary':reasons, 'source_sets':source_sets,
+            'source_bindings':[bindings[source] for source in sorted(actual_sources)],
             'view_ref':self.identity, 'partition_refs':list(used), 'null_available_at_utc_us':-(2**63)}
 
     def close(self):
-        self._loaded.clear()
-        self._store.close()
+        self._tiles.clear()
+        if self._own_store:
+            self._loaded.clear(); self._store.close()
+        else: self._store.check()
     def __enter__(self): return self
     def __exit__(self,*args): self.close()
