@@ -162,7 +162,7 @@ def _encoded_size(value):
     return sum(len(piece) for piece in _json_pieces(value, piece_chars=64))
 
 
-def _path(artifact):
+def _path(artifact, *, must_exist=True):
     fields(artifact, "artifact_type artifact_id contract_version manifest_uri content_digest")
     for name in ("artifact_type", "artifact_id", "contract_version", "manifest_uri"):
         require(type(artifact[name]) is str and bool(artifact[name]), "Invalid stock artifact envelope")
@@ -171,7 +171,8 @@ def _path(artifact):
     require(uri.scheme in ("", "file") and not uri.netloc and uri.fragment in ("", "definition/fold_spec") and not uri.query,
             "Stock source requires an explicit local canonical artifact")
     path = Path(unquote(uri.path)).resolve()
-    require(path.is_file(), "Missing fixed stock artifact: " + str(path))
+    if must_exist:
+        require(path.is_file(), "Missing fixed stock artifact: " + str(path))
     require(not uri.fragment or path.name == "fold.json", "Saved fold selector requires the original fold.json")
     return path
 
@@ -883,7 +884,7 @@ class StockInputSource:
         yield manifest["profile_input"]["artifact"]
         for entry in manifest["market_input"]["native_inputs"]:
             yield entry["artifact"]
-        for frame in manifest["prediction_input"]["frames"]:
+        for frame in manifest.get("prediction_input", {}).get("frames", []):
             for key in ("fold_spec_artifact", "model_metadata_artifact", "prediction_artifact"):
                 yield frame[key]
 
@@ -901,9 +902,10 @@ class StockInputSource:
                 require(descriptor.is_file(), "Saved fold selector requires its original sibling manifest")
                 files.setdefault(str(descriptor), {"manifest_uri": str(descriptor), "file_bytes": descriptor.stat().st_size})
         return {"files": list(files.values()), "input_bytes": sum(f["file_bytes"] for f in files.values()),
-                "folds": len(manifest["prediction_input"]["frames"]),
+                "folds": len(manifest.get("prediction_input", {}).get("frames", [])),
                 "declared_rows": {"market_rows": len(manifest["scope"]["calendar"]) * len(manifest["scope"]["execution_universe"]),
-                                  "prediction_rows": (len(manifest["scope"]["calendar"])-1) * len(manifest["scope"]["prediction_universe"])},
+                                  "prediction_rows": ((len(manifest["scope"]["calendar"])-1) * len(manifest["scope"]["prediction_universe"])
+                                                      if manifest.get("prediction_input", {}).get("frames") else 0)},
                 "declared_scope": manifest["scope"]}
 
     def _index(self, artifact, budget):
@@ -1252,7 +1254,7 @@ def _frames(source, manifest, budget):
     return frames, trade_map
 
 
-def _audit(source, manifest, block_sessions, budget, limits, implementation_ref):
+def _audit(source, manifest, block_sessions, budget, limits, implementation_ref, *, market_only=False, capture=None):
     from .stock_stream_contracts import validate_manifest, validate_limits
     from .stock_market import _project_stock_actions, _visible
     from .profiles import stock_daily_open_profile_v2
@@ -1262,7 +1264,11 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
     from ..core.portfolio import decimal
     from .stock_inputs import validate_cash_action
     integer(block_sessions, 1); digest(implementation_ref)
-    manifest = validate_manifest(manifest); validate_limits(limits)
+    # market_only is an invocation-local internal path, never a saved PASS flag.
+    # Its execution-only spec has already passed StockMarketSpec validation.
+    if not market_only:
+        manifest = validate_manifest(manifest)
+    validate_limits(limits)
     inventory = source.inventory(manifest)
     require(inventory["input_bytes"] <= limits["max_input_bytes"] and inventory["folds"] <= limits["max_folds"],
             "Stock source inventory exceeds input/fold budget")
@@ -1282,9 +1288,9 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
         key = str(_path(item["artifact"]))
         source._scan_row_limits[key] = limits["max_market_rows"]
         source._scan_native_scopes[key] = (manifest, limits)
-    for frame in manifest["prediction_input"]["frames"]:
+    for frame in manifest.get("prediction_input", {}).get("frames", []):
         source._scan_row_limits[str(_path(frame["prediction_artifact"]))] = limits["max_prediction_rows"]
-    source._prediction_paths = {str(_path(frame["prediction_artifact"])) for frame in manifest["prediction_input"]["frames"]}
+    source._prediction_paths = {str(_path(frame["prediction_artifact"])) for frame in manifest.get("prediction_input", {}).get("frames", [])}
     source._prediction_remaining = limits["max_prediction_rows"]
     scope = manifest["scope"]; calendar = scope["calendar"]; universe = scope["execution_universe"]
     require(scope["prediction_universe"] == universe, "Full-stock prediction/execution union mismatch")
@@ -1299,8 +1305,9 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
         rules["universe"] == universe and scope["supported_universe_ref"] == support_ref(universe), "Stock profile/rules scope mismatch")
     for name in ("stock_execution_rules_ref", "stock_fee_schedule_ref"):
         require(manifest["profile_input"][name] == profile[name], "Stock profile nested reference mismatch")
-    require(manifest["portfolio_policy"] == csi300_stock_portfolio_policy(top_k=manifest["portfolio_policy"]["top_k"],
-        execution_universe=universe, execution_rules=rules), "Stock portfolio policy mismatch")
+    if not market_only:
+        require(manifest["portfolio_policy"] == csi300_stock_portfolio_policy(top_k=manifest["portfolio_policy"]["top_k"],
+            execution_universe=universe, execution_rules=rules), "Stock portfolio policy mismatch")
     native_by_day, contexts = {}, []
     for item in manifest["market_input"]["native_inputs"]:
         index = source._index(item["artifact"], budget)
@@ -1312,7 +1319,7 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
             native_by_day[key] = index
     source_refs = [native_by_day["execution", kind, calendar[0] if kind not in ("actions-ex", "actions-record") else None].content_digest
                    for kind in ("states", "market", "limits", "factor", "actions-ex", "actions-record", "membership")]
-    frames, trade_map = _frames(source, manifest, budget)
+    frames, trade_map = ([], {}) if market_only else _frames(source, manifest, budget)
     prepared = {"request_ref": manifest["request_ref"], "native_by_day": native_by_day,
                 "rules_index": rules_index, "source_refs": source_refs, "trade_map": trade_map}
     source._prepared = prepared
@@ -1344,10 +1351,16 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
             for kind, names in (("market", ("open", "high", "low", "close", "volume_shares", "amount_cny")),
                                 ("factor", ("factor",)), ("membership", ("is_member",))):
                 with source._memory.stage() as stage:
-                    left, _, left_bindings = source._native("prediction_basis", kind, days, budget, reservation=stage)
-                    right, _, right_bindings = source._native("execution", kind, days, budget, reservation=stage)
-                    _pair(left, right, days, universe, names)
-                    del left, right, left_bindings, right_bindings
+                    if market_only:
+                        right, _, right_bindings = source._native("execution", kind, days, budget, reservation=stage)
+                        _grid(right, days, universe)
+                        capture("native", (kind, days), {"view": right, "bindings": right_bindings}, stage)
+                    else:
+                        left, _, left_bindings = source._native("prediction_basis", kind, days, budget, reservation=stage)
+                        right, _, right_bindings = source._native("execution", kind, days, budget, reservation=stage)
+                        _pair(left, right, days, universe, names)
+                        del left, left_bindings
+                    del right, right_bindings
             with source._memory.stage() as stage:
                 factor, _, factor_bindings = source._native("execution", "factor", days, budget, reservation=stage)
                 frows, fmeta = _grid(factor, days, universe)
@@ -1385,6 +1398,8 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
                             any(row[name] is None for name in ("open", "close", "volume_shares", "limit_up", "limit_down"))):
                         lifecycle["member_gap" if row["_stock_member"] else "listed_nonmember_gap"] += 1
                 row = None
+                if market_only:
+                    capture("block", days, block, block._reservation)
                 for trade, (header, indexed) in block.signals.items():
                     feature = trade_map[trade][1]
                     with source._memory.stage() as stage:
@@ -1416,12 +1431,18 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
         for day in warmup:
             for kind, names in (("market", ("open", "high", "low", "close", "volume_shares", "amount_cny")), ("factor", ("factor",))):
                 with source._memory.stage() as stage:
-                    left, _, left_bindings = source._native("prediction_basis", kind, [day], budget, reservation=stage)
-                    right, _, right_bindings = source._native("execution", kind, [day], budget, reservation=stage)
-                    _pair(left, right, [day], universe, names)
-                    _warmup_visibility(left, [day], universe, names)
-                    _warmup_visibility(right, [day], universe, names)
-                    del left, right, left_bindings, right_bindings
+                    if market_only:
+                        right, _, right_bindings = source._native("execution", kind, [day], budget, reservation=stage)
+                        _warmup_visibility(right, [day], universe, names)
+                        capture("native", (kind, (day,)), {"view": right, "bindings": right_bindings}, stage)
+                    else:
+                        left, _, left_bindings = source._native("prediction_basis", kind, [day], budget, reservation=stage)
+                        right, _, right_bindings = source._native("execution", kind, [day], budget, reservation=stage)
+                        _pair(left, right, [day], universe, names)
+                        _warmup_visibility(left, [day], universe, names)
+                        _warmup_visibility(right, [day], universe, names)
+                        del left, left_bindings
+                    del right, right_bindings
         # Original v6 emits factors security-major, even when delivery is date-major.
         blocks.extend(sorted(factor_blocks, key=lambda item: (item["security_id"], item["effective_session"])))
         del previous_factor
@@ -1439,7 +1460,8 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref)
         source._memory.reserve_global(("projected", "market_header"), _encoded_size({key: value for key, value in market_header.items()
             if key not in ("cash_dividends", "action_diagnostics", "action_blocks")}))
         receipt = {"contract_version": "stock_input_audit_v1", "request_ref": manifest["request_ref"],
-                   "market_ref": manifest["market_input"]["market_ref"], "prediction_ref": manifest["prediction_input"]["prediction_ref"],
+                   "market_ref": manifest["market_input"].get("market_ref"),
+                   "prediction_ref": manifest.get("prediction_input", {}).get("prediction_ref"),
                    "profile_ref": manifest["profile_input"]["profile_ref"], "implementation_ref": implementation_ref,
                    "counts": {"input_bytes": inventory["input_bytes"], "input_files": len(inventory["files"]),
                               "folds": len(frames), "prediction_rows": prediction_rows, "market_rows": market_rows,
