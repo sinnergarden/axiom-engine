@@ -30,7 +30,8 @@ def action(security, **changes):
     return result
 
 
-def fixture(root, *, cash='0.05', stock='0.1', change=None, plan=None):
+def fixture(root, *, cash='0.05', stock='0.1', change=None, plan=None,
+            allocation_policy='reject_non_integer'):
     manifest, old = source_fixture(root,plan=plan)
     scope = manifest['scope']; security=scope['execution_universe'][0]
     a=action(security,cash_dividend_before_tax_per_share=cash,stock_distribution_shares_per_share=stock)
@@ -41,7 +42,7 @@ def fixture(root, *, cash='0.05', stock='0.1', change=None, plan=None):
         calendar=scope['calendar'],parent_native_refs=old['market_replay']['source_refs'][4:6],
         supplemental_view_refs=[REF],identity_policy_ref=REF,actions=[a],limitations=['Synthetic resolved facts only.'])
     profile=equity_profile(execution_rules=old['profile']['stock_execution_rules'],
-        fee_schedule=old['profile']['stock_fee_schedule'])
+        fee_schedule=old['profile']['stock_fee_schedule'], share_allocation_policy=allocation_policy)
     pi=dict(artifact=artifact_file(root,'equity-profile',profile),profile_ref=Document.from_dict(profile).identity,
         **{k:profile[k] for k in ('stock_execution_rules_ref','stock_fee_schedule_ref')})
     request=equity_request(BacktestRequest.from_dict(manifest),profile_input=pi,

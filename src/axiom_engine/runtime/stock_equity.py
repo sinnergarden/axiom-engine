@@ -4,7 +4,7 @@ Dates describe an explicit offline simulation, never an opening cash receipt.
 No announcement-alias inference or factor-to-share calculation occurs here.
 """
 from copy import deepcopy
-from decimal import Context, Decimal, ROUND_HALF_UP, localcontext
+from decimal import Context, Decimal, ROUND_FLOOR, ROUND_HALF_UP, localcontext
 
 from ..core.contracts import Document, canonical, digest, fields, integer, require, session
 from ..core.portfolio import decimal, minor
@@ -19,18 +19,75 @@ SIMULATION = dict(contract_version='stock_equity_simulation_v1',
     cost='zero_added_cost_dilute_at_listing', fractional_shares='reject_non_integer',
     attribution='record_origin_fifo_v1',
     limitation='EXPLICIT DAILY SIMULATION: payout/listing dates proxy pre-decision availability, not actual credited cash or delivered shares. Gross dividends exclude personal holding-period taxes.')
+FLOOR_POLICY = 'historical_replay_floor'
+FLOOR_LIMITATION = ('Historical replay floors the total share grant once per account/event. '
+    'The theoretical fractional remainder is disclosure only, with no fractional holding or cash compensation. '
+    'An additional whole share may be allocated under a residual-allocation rule; no account-specific credit is known. '
+    'This assumption does not establish conservative strategy returns because later decisions may change.')
+
+
+def settle_stock_share_allocation(*, registered_quantity, shares_per_share,
+                                  policy='reject_non_integer', actual_quantity=None, evidence_refs=()):
+    """Pure allocation seam; confirmed integer credits never undergo rounding.
+
+    Evidence refs are required for a confirmed credit. Binding that evidence to
+    an account and its actual availability clock belongs to the shadow caller;
+    this function does not introduce a broker integration or account executor.
+    """
+    integer(registered_quantity)
+    require(type(shares_per_share) is str, 'exact decimal share rate required')
+    rate = decimal(shares_per_share, minimum=0)
+    require(policy in ('reject_non_integer', FLOOR_POLICY, 'confirmed_integer_credit'),
+            'unsupported share allocation policy')
+    with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
+        theoretical = Decimal(registered_quantity)*rate
+        floor = int(theoretical.to_integral_value(rounding=ROUND_FLOOR))
+        remainder = theoretical-floor
+        if policy == 'confirmed_integer_credit':
+            integer(actual_quantity)
+            require(type(evidence_refs) in (tuple, list) and bool(evidence_refs), 'confirmed share credit evidence required')
+            for ref in evidence_refs: digest(ref)
+            require(len(set(evidence_refs)) == len(evidence_refs), 'duplicate share credit evidence')
+            require(registered_quantity or actual_quantity == 0, 'credit without registered shares')
+            allocated = actual_quantity
+        else:
+            require(actual_quantity is None and not evidence_refs, 'unexpected actual share credit input')
+            require(policy != 'reject_non_integer' or remainder == 0, 'fractional entitlement unsupported')
+            allocated = floor
+        return dict(contract_version='stock_share_allocation_v1', allocation_basis=policy,
+            registered_quantity=registered_quantity, shares_per_share=shares_per_share,
+            theoretical_grant=str(theoretical), allocated_grant=allocated,
+            fractional_remainder=str(remainder), theoretical_minus_allocated=str(theoretical-allocated),
+            possible_additional_share=1 if policy == FLOOR_POLICY and remainder else 0,
+            evidence_refs=list(evidence_refs))
 
 
 class StockActionFacts(Document):
     """Reference-bound Data identities, revisions and values; not a resolver."""
 
 
-def equity_profile(*, execution_rules, fee_schedule, unknown_status_policy='block'):
+def equity_profile(*, execution_rules, fee_schedule, unknown_status_policy='block',
+                   share_allocation_policy='reject_non_integer'):
     from .profiles import stock_daily_open_profile_v2
     profile = stock_daily_open_profile_v2(execution_rules=execution_rules, fee_schedule=fee_schedule,
                                          unknown_status_policy=unknown_status_policy)
     profile.update(contract_version='stock_daily_open_profile_v3', equity_simulation=deepcopy(SIMULATION))
-    profile['limitation'] += ' ' + SIMULATION['limitation']
+    require(share_allocation_policy in ('reject_non_integer', FLOOR_POLICY), 'unsupported replay share allocation policy')
+    if share_allocation_policy == FLOOR_POLICY:
+        profile['contract_version'] = 'stock_daily_open_profile_v4'
+        profile['equity_simulation'].update(contract_version='stock_equity_simulation_v2',
+            fractional_shares=FLOOR_POLICY, attribution='record_origin_fifo_settled_grant_v2',
+            limitation=SIMULATION['limitation']+' '+FLOOR_LIMITATION)
+    profile['limitation'] += ' ' + profile['equity_simulation']['limitation']
+    return profile
+
+
+def validate_equity_profile(profile):
+    """Both frozen policies remain explicit; old v3 content is unchanged."""
+    require(profile == equity_profile(execution_rules=profile['stock_execution_rules'],
+        fee_schedule=profile['stock_fee_schedule'], unknown_status_policy=profile['unknown_status_policy'],
+        share_allocation_policy=profile['equity_simulation']['fractional_shares']),
+        'equity simulation profile mismatch')
     return profile
 
 
@@ -60,7 +117,8 @@ def validate_facts(wire, *, universe, calendar, parent_refs):
         len(set(wire['supplemental_view_refs']))==len(wire['supplemental_view_refs']), 'new corporate-action ViewRefs required')
     for ref in wire['supplemental_view_refs']: digest(ref)
     instant(wire['observed_at'])
-    require(wire['availability_basis']=='declared_vendor_assumption', 'explicit supplemental event clock basis required')
+    require(wire['availability_basis'] in ('declared_vendor_assumption', 'mixed_reviewed_sources_v1'),
+            'explicit supplemental event clock basis required')
     require(type(wire['actions']) is list and type(wire['limitations']) is list and
             all(type(x) is str for x in wire['limitations']), 'explicit action catalog required')
     ids, aliases = set(), set()
@@ -147,7 +205,8 @@ def register(ledger, action, day, *, pending_shares=None):
         ex_applied=False, cash_paid=False, shares_listed=False)
 
 
-def gaps(ledger, actions, day, decision_time):
+def gaps(ledger, actions, day, decision_time, *, share_allocation_policy='reject_non_integer'):
+    require(share_allocation_policy in ('reject_non_integer', FLOOR_POLICY), 'unsupported replay share allocation policy')
     result = []
     for a in actions:
         state = ledger.equity_entitlements.get(a['economic_event_id'])
@@ -173,7 +232,7 @@ def gaps(ledger, actions, day, decision_time):
         else:
             with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
                 grant = Decimal(state['record_quantity'])*decimal(a['stock_distribution_shares_per_share'])
-            if grant != grant.to_integral_value():
+            if grant != grant.to_integral_value() and share_allocation_policy != FLOOR_POLICY:
                 reason = 'UNSUPPORTED_FRACTIONAL_ENTITLEMENT'; unrounded = str(grant)
             elif decimal(a['cash_dividend_before_tax_per_share']) > 0 and a['payment_date'] is None: reason = 'MISSING_PAY_DATE'
             elif grant > 0 and a['stock_listing_date'] is None: reason = 'MISSING_LIST_DATE'
@@ -185,19 +244,23 @@ def gaps(ledger, actions, day, decision_time):
     return result
 
 
-def advance(ledger, actions, day):
+def advance(ledger, actions, day, *, share_allocation_policy='reject_non_integer'):
     """One shared phase path; caller prevalidates all qualified gaps atomically."""
     for a in sorted(actions, key=lambda a:a['economic_event_id']):
         state = ledger.equity_entitlements.get(a['economic_event_id'])
         if state is None or not state['record_quantity']: continue
         if a['ex_date'] == day and not state['ex_applied']:
-            with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
-                grant = Decimal(state['record_quantity'])*decimal(a['stock_distribution_shares_per_share'])
-            require(grant == grant.to_integral_value(), 'fractional entitlement unsupported')
+            allocation = settle_stock_share_allocation(registered_quantity=state['record_quantity'],
+                shares_per_share=a['stock_distribution_shares_per_share'], policy=share_allocation_policy)
+            grant = allocation['allocated_grant']
             if decimal(a['cash_dividend_before_tax_per_share']) > 0:
                 ledger.dividend(cash_action(a, ledger.calendar), 'EX', state['record_quantity'])
-            state['pending_quantity'] = int(grant); state['ex_applied'] = True
-            _journal(ledger, a, day, 'EX', pending_share_delta=int(grant))
+            state['pending_quantity'] = grant; state['ex_applied'] = True
+            evidence = {}
+            if share_allocation_policy == FLOOR_POLICY:
+                state['share_allocation'] = allocation
+                evidence['share_allocation'] = allocation
+            _journal(ledger, a, day, 'EX', pending_share_delta=grant, **evidence)
     for a in sorted(actions, key=lambda a:a['economic_event_id']):
         state = ledger.equity_entitlements.get(a['economic_event_id'])
         if state is None or not state['record_quantity'] or not state['ex_applied']: continue
@@ -227,9 +290,8 @@ def pending(ledger):
 def verify_saved(wire, rows, profile):
     """Replay saved accounting facts only; no planner, market source or broker."""
     from .accounting import AccountLedger
-    require(profile == equity_profile(execution_rules=profile['stock_execution_rules'],
-        fee_schedule=profile['stock_fee_schedule'], unknown_status_policy=profile['unknown_status_policy']),
-        'saved equity simulation profile mismatch')
+    validate_equity_profile(profile)
+    allocation_policy = profile['equity_simulation']['fractional_shares']
     scope = wire['request_manifest']['scope']; calendar = scope['calendar']
     actions = wire['account_events']['equity_facts']['actions']
     ledger = AccountLedger(cash_minor=wire['initial_nav_minor'], calendar=calendar,
@@ -250,13 +312,13 @@ def verify_saved(wire, rows, profile):
         fills_by_day[fill['session']].append(fill)
     for day in expected_days:
         ledger.advance(day)
-        missing = gaps(ledger, actions, day, profile['decision_time_utc'])
+        missing = gaps(ledger, actions, day, profile['decision_time_utc'], share_allocation_policy=allocation_policy)
         stopped = day not in nav
         if stopped and wire['stopped']['reason'] == 'HELD_EQUITY_FACT_GAP':
             require(missing == wire['stopped']['gaps'] and not fills_by_day[day], 'saved equity stop does not match qualified gap')
         else:
             require(not missing, 'saved equity account advanced through qualified gap')
-            advance(ledger, actions, day)
+            advance(ledger, actions, day, share_allocation_policy=allocation_policy)
             shares = pending(ledger)
             if not stopped:
                 for fill in fills_by_day[day]: ledger.apply_fill(fill)

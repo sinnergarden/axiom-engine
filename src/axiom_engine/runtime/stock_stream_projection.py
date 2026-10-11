@@ -611,7 +611,8 @@ def _load_stock_backtest_projection(path, *, artifact_reader, limits):
                                                read_size=limits["max_read_bytes"])
     require(observed_size == profile_size and _hash_wire(profile) == profile_artifact["content_digest"] ==
             wire["profile_ref"], "saved profile content/reference mismatch")
-    require(profile.get("contract_version") == ("stock_daily_open_profile_v3" if wire["contract_version"]=="backtest_run_v8" else "stock_daily_open_profile_v2") and
+    require(profile.get("contract_version") in (("stock_daily_open_profile_v3", "stock_daily_open_profile_v4")
+            if wire["contract_version"]=="backtest_run_v8" else ("stock_daily_open_profile_v2",)) and
             profile.get("stock_execution_rules_ref") == request["profile_input"]["stock_execution_rules_ref"] ==
             _hash_wire(profile["stock_execution_rules"]) and
             profile.get("stock_fee_schedule_ref") == request["profile_input"]["stock_fee_schedule_ref"] ==
