@@ -39,6 +39,11 @@ class VerifiedMatrixStore:
     def read_json(self, descriptor, ref_key):
         _fields(descriptor, {'path','file_digest',ref_key}, 'exact matrix parent descriptor required')
         require(_ref(descriptor[ref_key]), 'matrix parent content ref required')
+        path=descriptor['path']
+        require(type(path) is str and Path(path).is_absolute() and not self._resolve(path).is_symlink(),
+                'fixed absolute matrix file required')
+        require(self._resolve(path).stat().st_size<=self.maximum_parent_bytes,
+                'matrix parent byte budget exceeded')
         self._register(descriptor); path=descriptor['path']
         require(self.fingerprints[path][2]<=self.maximum_parent_bytes, 'matrix parent byte budget exceeded')
         if path not in self.json:

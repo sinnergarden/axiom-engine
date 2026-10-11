@@ -86,6 +86,13 @@ def decoded(projection, name):
     return [[projection['reason_dictionary'][int(i)] for i in row] for row in projection[name]]
 
 
+def tiles(view):
+    cap=view.describe()
+    return [{"session":day,"column":column,"partition":receipt["partition"]}
+            for day in cap["sessions"]
+            for column,receipt in view.column_receipts(day).items()]
+
+
 class IncrementalFeatureLibraryTests(unittest.TestCase):
     def test_backfill_new_raw_field_preserves_old_rectangle(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -94,14 +101,14 @@ class IncrementalFeatureLibraryTests(unittest.TestCase):
             old_columns=['raw_x','mean_x','raw_y']
             descriptor,_=library.ensure_features(source.request(old_columns,days),source)
             with library.open_feature_view(descriptor) as view:
-                old_refs={(t['session'],t['column']):t['partition']['partition_ref'] for t in view._view['tiles']}
+                old_refs={(t['session'],t['column']):t['partition']['partition_ref'] for t in tiles(view)}
             source.add_raw_field(); source.calls.clear()
             descriptor,stats=library.ensure_features(source.request(old_columns+['raw_z'],days),source)
             self.assertEqual((stats['core_calls'],stats['computed_output_cells']),(2,6))
             self.assertEqual(source.calls,[(day,['raw_z']) for day in days])
             with library.open_feature_view(descriptor) as view:
                 actual=view.project()
-                for tile in view._view['tiles']:
+                for tile in tiles(view):
                     key=tile['session'],tile['column']
                     if key in old_refs:self.assertEqual(tile['partition']['partition_ref'],old_refs[key])
             fresh=FeatureLibrary(Path(temp)/'fresh',maximum_working_bytes=2**20)
@@ -125,7 +132,7 @@ class IncrementalFeatureLibraryTests(unittest.TestCase):
                         self.assertEqual(stats['core_calls'],0)
                         self.assertEqual(stats['admission_file_hash_calls'],0)
                         self.assertEqual(view._store.metrics['file_hash_calls'],hashes)
-                        tile=view._view['tiles'][0]['partition']
+                        tile=tiles(view)[0]['partition']
                         part=view._store.read_json({k:tile[k] for k in ('path','file_digest','partition_ref')},'partition_ref')
                         path=Path(part['buffers']['values']['path'])
                         original=path.read_bytes(); path.write_bytes(original)
@@ -143,7 +150,7 @@ class IncrementalFeatureLibraryTests(unittest.TestCase):
             first,stats=library.ensure_features(source.request(['raw_x','mean_x'],days[2:4]),source)
             self.assertEqual((stats['core_calls'],stats['computed_output_cells']),(2,12))
             with library.open_feature_view(first) as view:
-                initial=view.project(); initial_refs=view._view['tiles']
+                initial=view.project(); initial_refs=tiles(view)
                 self.assertEqual(initial['values'][:,0].tolist(),[3,6,9,4,8,12])
                 self.assertEqual(view.describe()['complete'],True)
             # Sample subset and feature subset change projection only.
@@ -157,7 +164,7 @@ class IncrementalFeatureLibraryTests(unittest.TestCase):
             with library.open_feature_view(expanded) as view:
                 expanded_values=view.project()
                 for old in initial_refs:
-                    new=next(t for t in view._view['tiles'] if (t['session'],t['column'])==(old['session'],old['column']))
+                    new=next(t for t in tiles(view) if (t['session'],t['column'])==(old['session'],old['column']))
                     self.assertEqual(new['partition']['partition_ref'],old['partition']['partition_ref'])
             fresh=FeatureLibrary(Path(temp)/'once',maximum_working_bytes=2**20)
             once,_=fresh.ensure_features(source.request(['raw_x','mean_x','raw_y']),source)
@@ -181,8 +188,11 @@ class IncrementalFeatureLibraryTests(unittest.TestCase):
             def stop(update): raise RuntimeError('one intentional interruption')
             with self.assertRaisesRegex(RuntimeError,'intentional interruption'):
                 interrupted.ensure_features(source.request(['raw_y'],days[2:4]),source,progress=stop)
+            self.assertFalse((interrupted.root/'index.json').exists())
+            (interrupted.root/'partitions'/'.partial.json').write_text('{unfinished')
             restored,stats=interrupted.ensure_features(source.request(['raw_y'],days[2:4]),source)
             self.assertEqual((stats['recovered_partitions'],stats['core_calls']),(1,1))
+            self.assertEqual((stats['coverage_date_writes'],stats['coverage_root_writes']),(2,1))
             with interrupted.open_feature_view(restored) as view:
                 self.assertEqual(view.project()['values'][:,0].tolist(),[30,60,90,40,80,120])
 

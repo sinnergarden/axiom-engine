@@ -13,19 +13,18 @@ import json
 import math
 import os
 from pathlib import Path
-import tempfile
 
 from ..core import compile_feature_columns, execute_feature_columns
-from .codec import digest, seal, require, is_ref, file_digest, read_json, write_json
+from .codec import digest, seal, require, is_ref, file_digest
 from .identity import feature_definitions, select_feature_plan
 from .storage import write_buffer, write_part
 from .store import VerifiedMatrixStore
+from .coverage import (VIEW_V1, VIEW_VERSION, coverage_summary, partition_descriptor,
+                       read_index, write_date, publish_index, compact_view)
 
 ARRAYS = {'values': 'float64_le', 'validity': 'bool_u8', 'reason_codes': 'int32_le',
           'available_at_utc_us': 'int64_le', 'source_codes': 'int32_le'}
 PARTITION_VERSION = 'feature_library_partition_v1'
-INDEX_VERSION = 'feature_library_coverage_v1'
-VIEW_VERSION = 'feature_library_view_v1'
 
 
 def _ordered(values, label):
@@ -202,33 +201,23 @@ class FeatureLibrary:
                 self._session['arrays'].clear(); self._session=None
 
     def _index(self):
-        path = self.root / 'index.json'
-        if not path.exists(): return seal({'contract_version': INDEX_VERSION, 'partitions': []}, 'index_ref')
-        require(path.stat().st_size <= self.limits['maximum_matrix_bytes']//8,
-                'coverage index exceeds metadata budget')
-        value = read_json(path)
-        require(value.get('contract_version') == INDEX_VERSION and
-                value.get('index_ref') == digest({k:v for k,v in value.items() if k != 'index_ref'}),
-                'Feature coverage index mismatch')
-        return value
+        partitions, shards = read_index(self.root, min(64*1024**2,self.limits['maximum_matrix_bytes']//8))
+        return {'partitions':partitions, 'shards':shards}
 
-    def _publish_index(self, partitions):
-        value = seal({'contract_version': INDEX_VERSION, 'partitions': partitions}, 'index_ref')
-        with tempfile.NamedTemporaryFile(dir=self.root, prefix='.index-', delete=False) as stream:
-            temporary = Path(stream.name)
-        try:
-            write_json(temporary, value); os.replace(temporary, self.root/'index.json')
-        finally: temporary.unlink(missing_ok=True)
+    def _publish_index(self, shards):
+        publish_index(self.root, shards)
 
     def _recover(self, partitions, store, validated):
-        known = {p['partition_ref'] for p in partitions}; recovered = 0
+        known = {p['partition_ref'] for p in partitions}; recovered = []
         for path in sorted((self.root/'partitions').glob('*.json')):
+            if not is_ref('sha256:' + path.stem): continue
             if 'sha256:' + path.stem in known: continue
+            require(path.stat().st_size<=store.maximum_parent_bytes, 'matrix parent byte budget exceeded')
             descriptor = {'path': str(path), 'file_digest': file_digest(path), 'partition_ref': 'sha256:' + path.stem}
             part = store.read_json(descriptor, 'partition_ref')
             validated[part['partition_ref']]=_partition_arrays(store, part)
-            partitions.append(self._summary(descriptor, part)); known.add(descriptor['partition_ref']); recovered += 1
-        if recovered: self._publish_index(partitions)
+            partitions.append(coverage_summary(descriptor, part)); known.add(descriptor['partition_ref'])
+            recovered.extend(part['sessions'])
         return recovered
 
     @staticmethod
@@ -262,13 +251,13 @@ class FeatureLibrary:
             for column, definition in definitions.items():
                 match=lookup.get((day,security_axis_ref,column,definition['semantic_ref'],dependencies[day][column]))
                 if match is not None:
-                    hits.append({'session':day, 'column':column, 'partition':deepcopy(match)})
+                    hits.append({'session':day, 'column':column, 'partition':match})
                 else: gaps.append({'session':day, 'column':column})
         return {'hits':hits, 'gaps':gaps, 'dependencies':dependencies, 'definitions':definitions,
             'sessions':days, 'security_ids':securities, 'sample_universe':sample}
 
     def ensure_features(self, request, source_adapter, *, progress=None):
-        """Compute only missing output columns/dates; publish each date atomically.
+        """Compute gaps, seal each date, then publish one compact coverage root.
 
         Adapter.prepare(plan, day, physical_security_ids, dependency_refs) must
         return the original daily anchored Core input, with feature_dependency_ref
@@ -277,7 +266,7 @@ class FeatureLibrary:
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root/'.write.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            partitions = self._index()['partitions']
+            index = self._index(); partitions = index['partitions']; shards = index['shards']
             # An index is a hint, never admission of its existing bytes.
             owner=VerifiedMatrixStore(**self.limits) if self._session is None else self._session['store']
             with (owner if self._session is None else nullcontext(owner)) as admitted:
@@ -290,17 +279,24 @@ class FeatureLibrary:
                 for summary in hits.values():
                     descriptor={k:summary[k] for k in ('path','file_digest','partition_ref')}
                     part=admitted.read_json(descriptor,'partition_ref')
-                    require(self._summary(descriptor,part)==summary, 'coverage differs from admitted partition')
+                    require(coverage_summary(descriptor,part)==summary, 'coverage differs from admitted partition')
                     if part['partition_ref'] not in validated:
                         validated[part['partition_ref']]=_partition_arrays(admitted,part)
                 admitted.check()
                 admission_metrics={k:v-baseline[k] for k,v in admitted.metrics.items()}
             stats = {'core_calls':0, 'computed_output_cells':0, 'hit_columns':len(coverage['hits']),
-                     'gap_columns':len(coverage['gaps']), 'recovered_partitions':recovered,
+                     'gap_columns':len(coverage['gaps']), 'recovered_partitions':len(recovered),
+                     'coverage_date_writes':0, 'coverage_root_writes':0,
                      'maximum_execution_source_ids':0,
                      'admission_file_hash_calls':admission_metrics['file_hash_calls'],
                      'admission_hash_bytes':admission_metrics['hash_bytes']}
             compiled = {}; by_day={day:[] for day in coverage['sessions']}
+            parts_by_day={}
+            for part in partitions: parts_by_day.setdefault(part['sessions'][0],[]).append(part)
+            dirty=set(recovered) | (set(parts_by_day)-set(shards))
+            for day in sorted(dirty):
+                shards[day]=write_date(self.root,day,parts_by_day[day])
+                stats['coverage_date_writes']+=1
             final_hits={(h['session'],h['column']):h for h in coverage['hits']}
             for gap in coverage['gaps']: by_day[gap['session']].append(gap['column'])
             for day in coverage['sessions']:
@@ -352,20 +348,20 @@ class FeatureLibrary:
                     record=records/(part['partition_ref'][7:]+'.json')
                     try: os.link(descriptor['path'],record)
                     except FileExistsError: require(file_digest(record)==descriptor['file_digest'],'Feature partition conflict')
-                    descriptor['path']=str(record); summary=self._summary(descriptor,part); partitions.append(summary)
+                    descriptor['path']=str(record); summary=coverage_summary(descriptor,part); partitions.append(summary)
+                    parts_by_day.setdefault(day,[]).append(summary)
                     for column in block_columns:
-                        final_hits[day,column]={'session':day,'column':column,'partition':deepcopy(summary)}
+                        final_hits[day,column]={'session':day,'column':column,'partition':summary}
                     if progress is not None: progress({'stage':'partition_sealed','session':day,**deepcopy(stats)})
-                self._publish_index(partitions)
+                shards[day]=write_date(self.root,day,parts_by_day[day])
+                stats['coverage_date_writes']+=1
                 del result, arrays, inputs
             require(len(final_hits)==len(coverage['sessions'])*len(coverage['definitions']),
                     'Feature coverage remains incomplete')
-            final = coverage
-            view = seal({'contract_version':VIEW_VERSION, 'sessions':final['sessions'],
-                'security_ids':final['security_ids'], 'sample_universe':final['sample_universe'],
-                'columns':list(final['definitions']), 'definitions':final['definitions'],
-                'tiles':[final_hits[day,column] for day in final['sessions'] for column in final['definitions']]}, 'view_ref')
+            view = compact_view(coverage, final_hits)
             descriptor = write_part(self.root, view, 'view_ref')
+            self._publish_index(shards)
+            stats['coverage_root_writes']=1
             if self._session is not None:
                 self._session['store'].check()
                 stats['admission_file_hash_calls']=admitted.metrics['file_hash_calls']-baseline['file_hash_calls']
@@ -382,10 +378,76 @@ class FeatureView:
         self._own_store=_session is None
         self._store = VerifiedMatrixStore(**limits) if _session is None else _session['store']
         self._view = self._store.read_json(descriptor, 'view_ref')
-        require(self._view['contract_version'] == VIEW_VERSION, 'unsupported Feature view')
+        require(self._view['contract_version'] in (VIEW_V1,VIEW_VERSION), 'unsupported Feature view')
         self.descriptor = deepcopy(descriptor)
         self._loaded = {} if _session is None else _session['arrays']
-        self._tiles={(t['session'],t['column']):t['partition'] for t in self._view['tiles']}
+        self._parts={}; self._tiles={}; self._legacy=self._view['contract_version']==VIEW_V1
+        if self._legacy:
+            selections=({'session':t['session'],'columns':[t['column']], 'partition':t['partition']}
+                        for t in self._view['tiles'])
+        else:
+            selections=self._view['blocks']
+        for block in selections:
+            for column in block['columns']:
+                key=block['session'],column
+                require(key not in self._tiles, 'duplicate Feature view cell selection')
+                self._tiles[key]=block['partition']
+        require(set(self._tiles)=={(d,c) for d in self._view['sessions'] for c in self._view['columns']} and
+                set(self._view['definitions'])==set(self._view['columns']), 'incomplete Feature view selection')
+
+    def _partition(self, day, column, *, store=None, parts=None):
+        store=self._store if store is None else store
+        parts=self._parts if parts is None else parts
+        desc=self._tiles[day,column]; ref=desc['partition_ref']
+        if ref not in parts:
+            proof=partition_descriptor(desc)
+            part=store.read_json(proof,'partition_ref')
+            require(part['contract_version']==PARTITION_VERSION and part['sessions']==[day] and
+                    part['security_ids']==self._view['security_ids'] and
+                    set(part['semantic_refs'])==set(part['dependency_refs'])==set(part['columns']) and
+                    all(is_ref(r) for r in part['semantic_refs'].values()) and
+                    all(is_ref(r) for r in part['dependency_refs'].values()), 'view partition coverage mismatch')
+            parts[ref]=part
+        part=parts[ref]
+        require(part['sessions']==[day] and column in part['columns'] and
+                part['semantic_refs'][column]==self._view['definitions'][column]['semantic_ref'],
+                'view Feature semantics mismatch')
+        if self._legacy:
+            require(FeatureLibrary._summary(partition_descriptor(desc),part)==desc,
+                    'coverage summary differs from sealed partition')
+        return part
+
+    def column_receipts(self, session, columns=None):
+        """Read original per-column semantics, dependencies and sources, without Core.
+
+        The compact selection only points to immutable partitions. Actual parent
+        bytes and content refs are admitted before returning their receipts;
+        source eligibility/PIT remains the source adapter's responsibility.
+        """
+        self._store.check()
+        columns=list(self._view['columns'] if columns is None else columns)
+        require(bool(columns) and len(columns)==len(set(columns)) and
+                all((session,c) in self._tiles for c in columns), 'Feature receipt selection outside view')
+        cached=all(self._tiles[session,c]['partition_ref'] in self._parts for c in columns)
+        # Planning years of dependencies must not accumulate every date's
+        # metadata in one owner and repeatedly stat all previous parents. Reuse
+        # projected parents, otherwise admit this day's receipts in a bounded
+        # metadata epoch; original array admission still happens in project().
+        owner=(nullcontext(self._store) if cached else VerifiedMatrixStore(
+            maximum_source_bytes=self._store.maximum_source_bytes,
+            maximum_matrix_bytes=self._store.maximum_matrix_bytes,
+            maximum_parent_bytes=self._store.maximum_parent_bytes))
+        result={}
+        with owner as store:
+            parts=self._parts if cached else {}
+            for column in columns:
+                part=self._partition(session,column,store=store,parts=parts)
+                result[column]={'semantic_ref':part['semantic_refs'][column],
+                    'dependency_ref':part['dependency_refs'][column],
+                    'source_bindings':deepcopy(part['column_source_bindings'][column]),
+                    'partition':partition_descriptor(self._tiles[session,column])}
+        self._store.check()
+        return result
 
     @property
     def identity(self): return self._view['view_ref']
@@ -419,9 +481,7 @@ class FeatureView:
             for j, column in enumerate(columns):
                 desc = tiles[day,column]; ref = desc['partition_ref']
                 if ref not in used:
-                    proof_desc = {k:desc[k] for k in ('path','file_digest','partition_ref')}
-                    part = self._store.read_json(proof_desc,'partition_ref')
-                    require(FeatureLibrary._summary(proof_desc, part) == desc, 'coverage summary differs from sealed partition')
+                    part = self._partition(day,column)
                     if ref not in self._loaded: self._loaded[ref] = _partition_arrays(self._store, part)
                     arrays = self._loaded[ref]
                     reason_map=[]; source_map=[]
@@ -460,7 +520,7 @@ class FeatureView:
             'view_ref':self.identity, 'partition_refs':list(used), 'null_available_at_utc_us':-(2**63)}
 
     def close(self):
-        self._tiles.clear()
+        self._tiles.clear(); self._parts.clear()
         if self._own_store:
             self._loaded.clear(); self._store.close()
         else: self._store.check()
