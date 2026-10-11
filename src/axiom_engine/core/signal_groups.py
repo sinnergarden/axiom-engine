@@ -53,11 +53,12 @@ def evaluate_signal_groups(input, *, spec):
         text(key)
     require(len(set(signals)) == len(signals), "Duplicate signal key")
     require(type(wire["pairs"]) is list, "Group pairs must be a list")
+    day_set, signal_set = set(days), set(signals)
     pairs, seen, by_date = [], set(), {}
     for pair in wire["pairs"]:
         fields(pair, "signal_key security_id session score outcome")
         text(pair["security_id"])
-        require(pair["signal_key"] in signals and pair["session"] in days, "Pair outside group axes")
+        require(pair["signal_key"] in signal_set and pair["session"] in day_set, "Pair outside group axes")
         number(pair["score"])
         number(pair["outcome"])
         key = (pair["signal_key"], pair["session"], pair["security_id"])
