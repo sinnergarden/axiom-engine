@@ -1371,12 +1371,13 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
             manifest["market_input"]["warmup_sessions"][-1] < calendar[0], "Explicit preceding stock warmup required")
     profile_index = source._index(manifest["profile_input"]["artifact"], budget)
     equity = manifest.get("stock_action_policy") == "registered_equity_v1"
-    from .stock_equity import equity_profile, validate_facts, cash_action
+    from .stock_equity import validate_equity_profile, validate_facts, cash_action
     profile = profile_index.whole()
     require(profile_index.content_digest == manifest["profile_input"]["profile_ref"], "Stock profile identity mismatch")
     rules = profile["stock_execution_rules"]; rules_index = validate_execution_rules(rules)
-    require(profile == (equity_profile if equity else stock_daily_open_profile_v2)(execution_rules=rules, fee_schedule=profile["stock_fee_schedule"],
-        unknown_status_policy=profile.get("unknown_status_policy")) and rules["calendar"] == calendar and
+    expected_profile = validate_equity_profile(profile) if equity else stock_daily_open_profile_v2(
+        execution_rules=rules, fee_schedule=profile["stock_fee_schedule"], unknown_status_policy=profile.get("unknown_status_policy"))
+    require(profile == expected_profile and rules["calendar"] == calendar and
         rules["universe"] == universe and scope["supported_universe_ref"] == support_ref(universe), "Stock profile/rules scope mismatch")
     for name in ("stock_execution_rules_ref", "stock_fee_schedule_ref"):
         require(manifest["profile_input"][name] == profile[name], "Stock profile nested reference mismatch")

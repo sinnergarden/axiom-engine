@@ -85,3 +85,30 @@ saved v7 run, its result parts, and small profile/event views for evaluation and
 fill display. It does not reopen large Data, prediction or training parents.
 Complete projections use the existing v2/v3 evaluation and display algorithms;
 blocked accounts preserve their saved valid prefix and stopping phase.
+
+For saved v8 equity replay, `equity_profile(*, execution_rules, fee_schedule,
+unknown_status_policy='block', share_allocation_policy='reject_non_integer')`
+retains the strict v3 profile by default. Explicitly selecting
+`share_allocation_policy='historical_replay_floor'` creates profile v4 with
+`stock_equity_simulation_v2`. It floors the total grant once per account/event;
+physical, sellable and pending shares remain integers. The theoretical remainder
+is recorded in `EQUITY_EX.share_allocation` and the saved entitlement, without
+cash compensation or fractional assets. Profile/request/run identities change;
+the saved prediction and Data identities remain intact. Replay still uses the
+same Core, simulator, T+1, fee schedule and original prices.
+
+`settle_stock_share_allocation(*, registered_quantity, shares_per_share,
+policy='reject_non_integer', actual_quantity=None, evidence_refs=())` is a pure
+allocation function. `confirmed_integer_credit` requires an actual nonnegative
+integer and evidence refs and uses that quantity directly. A shadow caller must
+bind the evidence to the account and its actual availability clock; this release
+does not add a broker integration. Historical floor never silently substitutes
+for a missing confirmed credit.
+
+V2/V3 evaluation retains the account's allocated integer total when attributing
+shares to record-origin episodes, and exposes
+`episode_metrics.share_allocation_summary`: event evidence, per-security
+cumulative theoretical tails, possible additional shares, and local original-price
+mark sensitivity. These are disclosures, not account assets or a P&L correction.
+They do not bound full-path return differences or establish conservative returns.
+No persisted market admission or checkpoint/resume support is introduced.

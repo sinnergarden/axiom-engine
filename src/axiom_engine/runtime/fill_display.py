@@ -137,7 +137,9 @@ def _contract_unit(contract):
     full = contract["backtest_contract_version"] in ("backtest_run_v6", "backtest_run_v7", "backtest_run_v8")
     v5 = contract["backtest_contract_version"] == "backtest_run_v5"
     require(contract["backtest_contract_version"] in ("backtest_run_v1", "backtest_run_v2", "backtest_run_v3", "backtest_run_v4", "backtest_run_v5", "backtest_run_v6", "backtest_run_v7", "backtest_run_v8") and
-        contract["profile_contract_version"] == ("stock_daily_open_profile_v3" if contract["backtest_contract_version"]=="backtest_run_v8" else ("stock_daily_open_profile_v2" if full else ("stock_daily_open_profile_v1" if stock else ("daily_open_profile_v2" if v5 else "daily_open_profile_v1")))),
+        contract["profile_contract_version"] in (("stock_daily_open_profile_v3", "stock_daily_open_profile_v4")
+            if contract["backtest_contract_version"]=="backtest_run_v8" else
+            (("stock_daily_open_profile_v2" if full else ("stock_daily_open_profile_v1" if stock else ("daily_open_profile_v2" if v5 else "daily_open_profile_v1"))),)),
         "unsupported saved account unit contract")
     require((contract["quantity_unit"], contract["price_unit"]) == (("shares", "CNY/share") if stock else (("fund units", "CNY/fund unit") if v5 else (None, None))),
         "saved account unit metadata differs")

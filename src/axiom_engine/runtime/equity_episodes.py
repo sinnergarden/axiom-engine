@@ -8,6 +8,7 @@ from decimal import Context, Decimal, ROUND_HALF_UP, localcontext
 from fractions import Fraction
 
 from ..core.contracts import require
+from ..core.portfolio import minor
 from .episode_evaluation import _new_episode, _actions, summarize_episodes
 
 
@@ -28,9 +29,58 @@ def _quantity(value):
         return str(Decimal(value.numerator)/value.denominator)
 
 
+def _settled_grants(owners, quantity):
+    """Attribute an already allocated account total; never round each episode."""
+    total = sum((q for _, q in owners), Fraction(0))
+    require(total > 0, 'settled shares require registered owners')
+    return [q*Fraction(quantity)/total for _, q in owners]
+
+
+def _share_allocation_summary(run, simulation):
+    marks = {(p['session'], p['security_id']): p for p in run['positions']}
+    actions = {a['economic_event_id']: a for a in run['plan']['market_replay']['equity_facts']['actions']}
+    events, securities, missing_marks = [], {}, 0
+    local_value = 0
+    for row in run['position_ledger']:
+        if row['reason'] != 'EQUITY_EX': continue
+        allocation = row['share_allocation']
+        require(allocation['allocated_grant'] == row['pending_share_delta'], 'allocation/journal mismatch')
+        remainder = Decimal(allocation['fractional_remainder'])
+        extra = allocation['possible_additional_share']
+        security = row['security_id']
+        totals = securities.setdefault(security, dict(event_count=0, rounded_event_count=0,
+            theoretical_fraction_sum='0', maximum_additional_shares=0))
+        totals['event_count'] += 1
+        totals['rounded_event_count'] += bool(remainder)
+        totals['theoretical_fraction_sum'] = str(Decimal(totals['theoretical_fraction_sum'])+remainder)
+        totals['maximum_additional_shares'] += extra
+        mark = marks.get((row['session'], security))
+        current = mark is not None and mark['mark_session'] == row['session'] and not mark['is_stale']
+        value = minor(remainder*Decimal(mark['mark_price'])*100) if current else (0 if not remainder else None)
+        ceiling_value = minor(Decimal(mark['mark_price'])*extra*100) if current else (0 if not extra else None)
+        missing_marks += value is None
+        if value is not None: local_value += value
+        events.append(dict(economic_event_id=row['source_event_id'], revision_ref=row['revision_ref'],
+            security_id=security, session=row['session'], sequence=row['sequence'], allocation=allocation,
+            source_refs=actions[row['source_event_id']]['source_refs'],
+            mark_price=mark['mark_price'] if current else None,
+            mark_source_refs=mark['mark_source_refs'] if current else None,
+            mark_status='AVAILABLE' if current else 'NO_CURRENT_SAVED_POSITION_MARK',
+            local_theoretical_remainder_value_minor=value, local_one_share_sensitivity_minor=ceiling_value))
+    return dict(contract_version='stock_share_allocation_summary_v1', profile_ref=run['profile_ref'],
+        policy=simulation['fractional_shares'], event_count=len(events),
+        rounded_event_count=sum(v['rounded_event_count'] for v in securities.values()), by_security=securities,
+        local_remainder_mark_value_minor=None if missing_marks else local_value,
+        missing_local_mark_count=missing_marks, events=events,
+        limitations=[simulation['limitation'],
+            'Remainders are disclosures, not owned rights, receivables or cash compensation.',
+            'Share differences aggregate per security only; they are not a common cross-security quantity.',
+            'Local marks describe each event at its saved original-price close. Their sum is not an account P&L correction or a full-path return bound.'])
+
+
 def evaluate_equity_episodes(run, scope, binding):
-    from .stock_equity import SIMULATION
-    require(run['plan']['profile']['equity_simulation']==SIMULATION,'frozen equity attribution required')
+    from .stock_equity import FLOOR_POLICY, validate_equity_profile
+    simulation = validate_equity_profile(run['plan']['profile'])['equity_simulation']
     require(run['plan']['initial_account']['positions']=={},'equity episodes require observed entry')
     # Same-event scope contradictions are still rejected. Supplemental facts,
     # rather than an evaluation-only correction, define this account's rights.
@@ -38,7 +88,7 @@ def evaluate_equity_episodes(run, scope, binding):
     facts=run['plan']['market_replay']['equity_facts']['actions']
     actions={a['economic_event_id']:a for a in facts}
     require(all(a['event_id'] in actions for a in observed),'evaluation cannot add a v8 account action')
-    episodes=[]; active={}; registered={}; ex_seen=set(); paid=set()
+    episodes=[]; active={}; registered={}; share_grants={}; ex_seen=set(); paid=set()
     events=[(f['sequence'],'FILL',f) for f in run['fills']]
     events += [(r['sequence'],r['reason'],r) for r in run['position_ledger'] if r['reason'].startswith('EQUITY_')]
     events += [(r['sequence'],r['reason'],r) for r in run['cash_ledger'] if r['reason'] in ('DIVIDEND_EX','DIVIDEND_PAY')]
@@ -87,15 +137,17 @@ def evaluate_equity_episodes(run, scope, binding):
                     record_quantity_fraction=dict(numerator=q.numerator,denominator=q.denominator),
                     revision_ref=actions[key]['revision_ref']))
         elif kind=='EQUITY_EX':
-            owners=registered.get(key,[]); a=actions[key]
-            grants=[q*Fraction(a['stock_distribution_shares_per_share']) for _,q in owners]
+            owners=registered.get(key,[])
+            grants=_settled_grants(owners, row['pending_share_delta'])
             require(sum(grants,Fraction(0))==row['pending_share_delta'],'saved share rights disagree with record origin')
+            share_grants[key] = grants
             for (e,_),grant in zip(owners,grants): e['pending_share_quantity']+=grant
             ex_seen.add(key)
         elif kind=='EQUITY_LISTING':
-            owners=registered.get(key,[]); a=actions[key]
-            for e,q in owners:
-                grant=q*Fraction(a['stock_distribution_shares_per_share'])
+            owners=registered.get(key,[])
+            grants=share_grants[key]
+            require(sum(grants,Fraction(0))==row['quantity_delta'], 'listed shares disagree with allocated grant')
+            for (e,_),grant in zip(owners,grants):
                 e['pending_share_quantity']-=grant; e['final_quantity']+=grant
                 if grant: e.update(exit_session=None,exit_sequence=None)
         elif kind=='DIVIDEND_EX':
@@ -109,7 +161,7 @@ def evaluate_equity_episodes(run, scope, binding):
                     pay_session=next((s for s in run['plan']['market_replay']['calendar'] if a['payment_date'] is not None and s>=a['payment_date']),None),
                     entitlement_quantity=_quantity(q),recognition_sequence=row['sequence'],payment_sequence=None,
                     recognized_minor=value,pending_minor=0,receivable_minor=value,source_refs=a['source_refs'],
-                    payment_status='PENDING',tax_convention=SIMULATION['tax_convention']))
+                    payment_status='PENDING',tax_convention=simulation['tax_convention']))
         elif kind=='DIVIDEND_PAY':
             owners=registered.get(key,[]); total=0
             for e,_ in owners:
@@ -141,10 +193,12 @@ def evaluate_equity_episodes(run, scope, binding):
             pending_dividend_minor=None if awaiting else 0,net_pnl_minor=None if reasons else pnl,
             marked_pnl_minor=pnl+marks.get(e['episode_id'],0) if open_position and not awaiting else None,
             return_denominator_minor=e['buy_cost_minor'],net_return=str(Decimal(pnl)/e['buy_cost_minor']) if not reasons and e['buy_cost_minor'] else None,
-            attribution_policy=SIMULATION['attribution'],final_quantity_fraction=dict(numerator=e['final_quantity'].numerator,denominator=e['final_quantity'].denominator),
+            attribution_policy=simulation['attribution'],final_quantity_fraction=dict(numerator=e['final_quantity'].numerator,denominator=e['final_quantity'].denominator),
             pending_share_quantity_fraction=dict(numerator=e['pending_share_quantity'].numerator,denominator=e['pending_share_quantity'].denominator))
         e['final_quantity']=_quantity(e['final_quantity']); e['pending_share_quantity']=_quantity(e['pending_share_quantity'])
     result,metrics=summarize_episodes(run,scope,episodes)
-    metrics.update(attribution_policy=SIMULATION['attribution'],cash_allocation='largest_remainder_entry_order',
+    metrics.update(attribution_policy=simulation['attribution'],cash_allocation='largest_remainder_entry_order',
         pending_share_episode_count=sum(bool(e['pending_share_quantity']) for e in episodes))
+    if simulation['fractional_shares'] == FLOOR_POLICY:
+        metrics['share_allocation_summary'] = _share_allocation_summary(run, simulation)
     return result,metrics

@@ -159,8 +159,8 @@ def _fees(price, quantity, side, profile):
 
 
 def _fee_components(price, quantity, side, profile, day=None):
-    full = profile["contract_version"] in ("stock_daily_open_profile_v2", "stock_daily_open_profile_v3")
-    if profile["contract_version"] not in ("stock_daily_open_profile_v1", "stock_daily_open_profile_v2", "stock_daily_open_profile_v3"):
+    full = profile["contract_version"] in ("stock_daily_open_profile_v2", "stock_daily_open_profile_v3", "stock_daily_open_profile_v4")
+    if profile["contract_version"] not in ("stock_daily_open_profile_v1", "stock_daily_open_profile_v2", "stock_daily_open_profile_v3", "stock_daily_open_profile_v4"):
         return (*_fees(price, quantity, side, profile), 0)
     if quantity == 0:
         return 0, 0, 0, 0
@@ -184,8 +184,8 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
     order["market_state"] = row["market_state"]
     order["state_reason"] = row["state_reason"]
     order["execution_admission"] = "CONFIRMED_STATUS"
-    full = profile["contract_version"] in ("stock_daily_open_profile_v2", "stock_daily_open_profile_v3")
-    stock = profile["contract_version"] in ("stock_daily_open_profile_v1", "stock_daily_open_profile_v2", "stock_daily_open_profile_v3")
+    full = profile["contract_version"] in ("stock_daily_open_profile_v2", "stock_daily_open_profile_v3", "stock_daily_open_profile_v4")
+    stock = profile["contract_version"] in ("stock_daily_open_profile_v1", "stock_daily_open_profile_v2", "stock_daily_open_profile_v3", "stock_daily_open_profile_v4")
     if full:
         order.update(requested_quantity=intent["quantity"], submitted_quantity=0,
                      unsubmitted_quantity=intent["quantity"], quantity=0, unfilled_quantity=0,
@@ -379,6 +379,7 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
         from ..core.stock_rules import validate_execution_rules
         rules_index = storage.audit.globals["rules_index"] if streaming else validate_execution_rules(profile["stock_execution_rules"])
     equity_actions = market["equity_facts"]["actions"] if equity else []
+    share_allocation_policy = profile['equity_simulation']['fractional_shares'] if equity else None
     splits = market.get("unit_splits", [])
     run_id = storage.run_id if streaming else Document.from_dict({"request": plan, "core": core_version, "runtime": runtime,
                                 "implementation_ref": IMPLEMENTATION_REF}).identity
@@ -419,12 +420,13 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                 require(initial_value > 0, "positive initial NAV required")
             ledger.advance(day)
             if equity:
-                equity_gaps = stock_equity.gaps(ledger, equity_actions, day, profile["decision_time_utc"])
+                equity_gaps = stock_equity.gaps(ledger, equity_actions, day, profile["decision_time_utc"],
+                    share_allocation_policy=share_allocation_policy)
                 if equity_gaps:
                     stopped = dict(session=day, reason="HELD_EQUITY_FACT_GAP", gaps=equity_gaps, committed_sequence=ledger.sequence)
                     storage.flush(day, "STOPPED_BEFORE_NAV", ledger.sequence)
                     break
-                stock_equity.advance(ledger, equity_actions, day)
+                stock_equity.advance(ledger, equity_actions, day, share_allocation_policy=share_allocation_policy)
                 # EX/PAY/LISTING change rights before this snapshot. Fills and
                 # registration leave pending rights unchanged until next day.
                 share_pending = stock_equity.pending(ledger)
