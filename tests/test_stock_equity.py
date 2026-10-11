@@ -95,6 +95,79 @@ class EquityTests(unittest.TestCase):
             self.assertEqual(ex['pending_share_quantity'],before['quantity']//10)
             self.assertEqual(ex['market_value_minor'],int(Decimal(ex['mark_price'])*(ex['quantity']+ex['pending_share_quantity'])*100))
 
+    def test_in_window_record_and_ex_dates_must_be_actual_sessions_before_account_creation(self):
+        for changes,field in [({'ex_date':'2024-01-06'},'ex_date'),
+                ({'record_date':'2024-01-06','ex_date':DAYS[3],
+                  'payment_date':DAYS[3],'stock_listing_date':DAYS[3]},'record_date')]:
+            with self.subTest(field=field),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp); manifest,_,_=fixture(root,change=lambda a:a.update(changes))
+                path=Path(manifest['action_facts_artifact']['manifest_uri']); original=path.read_bytes()
+                with patch('axiom_engine.runtime.backtest.AccountLedger',side_effect=AssertionError('account created')):
+                    with self.assertRaisesRegex(ContractError,'action '+field+' absent from frozen exchange calendar'):
+                        execute(root/'out',manifest)
+                self.assertEqual(path.read_bytes(),original)
+
+    def test_future_phase_dates_outside_calendar_are_preserved_without_mapping_record_or_ex(self):
+        for record in [DAYS[1],'2024-01-13']:
+            with self.subTest(record=record),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp); manifest,_,a=fixture(root,change=lambda a:a.update(record_date=record,
+                    ex_date='2024-01-14',payment_date='2024-01-15',stock_listing_date='2024-01-15'))
+                wire,view,_=execute(root/'out',manifest)
+                self.assertEqual(wire['status'],'COMPLETE')
+                self.assertEqual(view.account_events['equity_facts']['actions'][0],a)
+                self.assertFalse(any(r['reason']=='EQUITY_EX' for r in view.rows['position_ledger']))
+                if record==DAYS[1]:
+                    state=wire['final_account']['equity_entitlements'][a['economic_event_id']]
+                    self.assertEqual(state['record_quantity'],16600)
+                    self.assertFalse(state['ex_applied'])
+
+    def test_saved_loader_rejects_rehashed_in_window_non_session_record_and_ex_dates(self):
+        from axiom_engine.runtime.stock_stream import stock_run_id
+        from axiom_engine.runtime.stock_stream_contracts import logical_ref
+        from axiom_engine.runtime.stock_stream_projection import load_stock_backtest_projection
+        from axiom_engine.runtime.stock_equity import cash_action
+        from test_stock_stream_inputs import LIMITS
+        from test_stock_stream_projection import reseal_run
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); manifest,_,a=fixture(root,change=lambda a:a.update(ex_date='2024-01-14',
+                payment_date='2024-01-15',stock_listing_date='2024-01-15'))
+            valid,_,_=execute(root/'out',manifest)
+            self.assertEqual(valid['final_account']['equity_entitlements'][a['economic_event_id']]['record_quantity'],16600)
+            for field in ('record_date','ex_date'):
+                with self.subTest(field=field):
+                    wire=deepcopy(valid); events=wire['account_events']; request=wire['request_manifest']
+                    events['equity_facts']['actions'][0][field]='2024-01-06'
+                    ref=Document.from_dict(events['equity_facts']).identity
+                    request['action_facts_artifact']['content_digest']=events['action_facts_ref']=ref
+                    request['request_ref']=logical_ref(request,'request_ref')
+                    wire['request_ref']=wire['source_audit']['request_ref']=events['request_ref']=request['request_ref']
+                    wire['source_audit_ref']=Document.from_dict(wire['source_audit']).identity
+                    events['cash_dividends']=[cash_action(events['equity_facts']['actions'][0],DAYS)]
+                    wire['account_events_ref']=Document.from_dict(events).identity
+                    wire['run_id']=stock_run_id(request,wire['implementation_ref'])
+                    path=root/('invalid-'+field+'.json'); reseal_run(path,wire)
+                    with self.assertRaisesRegex(ContractError,'action '+field+' absent from frozen exchange calendar'):
+                        load_stock_backtest_projection(path,artifact_reader=lambda r:self.fail('artifact read'),limits=LIMITS)
+
+    def test_pending_is_scanned_once_after_each_days_transfers_in_runtime_and_saved_replay(self):
+        from axiom_engine.runtime import stock_equity
+        snapshots=[]
+        def observe(ledger):
+            shares=pending(ledger)
+            snapshots.append((ledger._output_guard is not None,ledger._session,len(ledger.positions),dict(shares)))
+            return shares
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); manifest,_,a=fixture(root)
+            with patch.object(stock_equity,'pending',side_effect=observe):
+                wire,view,_=execute(root/'out',manifest)
+            for runtime in (True,False):
+                actual=[row[1:] for row in snapshots if row[0]==runtime]
+                self.assertEqual([row[0] for row in actual],DAYS[1:])
+                self.assertEqual([row[2] for row in actual],[{},{a['security_id']:1660},{}])
+                self.assertGreater(actual[-1][1],1)
+            self.assertEqual(wire['status'],'COMPLETE')
+            self.assertTrue(any(p['pending_share_quantity']==1660 for p in view.rows['positions']))
+
     def test_saved_partial_gap_replays_and_zero_total_does_not_require_listing(self):
         for total,expected in [(None,'BLOCKED'),('0','COMPLETE')]:
             with self.subTest(total=total),tempfile.TemporaryDirectory() as tmp:
@@ -158,6 +231,38 @@ class EquityTests(unittest.TestCase):
         register(ledger,second,DAYS[2]); ledger.advance(DAYS[3])
         self.assertEqual(gaps(ledger,[second],DAYS[3],'09:30:00+08:00')[0]['reason'],
             'UNRESOLVED_REGISTERED_SHARE_BASIS')
+
+    def test_saved_boundary_evidence_keeps_exact_fraction_late_record_quantity_and_unlisted_rights(self):
+        for boundary,reason in [('fraction','UNSUPPORTED_FRACTIONAL_ENTITLEMENT'),
+                ('late','LATE_ENTITLEMENT_FACT'),('unlisted','UNRESOLVED_REGISTERED_SHARE_BASIS')]:
+            with self.subTest(boundary=boundary),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp)
+                change=(lambda a:a.update(available_at='2024-01-02T21:00:00+08:00')) if boundary=='late' else None
+                manifest,old,a=fixture(root,stock='0.0001' if boundary=='fraction' else '0.1',change=change)
+                if boundary=='unlisted':
+                    facts=Document(Path(manifest['action_facts_artifact']['manifest_uri']).read_text()).to_dict()
+                    facts['actions'][0]['stock_listing_date']='2024-01-09'
+                    second=action(a['security_id'],economic_event_id='tushare:second',report_period='2023-12-31',
+                        record_date=DAYS[2],ex_date=DAYS[3],payment_date=DAYS[3],stock_listing_date=DAYS[3])
+                    second['aliases'][0].update(report_period=second['report_period'],announcement_date='2023-12-25')
+                    facts['actions'].append(second)
+                    manifest=equity_request(BacktestRequest.from_dict(old),profile_input=manifest['profile_input'],
+                        action_facts_artifact=artifact_file(root,'overlap-actions',facts)).to_dict()
+                wire,view,_=execute(root/'out',manifest)
+                self.assertEqual(wire['status'],'BLOCKED')
+                gap=wire['stopped']['gaps'][0]; self.assertEqual(gap['reason'],reason)
+                record=next(p for p in view.rows['positions'] if p['security_id']==a['security_id'] and p['session']==DAYS[1])
+                self.assertEqual(record['quantity'],16600)
+                registers=[r for r in view.rows['position_ledger'] if r['reason']=='EQUITY_REGISTER']
+                if boundary=='fraction':
+                    self.assertEqual(gap['unrounded_share_quantity'],'1.6600')
+                    self.assertEqual(registers[0]['record_quantity'],16600)
+                elif boundary=='late':
+                    self.assertEqual(registers,[])
+                    self.assertEqual(wire['stopped']['session'],DAYS[2])
+                else:
+                    self.assertEqual(registers[-1]['record_quantity'],16600)
+                    self.assertEqual(registers[-1]['record_pending_quantity'],1660)
 
     def test_market_owner_uses_same_rights_path_and_saved_evaluation_never_reopens_source(self):
         from test_stock_market_owner import market_for,bind

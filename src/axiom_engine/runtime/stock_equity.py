@@ -64,6 +64,7 @@ def validate_facts(wire, *, universe, calendar, parent_refs):
     require(type(wire['actions']) is list and type(wire['limitations']) is list and
             all(type(x) is str for x in wire['limitations']), 'explicit action catalog required')
     ids, aliases = set(), set()
+    calendar_sessions = set(calendar)
     for a in wire['actions']:
         fields(a, 'economic_event_id revision_ref identity_status security_id report_period record_date ex_date payment_date stock_listing_date cash_dividend_before_tax_per_share stock_distribution_shares_per_share bonus_shares_per_share capital_transfer_shares_per_share available_at first_observed_at raw_batch_ids source_refs aliases')
         require(type(a['economic_event_id']) is str and bool(a['economic_event_id']), 'Data economic event identity required'); digest(a['revision_ref'])
@@ -78,6 +79,10 @@ def validate_facts(wire, *, universe, calendar, parent_refs):
         require(instant(a['available_at']) <= instant(calendar[-1]+'T20:30:00+08:00'), 'future action evidence')
         for k in ('record_date', 'ex_date', 'payment_date', 'stock_listing_date'):
             if a[k] is not None: session(a[k])
+        for k in ('record_date', 'ex_date'):
+            day = a[k]
+            require(day is None or day < calendar[0] or day > calendar[-1] or
+                    day in calendar_sessions, 'action '+k+' absent from frozen exchange calendar')
         if a['record_date'] is not None and a['ex_date'] is not None:
             require(a['record_date'] < a['ex_date'], 'action record must precede EX')
         for k in ('payment_date', 'stock_listing_date'):
@@ -125,7 +130,7 @@ def _journal(ledger, a, day, phase, **values):
     ledger._append_output('position_ledger', row)
 
 
-def register(ledger, action, day):
+def register(ledger, action, day, *, pending_shares=None):
     key = action['economic_event_id']
     payload = canonical(action)
     if instant(action['available_at']) > instant(day+'T20:30:00+08:00'): return
@@ -133,7 +138,7 @@ def register(ledger, action, day):
         require(ledger.equity_entitlements[key]['payload'] == payload, 'conflicting equity registration')
         return
     quantity = ledger.positions.get(action['security_id'], {}).get('quantity', 0)
-    pending_quantity = pending(ledger).get(action['security_id'], 0)
+    pending_quantity = (pending(ledger) if pending_shares is None else pending_shares).get(action['security_id'], 0)
     _journal(ledger, action, day, 'REGISTER', record_quantity=quantity,
              record_pending_quantity=pending_quantity)
     ledger.equity_entitlements[key] = dict(payload=payload, security_id=action['security_id'],
@@ -252,6 +257,7 @@ def verify_saved(wire, rows, profile):
         else:
             require(not missing, 'saved equity account advanced through qualified gap')
             advance(ledger, actions, day)
+            shares = pending(ledger)
             if not stopped:
                 for fill in fills_by_day[day]: ledger.apply_fill(fill)
                 for security, position in ledger.positions.items():
@@ -259,9 +265,9 @@ def verify_saved(wire, rows, profile):
                 for a in actions:
                     if a['record_date'] == day:
                         ledger.equity_history[day,a['security_id']] = ledger.positions.get(a['security_id'],{}).get('quantity',0)
-                        register(ledger,a,day)
+                        register(ledger,a,day,pending_shares=shares)
                 ledger.sequence += 1
-                point = nav[day]; shares = pending(ledger)
+                point = nav[day]
                 snapshots = {p['security_id']:p for p in rows['positions'] if p['session']==day}
                 require(len(snapshots) == sum(p['session']==day for p in rows['positions']), 'duplicate equity position snapshot')
                 expected = {s for s,p in ledger.positions.items() if p['quantity']} | set(shares)

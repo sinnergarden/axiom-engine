@@ -410,6 +410,7 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
     for index, day in enumerate(calendar):
         if day > plan["end_session"]:
             break
+        share_pending = {}
         if day >= plan["start_session"]:
             if initial_value is None:
                 require(all(s in marks for s in ledger.positions), "initial positions lack observed price")
@@ -424,9 +425,12 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                     storage.flush(day, "STOPPED_BEFORE_NAV", ledger.sequence)
                     break
                 stock_equity.advance(ledger, equity_actions, day)
+                # EX/PAY/LISTING change rights before this snapshot. Fills and
+                # registration leave pending rights unchanged until next day.
+                share_pending = stock_equity.pending(ledger)
             account_positions = ledger.positions
             if equity:
-                account_positions = {s:{**ledger.positions.get(s,{}), "quantity":ledger.positions.get(s,{}).get("quantity",0)+stock_equity.pending(ledger).get(s,0)} for s in set(ledger.positions)|set(stock_equity.pending(ledger))}
+                account_positions = {s:{**ledger.positions.get(s,{}), "quantity":ledger.positions.get(s,{}).get("quantity",0)+share_pending.get(s,0)} for s in set(ledger.positions)|set(share_pending)}
             if stock:
                 from .stock_inputs import applicable_blocks
                 if v6:
@@ -506,7 +510,7 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                 for action in equity_actions:
                     if action["record_date"] == day:
                         ledger.equity_history[day, action["security_id"]] = ledger.positions.get(action["security_id"], {}).get("quantity", 0)
-                        stock_equity.register(ledger, action, day)
+                        stock_equity.register(ledger, action, day, pending_shares=share_pending)
             for action in ([] if equity else market["cash_dividends"]):
                 if action["record_session"] == day:
                     entitlements[action["event_id"]] = ledger.positions.get(action["security_id"], {"quantity": 0})["quantity"]
@@ -541,7 +545,6 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                     mark_basis[event["security_id"]] = event["event_id"]
         ledger.sequence += 1  # commit the session valuation at one shared watermark
         value = 0
-        share_pending = stock_equity.pending(ledger) if equity else {}
         marked_positions = {**{s:dict(quantity=0,sellable_quantity=0,cost_minor=0) for s in share_pending}, **ledger.positions}
         for security, position in sorted(marked_positions.items()):
             if not position["quantity"] and not share_pending.get(security):
