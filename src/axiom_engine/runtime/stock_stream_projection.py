@@ -107,12 +107,13 @@ def _artifact(ref):
 
 def _run_header(wire):
     from .stock_stream_contracts import validate_manifest
+    from .stock_rules import stock_core_version
     require("account_events" in wire and "account_events_ref" in wire,
             "saved account event view/ref required")
     fields(wire, RUN_FIELDS)
     require(wire["contract_version"] in ("backtest_run_v7", "backtest_run_v8") and
             wire["runtime_version"] == ("axiom.backtest/8" if wire["contract_version"] == "backtest_run_v8" else "axiom.backtest/7") and
-            wire["core_version"] == "axiom.stock_portfolio/3", "invalid saved v7 version tuple")
+            wire["core_version"] == stock_core_version(wire["request_manifest"]["portfolio_policy"]), "invalid saved v7 version tuple")
     require(wire["status"] in ("COMPLETE", "BLOCKED"), "invalid saved run status")
     for key in ("run_id", "request_ref", "source_audit_ref", "signal_ref", "market_ref",
                 "profile_ref", "implementation_ref", "account_events_ref", "content_digest"):
@@ -273,6 +274,14 @@ def _saved_business(wire, rows, profile):
     intents = {}
     decision_days = set()
     execution_universe = set(request["scope"]["execution_universe"])
+    strategy = wire["core_version"] == "axiom.stock_portfolio/4"
+    if strategy:
+        from ..core.stock_strategy import initial_strategy_state, validate_strategy_policy, strategy_support_ref
+        validate_strategy_policy(request["portfolio_policy"], request["scope"]["execution_universe"], rules_ref)
+        require(request["scope"]["supported_universe_ref"] ==
+                strategy_support_ref(request["scope"]["execution_universe"], request["portfolio_policy"]["universe_id"]),
+                "saved strategy membership scope mismatch")
+        saved_strategy_state = initial_strategy_state()
     for decision in rows["decisions"]:
         day = decision.get("trade_session")
         require(day in day_index and day_index[day] > 0 and day not in decision_days and
@@ -283,6 +292,10 @@ def _saved_business(wire, rows, profile):
                 decision.get("stock_execution_rules_ref") == rules_ref,
                 "saved decision/version/session/rule binding mismatch")
         decision_days.add(day)
+        if strategy:
+            from .stock_strategy_saved import validate_saved_strategy_decision
+            saved_strategy_state = validate_saved_strategy_decision(decision, request["portfolio_policy"],
+                request["scope"]["execution_universe"], saved_strategy_state, rows["positions"])
         frame = frames.get(decision.get("signal_ref"))
         clock = decision.get("prediction_clock")
         require(frame is not None and type(clock) is dict,'Saved decision/Signal metadata required')
@@ -385,6 +398,9 @@ def _saved_business(wire, rows, profile):
     else:
         _saved_balances(wire, rows, fills)
         _saved_cash_actions(wire, rows)
+    if strategy:
+        from .stock_strategy_saved import validate_saved_strategy_capacity
+        validate_saved_strategy_capacity(wire, rows)
     metrics = wire["metrics"]
     expected = dict(total_fees_minor=sum(fill["fee_minor"] for fill in fills.values()),
                     turnover_minor=sum(fill["gross_minor"] for fill in fills.values()), fill_count=len(fills),

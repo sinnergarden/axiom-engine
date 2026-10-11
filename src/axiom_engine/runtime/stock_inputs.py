@@ -14,8 +14,14 @@ ACTION_POLICY = "observed_implemented_only"
 TAX_CONVENTION = "gross_before_tax_no_personal_tax_model"
 
 
-def stock_portfolio_policy(*, top_k: int, execution_universe: list[str]) -> dict:
+def stock_portfolio_policy(*, execution_universe: list[str], top_k=None, strategy_spec=None, universe_id=None, execution_rules=None) -> dict:
     """Pure explicit TopK configuration; never read members, prices or predictions."""
+    if strategy_spec is not None:
+        from .stock_rules import strategy_stock_portfolio_policy
+        require(top_k is None, "strategy spec owns top_k")
+        return strategy_stock_portfolio_policy(strategy_spec=strategy_spec, universe_id=universe_id,
+                    execution_universe=execution_universe, execution_rules=execution_rules)
+    require(universe_id is None and execution_rules is None, "pool/rules require an explicit strategy spec")
     require(type(execution_universe) is list and bool(execution_universe) and
             execution_universe == supported_universe(execution_universe) and
             len(set(execution_universe)) == len(execution_universe), "frozen supported execution universe required")

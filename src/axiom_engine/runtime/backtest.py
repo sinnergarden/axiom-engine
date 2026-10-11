@@ -177,7 +177,7 @@ def _fee_components(price, quantity, side, profile, day=None):
 
 
 def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_splits=None, stock_market=None,
-              stock_rules_index=None):
+              stock_rules_index=None, position_capacity=None, pending_share_quantities=None, reserved_security_ids=()):
     order = {**intent, "order_id": run_id + ":order:" + str(order_index), "session": day,
              "status": "EXPIRED", "filled_quantity": 0, "unfilled_quantity": intent["quantity"],
              "reason": None, "execution": "daily_open_approximation"}
@@ -200,6 +200,13 @@ def _simulate(intent, row, ledger, profile, day, run_id, order_index, unit_split
             from ..core.stock_rules import rule_at, legal_quantity
             rule = rule_at(profile["stock_execution_rules"], intent["security_id"], day, validated=stock_rules_index)
             order["quantity_rule_effective_from"] = rule["effective_from"]
+        if position_capacity is not None and intent["side"] == "BUY":
+            owned = {s for s, p in ledger.positions.items() if p["quantity"]} | {
+                s for s, quantity in (pending_share_quantities or {}).items() if quantity} | set(reserved_security_ids)
+            if intent["security_id"] not in owned and len(owned) >= position_capacity:
+                order.update(status="REJECTED", execution_admission="BLOCKED", reason="MAX_OWNED_POSITIONS",
+                             submission_reason="MAX_OWNED_POSITIONS")
+                return order
         if full and (not row["_stock_listed"] or not row["_stock_factor_valid"]):
             order.update(execution_admission="BLOCKED", reason="MISSING_STOCK_LIFECYCLE_CAPABILITY",
                          capability_missing_reason=row["_stock_factor_missing_reason"],
@@ -374,6 +381,11 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
     from ..core.etf_buy_hold import BUY_HOLD_VERSION, plan_etf_buy_and_hold
     runtime = "axiom.backtest/6" if v6 else ("axiom.backtest/5" if v5 else ("axiom.backtest/4" if v4 else ("axiom.backtest/3" if stock else (RUNTIME_VERSION if v2 else LEGACY_RUNTIME_VERSION))))
     core_version = CSI300_PORTFOLIO_VERSION if v6 else (BUY_HOLD_VERSION if hold else (TOPK_PORTFOLIO_VERSION if stock else PORTFOLIO_VERSION))
+    strategy = v6 and plan["portfolio_policy"].get("contract_version") == "stock_portfolio_policy_v4"
+    if strategy:
+        from ..core.stock_strategy import initial_strategy_state, STRATEGY_PORTFOLIO_VERSION
+        core_version = STRATEGY_PORTFOLIO_VERSION
+        strategy_state, risk_observations = initial_strategy_state(), {}
     rules_index = None
     if v6:
         from ..core.stock_rules import validate_execution_rules
@@ -482,6 +494,11 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                     if v6:
                         context.update(portfolio_policy=plan["portfolio_policy"], stock_execution_rules=profile["stock_execution_rules"],
                                        stock_execution_rules_ref=plan["stock_execution_rules_ref"])
+                    if strategy:
+                        from .stock_strategy_rights import registered_share_reservations
+                        reserved_rights = registered_share_reservations(ledger, equity_actions) if equity else []
+                        context.update(strategy_state=strategy_state, risk_observations=risk_observations,
+                                       pending_share_quantities=share_pending if equity else {}, reserved_security_ids=reserved_rights)
                     if scheduled:
                         context["feature_knowledge_cutoff"] = first["feature_knowledge_cutoff"]
                         decision = _plan_admitted_stock_portfolio(active, active_rows, account=ledger.account(),
@@ -495,9 +512,14 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                 if v2 or stock:
                     decision["reference_prices"] = {s: dict(q) for s, q in quotes.items()}
                 append_output("decisions", decision)
+                if strategy and "strategy_targets" in decision:
+                    strategy_state = decision["strategy_targets"]["next_state"]
                 for intent in decision["intents"]:
                     order = _simulate(intent, rows[day, intent["security_id"]], ledger, profile, day, run_id, order_index,
-                                      splits if v2 else None, market if stock else None, stock_rules_index=rules_index)
+                                      splits if v2 else None, market if stock else None, stock_rules_index=rules_index,
+                                      position_capacity=plan["portfolio_policy"]["top_k"] if strategy else None,
+                                      pending_share_quantities=share_pending if strategy and equity else None,
+                                      reserved_security_ids=reserved_rights if strategy else ())
                     order_index += 1
                     append_output("orders", order)
                     if streaming:
@@ -568,6 +590,16 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
             if v6:
                 point["stale_reason"] = rows[day, security]["_stock_close_missing_reason"] if mark["session"] != day else None
             append_output("positions", point)
+        if strategy:
+            # Capture cost and economic quantity in this close's original units.
+            # Today's EX must never modify yesterday's risk observation.
+            risk_observations = {s: dict(price=marks[s]["price"], session=marks[s]["session"],
+                available_at=marks[s]["available_at"], source_refs=marks[s]["source_refs"],
+                cost_minor=ledger.positions.get(s, {}).get("cost_minor", 0),
+                owned_quantity=ledger.positions.get(s, {}).get("quantity", 0)+(share_pending.get(s, 0) if equity else 0),
+                price_basis="original_session_units", committed_sequence=ledger.sequence) for s in marked_positions
+                if s in marks and marks[s]["session"] == day and (ledger.positions.get(s, {}).get("quantity", 0) or
+                (share_pending.get(s, 0) if equity else 0))}
         if streaming:
             point = None
         receivable = sum(ledger.receivables.values())

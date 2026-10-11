@@ -421,8 +421,14 @@ def _bind(market, plan, source, limits, maximum):
     try:
         require(meta["implementation_ref"] == IMPLEMENTATION_REF, "Admitted stock implementation differs")
         validate_top_k(plan["portfolio_policy"]["top_k"], universe)
-        require(plan["portfolio_policy"] == {**meta["policy"], "top_k": plan["portfolio_policy"]["top_k"]},
-                "Stock portfolio policy mismatch")
+        if plan["portfolio_policy"].get("contract_version") == "stock_portfolio_policy_v4":
+            from .stock_rules import validate_full_stock_policy
+            require(plan["portfolio_policy"]["universe_id"] == "csi300", "admitted CSI300 market cannot authorize another membership pool")
+            validate_full_stock_policy(plan["portfolio_policy"], execution_universe=universe,
+                                       execution_rules=meta["globals"]["profile"]["stock_execution_rules"])
+        else:
+            require(plan["portfolio_policy"] == {**meta["policy"], "top_k": plan["portfolio_policy"]["top_k"]},
+                    "Stock portfolio policy mismatch")
         native_by_day, contexts = {}, []
         execution = {canonical(artifact_identity(d["entry"]["artifact"])): d for d in meta["descriptors"]}
         if proof is None:
