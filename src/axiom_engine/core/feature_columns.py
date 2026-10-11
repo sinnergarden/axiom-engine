@@ -52,6 +52,7 @@ class CompiledFeatureColumns:
     _plan: object
     _history: object
     _last_use: object
+    _sessions: tuple
 
 
 def compile_feature_columns(plan: FeaturePlan):
@@ -74,7 +75,8 @@ def compile_feature_columns(plan: FeaturePlan):
                      'plan_ref': plan.identity, 'implementation_ref': IMPLEMENTATION_REF,
                      'profile': 'sessions_float64_bool_sources64_v1'})
     return CompiledFeatureColumns(plan.identity, identity, _freeze(p),
-                                  _freeze(required_history(plan)), _freeze(last))
+                                  _freeze(required_history(plan)), _freeze(last),
+                                  tuple(sorted(p['reference_members'])))
 
 
 class _Budget:
@@ -190,6 +192,10 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     for day in days:
         session(day)
     require(days == sorted(set(days)), 'Column sessions must be unique/ordered')
+    require(days[0] in p['reference_members'], 'MISSING_SESSION: unbound calendar start')
+    start = compiled._sessions.index(days[0])
+    require(tuple(days) == compiled._sessions[start:start + len(days)],
+            'MISSING_SESSION: input must be a contiguous frozen-calendar slice')
     require(type(securities) is list and bool(securities), 'Column security IDs required')
     for security in securities:
         text(security)

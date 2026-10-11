@@ -39,6 +39,25 @@ def packed(p, f, c):
 
 
 class FeatureColumns(unittest.TestCase):
+    def test_calendar_slice_cannot_compress_a_missing_middle_session(self):
+        p,f,c = setup({'A':[10,20,30]}, [node('lag','shift',['x'],{'periods':1})])
+        compiled = compile_feature_columns(FeaturePlan.from_dict(p))
+        def sliced(indices):
+            inputs = packed(p,f,c)
+            inputs['sessions'] = [c['sessions'][i] for i in indices]
+            inputs['cutoffs_utc_us'] = inputs['cutoffs_utc_us'][indices]
+            for field in ('values','validity','reason_codes','available_at_utc_us','source_codes'):
+                for name, value in inputs[field].items(): inputs[field][name] = value[indices]
+            for field in ('reference_member','reference_industry','reference_available_at_utc_us','reference_source_codes'):
+                inputs[field] = inputs[field][indices]
+            return inputs
+        result = execute_feature_columns(compiled, inputs=sliced([1,2]),
+            output_sessions=[c['sessions'][2]], max_working_bytes=2**20)
+        self.assertEqual(float(result['values'][0,0,0]), 20)
+        with self.assertRaisesRegex(ContractError, 'MISSING_SESSION'):
+            execute_feature_columns(compiled, inputs=sliced([0,2]),
+                output_sessions=[c['sessions'][2]], max_working_bytes=2**20)
+
     def test_composite_original_math_clocks_missing_cohort_anchor_and_batch(self):
         nodes = [node('lag', 'shift', ['x'], {'periods': 1}),
                  rolling('mean', 'lag', 3, 2), rolling('std', 'mean', 2, 1, 'std', ddof=1),
