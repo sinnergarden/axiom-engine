@@ -322,8 +322,13 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
     if strategy_targets is not None:
         result["targets"].update(strategy_targets["preserve_quantities"])
     for security in sorted(needed):
-        raw = (int(budget * decimal(strategy_targets["target_weights"].get(security, "0")) / (prices[security] * 100))
-               if strategy_targets is not None else (int(budget / k / (prices[security] * 100)) if security in selected else 0))
+        if strategy_targets is not None:
+            from fractions import Fraction
+            ratio = strategy_targets["allocation_ratios"].get(security, {"numerator": 0, "denominator": 1})
+            exact = Fraction(budget)*Fraction(ratio["numerator"], ratio["denominator"])/(Fraction(prices[security])*100)
+            raw = exact.numerator//exact.denominator
+        else:
+            raw = int(budget / k / (prices[security] * 100)) if security in selected else 0
         if strategy_targets is not None and security in strategy_targets["preserve_quantities"]:
             result["targets"][security] = strategy_targets["preserve_quantities"][security]
             continue

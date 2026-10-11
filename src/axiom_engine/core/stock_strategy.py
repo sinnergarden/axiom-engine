@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import datetime
 from decimal import Context, Decimal, ROUND_HALF_UP, localcontext
+from fractions import Fraction
 from typing import Protocol
 
 from .contracts import Document, digest, fields, integer, number, require, session
@@ -228,7 +229,7 @@ class ConfiguredStockStrategy:
         forced.update(newly_forced)
         selected = [s for s in selected if s not in forced]
         preserve = {s: q for s, q in preserve.items() if s not in forced}
-        weights = {s: str(Decimal(1)/k) for s in selected if s not in preserve}
+        weighted = [s for s in selected if s not in preserve]
         budget = Decimal(inputs["cash_minor"])
         reserve = Decimal(0)
         for s in held:
@@ -240,18 +241,19 @@ class ConfiguredStockStrategy:
             value = Decimal(q) * decimal(quote["price"]) * 100 if q else Decimal(0)
             budget += value
             if s in preserve or s in forced: reserve += value
-        if weights and budget:
-            requested = sum(decimal(w) for w in weights.values()) * budget
-            scale = min(Decimal(1), max(Decimal(0), budget-reserve)/requested)
-            weights = {s: str(decimal(w)*scale) for s, w in weights.items()}
+        ratio = Fraction(1, k)
+        if weighted and budget:
+            ratio = min(ratio, Fraction(max(Decimal(0), budget-reserve))/Fraction(budget)/len(weighted))
         elif not budget:
-            weights = {s: "0" for s in weights}
+            ratio = Fraction(0)
+        allocations = {s: dict(numerator=ratio.numerator, denominator=ratio.denominator) for s in weighted}
+        weights = {s: str(Decimal(ratio.numerator)/ratio.denominator) for s in weighted}
         trace.append(dict(reason="STRATEGY_TARGET_BUDGET", budget_minor=str(budget), reserved_minor=str(reserve),
                           pending_rights="occupy_slots_excluded_from_deployable_budget"))
         wire = dict(contract_version="stock_strategy_targets_v1", strategy_spec_ref=self._spec.identity,
                     status="NO_DECISION" if insufficient and not forced else "DECISION_COMPLETE",
-                    selected_security_ids=selected, target_weights=weights, preserve_quantities=preserve,
+                    selected_security_ids=selected, target_weights=weights, allocation_ratios=allocations, preserve_quantities=preserve,
                     force_exit_security_ids=sorted(forced), next_state=next_state, trace=trace)
-        require(not (set(preserve) & forced) and sum(decimal(w) for w in weights.values()) <= 1,
+        require(not (set(preserve) & forced) and ratio*len(weighted) <= 1,
                 "conflicting strategy targets")
         return StrategyTargets.from_dict(wire)

@@ -1,5 +1,6 @@
 """Validate saved strategy identities and clocks without calling a planner."""
 from decimal import Context, Decimal, ROUND_HALF_UP, localcontext
+from fractions import Fraction
 
 from ..core.contracts import Document, fields, integer, require
 from ..core.portfolio import decimal
@@ -14,7 +15,7 @@ def validate_saved_strategy_decision(decision, policy, universe, previous_state,
 
 def _validate(decision, policy, universe, previous_state, positions):
     targets = decision.get("strategy_targets")
-    fields(targets, "contract_version strategy_spec_ref status selected_security_ids target_weights preserve_quantities force_exit_security_ids next_state trace")
+    fields(targets, "contract_version strategy_spec_ref status selected_security_ids target_weights allocation_ratios preserve_quantities force_exit_security_ids next_state trace")
     require(targets["contract_version"] == "stock_strategy_targets_v1" and
             decision.get("strategy_spec_ref") == targets["strategy_spec_ref"] == policy["strategy_spec_ref"] and
             decision.get("strategy_targets_ref") == Document.from_dict(targets).identity and
@@ -29,8 +30,19 @@ def _validate(decision, policy, universe, previous_state, positions):
             (set(weights) | set(preserve) | set(forced)) <= set(universe) and
             not ((set(weights) | set(preserve)) & set(forced)) and not (set(weights) & set(preserve)),
             "saved strategy target domains conflict")
-    require(all(type(v) is str and decimal(v) >= 0 for v in weights.values()) and
-            sum((decimal(v) for v in weights.values()), Decimal(0)) <= 1, "invalid saved target weights")
+    require(all(type(v) is str and decimal(v) >= 0 for v in weights.values()), "invalid saved target weights")
+    allocations = targets["allocation_ratios"]
+    require(type(allocations) is dict and set(allocations) == set(weights), "saved allocation ratio scope mismatch")
+    ratios = []
+    for s, allocation in allocations.items():
+        fields(allocation, "numerator denominator")
+        integer(allocation["numerator"]); integer(allocation["denominator"], 1)
+        ratio = Fraction(allocation["numerator"], allocation["denominator"])
+        require(allocation == dict(numerator=ratio.numerator, denominator=ratio.denominator) and
+                decimal(weights[s]) == Decimal(ratio.numerator)/ratio.denominator,
+                "saved exact allocation ratio/weight mismatch")
+        ratios.append(ratio)
+    require(sum(ratios, Fraction(0)) <= 1, "saved allocation ratios exceed budget")
     for value in preserve.values(): integer(value)
     require(all(decision.get("targets", {}).get(s, 0) == 0 for s in forced) and
             all(intent["security_id"] not in set(forced) | set(preserve) for intent in decision["intents"] if intent["side"] == "BUY"),

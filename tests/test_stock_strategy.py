@@ -201,6 +201,20 @@ class StockStrategyTests(unittest.TestCase):
                 self.assertEqual(result["targets"],{security:0})
                 self.assertEqual(result["intents"],[])
 
+    def test_top_k_three_exact_lot_boundary_matches_legacy_targets(self):
+        rules=rules_for();context=core_context(rules,3)
+        frame=StockPredictionFrame.from_dict(frame_for(rules))
+        account=dict(cash_minor=300_000,positions={},version=0)
+        legacy=plan_stock_portfolio(frame,account=account,context=context,top_k=3).to_dict()
+        context.update(portfolio_policy=stock_portfolio_policy(strategy_spec=stock_strategy_spec(top_k=3),
+            universe_id="csi300",execution_universe=rules["universe"],execution_rules=rules),
+            strategy_state=initial_strategy_state(),pending_share_quantities={},reserved_security_ids=[],risk_observations={})
+        result=plan_stock_portfolio(frame,account=account,context=context,top_k=3).to_dict()
+        self.assertEqual(result["targets"],legacy["targets"])
+        self.assertEqual(list(result["targets"].values()),[100,100,100])
+        self.assertEqual([i["quantity"] for i in result["intents"]],[100,100,100])
+        self.assertTrue(all(r==dict(numerator=1,denominator=3) for r in result["strategy_targets"]["allocation_ratios"].values()))
+
     def test_same_saved_signal_three_configs_reuse_market_and_load_without_planning(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);manifest,_=source_fixture(root)

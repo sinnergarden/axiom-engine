@@ -174,6 +174,11 @@ would exceed the actual owned-position limit records `MAX_OWNED_POSITIONS`.
 The saved loader checks strategy/state identities, exit observations against the
 prior original-unit position snapshot, and capacity from the saved journal; it
 does not replay the strategy or reopen signals/native inputs.
+`allocation_ratios` stores each weight as an exact integer numerator and
+denominator. Core floors the exact rational budget/price quantity before applying
+the existing lot rules; the decimal `target_weights` are its readable projection.
+This retains K=3 lot boundaries without epsilon or upward quantity adjustments.
+Preserve-only rights explicitly have zero quantity targets and produce no buys.
 
 This release's evidence is synthetic source validation. The designated real
 case is Research's 2023 historical CSI300 cross-section with 88 features; a
