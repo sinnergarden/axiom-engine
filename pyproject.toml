@@ -11,6 +11,7 @@ dependencies = []
 
 [project.optional-dependencies]
 forward-returns = ["numpy"]
+feature-columns = ["numpy"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

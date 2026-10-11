@@ -269,28 +269,28 @@ def _quantile(vals, q):
     return vals[lo] + (vals[hi] - vals[lo]) * (pos-lo)
 
 
-def _element(op, cells, q):
-    vals = [c.value for c in cells]
-    if op == 'constant': return _merge(q['value'], ())
+def _element_numeric(op, vals, q):
+    """Original element arithmetic shared by row and column transports."""
+    if op == 'constant': return q['value']
     x = vals[0]
-    if op == 'identity': return _merge(x, cells, cells[0].reason)
-    if op == 'is_missing': return _merge(x is None, cells)
-    if op == 'fill': return _merge(q['value'] if x is None else x, cells)
+    if op == 'identity': return x
+    if op == 'is_missing': return x is None
+    if op == 'fill': return q['value'] if x is None else x
     if op in ('gt', 'lt', 'eq', 'and', 'or', 'not', 'where'):
         if any(v is None for v in vals[:1] if op == 'where') or op != 'where' and any(v is None for v in vals):
             require(q['missing'] != 'reject', 'MISSING_BOOLEAN')
-            if q['missing'] == 'preserve': return _merge(None, cells)
+            if q['missing'] == 'preserve': return None
             # Comparisons involving a missing operand are false, not comparison to zero.
-            if op in ('gt', 'lt', 'eq'): return _merge(False, cells)
+            if op in ('gt', 'lt', 'eq'): return False
             vals = ([False, *vals[1:]] if op == 'where' else
                     [False if v is None else v for v in vals])
-        if op == 'where': return _merge(vals[1] if vals[0] else vals[2], cells)
-        if op == 'not': return _merge(not vals[0], cells)
+        if op == 'where': return vals[1] if vals[0] else vals[2]
+        if op == 'not': return not vals[0]
         a, b = vals
         value = {'gt': lambda: a > b, 'lt': lambda: a < b, 'eq': lambda: a == b,
                  'and': lambda: a and b, 'or': lambda: a or b}[op]()
-        return _merge(value, cells)
-    if any(v is None for v in vals): return _merge(None, cells)
+        return value
+    if any(v is None for v in vals): return None
     if op == 'divide': value = _divide(*vals, q['zero'])
     elif op == 'add': value = vals[0] + vals[1]
     elif op == 'sub': value = vals[0] - vals[1]
@@ -306,7 +306,12 @@ def _element(op, cells, q):
         require(x > -1 or q['domain'] == 'missing', 'LOG_DOMAIN')
         value = math.log1p(x) if x > -1 else None
     else: raise ContractError('Unsupported element operator')
-    return _merge(value, cells)
+    return value
+
+
+def _element(op, cells, q):
+    return _merge(_element_numeric(op, [c.value for c in cells], q), cells,
+                  cells[0].reason if op == 'identity' else None)
 
 
 def _rolling_value(vals, last, q):

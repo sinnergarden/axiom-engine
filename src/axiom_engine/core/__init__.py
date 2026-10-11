@@ -4,6 +4,7 @@ from .contracts import (ABI, SEMANTICS, ContractError, ExecutionContext, FactBat
 from .execution import execute_feature_plan
 from .cs_batch import execute_cs_zscore_batch
 from .feature_batch import execute_feature_plan_batch
+from .feature_columns import CompiledFeatureColumns, compile_feature_columns, execute_feature_columns
 from .forward_returns import execute_forward_returns
 from .plan import required_history, validate_plan
 from .portfolio import SignalFrame, PortfolioDecision, plan_rotation
@@ -16,6 +17,7 @@ from .stock_strategy import (StockStrategy, StrategyTargets, ConfiguredStockStra
 
 __all__ = ['ABI', 'SEMANTICS', 'ContractError', 'ExecutionContext', 'FactBatch',
            'FeatureFrame', 'FeaturePlan', 'unresolved', 'execute_feature_plan', 'execute_cs_zscore_batch', 'execute_feature_plan_batch', 'execute_forward_returns',
+           'CompiledFeatureColumns', 'compile_feature_columns', 'execute_feature_columns',
            'required_history', 'validate_plan', 'SignalFrame', 'PortfolioDecision', 'plan_rotation',
            'StockPredictionFrame', 'plan_stock_portfolio', 'validate_stock_predictions',
            'execute_signal_plan', 'validate_signal_plan', 'validate_label_spec', 'signal_plan_ref',

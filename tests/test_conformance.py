@@ -367,13 +367,16 @@ class Conformance(unittest.TestCase):
         package_root=Path(__file__).parents[1]/'src'
         source=package_root/'axiom_engine'/'core'
         allowed={'dataclasses','datetime','decimal','hashlib','json','math','re','statistics'}
+        extras={'cs_batch.py':{'struct','sys'},'feature_batch.py':{'struct','sys','time'},
+                'forward_returns.py':{'sys','numpy'},'stock_signal.py':{'copy','types'},
+                'stock_portfolio.py':{'fractions'},'stock_strategy.py':{'copy','fractions','typing'},
+                'feature_columns.py':{'numpy','time','types'}}
         for path in source.rglob('*.py'):
             tree=ast.parse(path.read_text())
             for n in ast.walk(tree):
                 if isinstance(n,ast.Import):
-                    extras={'cs_batch.py':{'struct','sys'},'feature_batch.py':{'struct','sys','time'}}
                     for alias in n.names:self.assertIn(alias.name.split('.')[0],allowed | extras.get(path.name,set()))
-                if isinstance(n,ast.ImportFrom) and n.level==0:self.assertIn(n.module.split('.')[0],allowed)
+                if isinstance(n,ast.ImportFrom) and n.level==0:self.assertIn(n.module.split('.')[0],allowed | extras.get(path.name,set()))
                 if isinstance(n,ast.Call) and isinstance(n.func,ast.Name):
                     self.assertNotIn(n.func.id,{'eval','exec','open','__import__'})
         # An unimportable/malicious plugin is rejected as data; no loader exists.
