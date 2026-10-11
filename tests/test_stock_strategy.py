@@ -1,4 +1,4 @@
-"""Eight synthetic strategy/clock/equity/capacity and compatibility scenarios."""
+"""Synthetic strategy/clock/equity/capacity and compatibility scenarios."""
 from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
@@ -180,6 +180,26 @@ class StockStrategyTests(unittest.TestCase):
         rejected=_simulate(buy,row,ledger,profile,DAYS[1],"synthetic",3,stock_market={"action_blocks":[]},
             position_capacity=1,reserved_security_ids=reservations)
         self.assertEqual(rejected["reason"],"MAX_OWNED_POSITIONS")
+
+    def test_core_preserve_only_rights_initialize_zero_targets_without_buying(self):
+        rules=rules_for();security=rules["universe"][-1]
+        spec=stock_strategy_spec(top_k=1)
+        for kind in ("pending_only","registered_right_only"):
+            with self.subTest(kind=kind):
+                context=core_context(rules,1)
+                context.update(portfolio_policy=stock_portfolio_policy(strategy_spec=spec,universe_id="csi300",
+                    execution_universe=rules["universe"],execution_rules=rules),reference_prices={},
+                    strategy_state=initial_strategy_state(),risk_observations={},
+                    pending_share_quantities={security:100} if kind=="pending_only" else {},
+                    reserved_security_ids=[security] if kind=="registered_right_only" else [])
+                result=plan_stock_portfolio(StockPredictionFrame.from_dict(frame_for(rules)),
+                    account=dict(cash_minor=1_000_000,positions={},version=0),context=context,top_k=1).to_dict()
+                self.assertEqual(result["status"],"DECISION_COMPLETE")
+                self.assertEqual(result["selected_security_ids"],[security])
+                self.assertEqual(result["strategy_targets"]["preserve_quantities"],{security:0})
+                self.assertEqual(result["strategy_targets"]["target_weights"],{})
+                self.assertEqual(result["targets"],{security:0})
+                self.assertEqual(result["intents"],[])
 
     def test_same_saved_signal_three_configs_reuse_market_and_load_without_planning(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -319,6 +319,8 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         return PortfolioDecision.from_dict(result)
     budget = Decimal(account["cash_minor"]) + sum(Decimal(position["quantity"]) * prices[security] * 100
                                                   for security, position in account["positions"].items() if security in held)
+    if strategy_targets is not None:
+        result["targets"].update(strategy_targets["preserve_quantities"])
     for security in sorted(needed):
         raw = (int(budget * decimal(strategy_targets["target_weights"].get(security, "0")) / (prices[security] * 100))
                if strategy_targets is not None else (int(budget / k / (prices[security] * 100)) if security in selected else 0))
@@ -349,6 +351,8 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         if reduction > available:
             result["trace"].append({"reason": "T_PLUS_ONE_OR_UNSELLABLE", "security_id": security, "quantity": reduction - available})
     for security in sorted(selected):
+        if strategy_targets is not None and security in strategy_targets["preserve_quantities"]:
+            continue
         current = account["positions"].get(security, {"quantity": 0})["quantity"]
         increase = max(0, result["targets"][security] - current)
         if full:
