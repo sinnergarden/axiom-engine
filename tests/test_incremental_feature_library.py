@@ -29,8 +29,8 @@ class FixedSource:
         by_name={o['column']['name']:o for o in p['outputs']}
         p['outputs']=[by_name[c] for c in columns]
         return FeatureRequest(FeaturePlan.from_dict(p),tuple(days or self.c['sessions'][2:]),
-            ('A','B','C'),{'x':{'clock':'explicit','anchor':'output_day'},
-                         'y':{'clock':'explicit','unit':'dimensionless'}},
+            ('A','B','C'),{c['name']:{'clock':'explicit','unit':'dimensionless','anchor':'output_day'}
+                         for c in p['input_schema']},
             None if sample is None else tuple(sample))
 
     def dependency_refs(self, definitions, days, securities):
@@ -57,9 +57,25 @@ class FixedSource:
 
     def prepare(self, plan, day, securities, dependencies):
         self.calls.append((day,[o['column']['name'] for o in plan.to_dict()['outputs']]))
-        inputs=packed(plan.to_dict(),self.f,self.c)
+        p=plan.to_dict(); full={**p,'input_schema':self.p['input_schema']}
+        inputs=packed(full,self.f,self.c); inputs['schema']=p['input_schema']
+        names={c['name'] for c in p['input_schema']}
+        for field in ('values','validity','reason_codes','available_at_utc_us','source_codes'):
+            inputs[field]={name:value for name,value in inputs[field].items() if name in names}
+        inputs['source_sets']=[[p['sources'][0]['id']]]
         inputs['input_refs']['feature_dependency_ref']=digest(dependencies)
         return inputs
+
+    def add_raw_field(self):
+        self.p['input_schema'].append(col('z',stage='fact'))
+        added=node('raw_z','identity',['z']); self.p['nodes'].append(added)
+        self.p['outputs'].append({'node':'raw_z','column':deepcopy(added['column'])})
+        self.p['recipe_ref']=digest(['expanded catalog with z'])
+        self.p['sources'][0]={**self.p['sources'][0],'id':'facts_v2','view_ref':digest(['expanded source manifest'])}
+        for row in self.f['rows']:
+            row['values'].append(70+len(row['security_id']))
+            row['availability'].append(row['availability'][0])
+            row['missing_reasons'].append(None)
 
     def change_reference(self, day):
         self.p['reference_members'][day].pop('C')
@@ -71,6 +87,31 @@ def decoded(projection, name):
 
 
 class IncrementalFeatureLibraryTests(unittest.TestCase):
+    def test_backfill_new_raw_field_preserves_old_rectangle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source=FixedSource(); days=source.c['sessions'][2:4]
+            library=FeatureLibrary(Path(temp)/'library',maximum_working_bytes=2**20)
+            old_columns=['raw_x','mean_x','raw_y']
+            descriptor,_=library.ensure_features(source.request(old_columns,days),source)
+            with library.open_feature_view(descriptor) as view:
+                old_refs={(t['session'],t['column']):t['partition']['partition_ref'] for t in view._view['tiles']}
+            source.add_raw_field(); source.calls.clear()
+            descriptor,stats=library.ensure_features(source.request(old_columns+['raw_z'],days),source)
+            self.assertEqual((stats['core_calls'],stats['computed_output_cells']),(2,6))
+            self.assertEqual(source.calls,[(day,['raw_z']) for day in days])
+            with library.open_feature_view(descriptor) as view:
+                actual=view.project()
+                for tile in view._view['tiles']:
+                    key=tile['session'],tile['column']
+                    if key in old_refs:self.assertEqual(tile['partition']['partition_ref'],old_refs[key])
+            fresh=FeatureLibrary(Path(temp)/'fresh',maximum_working_bytes=2**20)
+            descriptor,_=fresh.ensure_features(source.request(old_columns+['raw_z'],days),source)
+            with fresh.open_feature_view(descriptor) as view:
+                expected=view.project()
+                for name in ('values','validity','available_at_utc_us'):
+                    np.testing.assert_array_equal(actual[name],expected[name])
+                self.assertEqual(decoded(actual,'reason_codes'),decoded(expected,'reason_codes'))
+
     def test_shared_admission_epoch_reuses_hashes_but_detects_mutation(self):
         with tempfile.TemporaryDirectory() as temp:
             library=FeatureLibrary(temp,maximum_working_bytes=2**20); source=FixedSource()

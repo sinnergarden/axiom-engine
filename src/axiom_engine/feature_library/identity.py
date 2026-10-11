@@ -81,13 +81,18 @@ def select_feature_plan(plan, columns):
     outputs = {o['column']['name']: o for o in p['outputs']}
     require(type(columns) is list and bool(columns) and len(set(columns)) == len(columns)
             and set(columns) <= set(outputs), 'ordered unique plan output subset required')
-    nodes = {n['name']: n for n in p['nodes']}; needed = set()
+    nodes = {n['name']: n for n in p['nodes']}; needed = set(); leaves=set()
+    facts={c['name'] for c in p['input_schema']}
     def include(name):
         if name in nodes and name not in needed:
             needed.add(name)
             for parent in nodes[name]['inputs']: include(parent)
+        elif name in facts: leaves.add(name)
     for name in columns: include(outputs[name]['node'])
     p['nodes'] = [n for n in p['nodes'] if n['name'] in needed]
+    p['input_schema'] = [c for c in p['input_schema'] if c['name'] in leaves]
+    streams={n['params']['stream'] for n in p['nodes'] if n['op']=='asof'}
+    p['event_schema']={name:schema for name,schema in p['event_schema'].items() if name in streams}
     p['outputs'] = [outputs[name] for name in columns]
     # This execution receipt may differ from the original full-plan receipt.
     # Feature identity above never uses this experiment-wide recipe hash.

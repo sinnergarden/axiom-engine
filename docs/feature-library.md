@@ -24,6 +24,8 @@ An optional `execution_plan(plan, day, physical_security_ids, dependencies)`
 may project only the actual day's source bindings before compilation. Every
 other plan field must remain identical. The original Core source limit stays
 unchanged; historical source generations are never merged into one global plan.
+The selected gap plan also prunes its fact and event input schemas to the actual
+DAG closure. Adapters project precisely those facts and their original bindings.
 The library does not broaden a source's supported universe or PIT policy.
 
 Coverage builds one local tuple-key index, then looks up each requested column
@@ -45,10 +47,12 @@ and source sets. Existing hit bytes are admitted before a COMPLETE view is
 published; a persisted index is never a trusted flag. Sealed partitions precede
 the atomic index and can be recovered after interruption.
 
-At this checkpoint, four short synthetic cases verify subset zero-computation,
+At this checkpoint, six short synthetic cases verify subset zero-computation,
 column/date expansion, exact original-Core/raw-to-CS equivalence, reference and
 input changes, split column blocks, ten source generations with one daily CS
-gap, admission reuse with mutation detection, and one recovery. Research has
+gap, an old normalized hit plus an added column from another source frame,
+new raw-field backfill without old-column computation or ref changes,
+admission reuse with mutation detection, and one recovery. Research has
 an explicit training projection adapter over the unchanged Label/fit owner.
 A real label/model/strategy run, a real expansion and legacy Feature-matrix
 read-only attachment are the next vertical step. Old Research loaders remain
