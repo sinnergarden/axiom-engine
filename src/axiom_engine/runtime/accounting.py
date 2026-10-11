@@ -32,6 +32,9 @@ class AccountLedger:
         self.position_ledger = []
         self._applied = {}
         self.receivables = {}
+        self.equity_entitlements = {}
+        self.equity_owned = {}
+        self.equity_history = {}
         self._session = None
         self._output_guard = output_guard
 

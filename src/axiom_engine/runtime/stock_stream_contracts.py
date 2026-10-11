@@ -35,6 +35,8 @@ def artifact_identity(ref):
 def identity_view(value):
     """Remove locations only at the exact, published ArtifactRef positions."""
     value = deepcopy(value)
+    if "action_facts_artifact" in value:
+        value["action_facts_artifact"] = artifact_identity(value["action_facts_artifact"])
     if "profile_input" in value:
         value["profile_input"]["artifact"] = artifact_identity(value["profile_input"]["artifact"])
     market = value.get("market_input", value if value.get("contract_version") == "stock_market_input_refs_v1" else None)
@@ -100,15 +102,17 @@ def _validate_scope(scope):
 
 def validate_manifest(manifest):
     plan = manifest.to_dict() if isinstance(manifest, Document) else deepcopy(manifest)
-    fields(plan, "contract_version request_ref account_id scope initial_account portfolio_policy profile_input market_input prediction_input stock_action_policy clock_policy limitations")
-    require(plan["contract_version"] == REQUEST_VERSION, "bounded stock request required")
+    equity = plan.get("contract_version") == "backtest_request_v8"
+    fields(plan, "contract_version request_ref account_id scope initial_account portfolio_policy profile_input market_input prediction_input stock_action_policy clock_policy limitations" + (" action_facts_artifact" if equity else ""))
+    if equity: validate_artifact_ref(plan["action_facts_artifact"])
+    require(plan["contract_version"] in (REQUEST_VERSION, "backtest_request_v8"), "bounded stock request required")
     text(plan["account_id"])
     scope = plan["scope"]
     _validate_scope(scope)
     fields(plan["initial_account"], "cash_minor positions")
     integer(plan["initial_account"]["cash_minor"], 1)
     require(plan["initial_account"]["positions"] == {}, "bounded stock initial holdings must be empty")
-    require(plan["stock_action_policy"] == ACTION_POLICY and plan["clock_policy"] == CLOCK_POLICY,
+    require(plan["stock_action_policy"] == ("registered_equity_v1" if equity else ACTION_POLICY) and plan["clock_policy"] == CLOCK_POLICY,
             "stock action/clock policy mismatch")
     require(type(plan["limitations"]) is list and all(type(v) is str for v in plan["limitations"]), "request limitations required")
     profile = plan["profile_input"]

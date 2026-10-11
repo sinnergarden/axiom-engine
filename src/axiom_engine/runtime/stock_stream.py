@@ -13,7 +13,7 @@ from .stock_stream_outputs import StockResultSink, canonical_size
 
 def stock_run_id(manifest, implementation_ref=IMPLEMENTATION_REF):
     return Document.from_dict({"request_ref": manifest["request_ref"],
-        "core_version": "axiom.stock_portfolio/3", "runtime_version": STREAM_RUNTIME_VERSION,
+        "core_version": "axiom.stock_portfolio/3", "runtime_version": ("axiom.backtest/8" if manifest["contract_version"] == "backtest_request_v8" else STREAM_RUNTIME_VERSION),
         "implementation_ref": implementation_ref}).identity
 
 
@@ -140,6 +140,8 @@ class _StreamStorage:
             "source_refs": list(dict.fromkeys(market["source_refs"][4:6])),
             "limitations": ["Observed implemented stock cash actions only; absent actions do not establish completeness.",
                             "Unknown PAY remains pending; gross dividends exclude personal holding-period taxes."]}
+        if manifest["contract_version"] == "backtest_request_v8":
+            self.account_events.update(contract_version="stock_account_events_v2", equity_facts=market["equity_facts"], action_facts_ref=market["action_facts_ref"])
         event_bytes = canonical_size(self.account_events, self.header_budget)
         for action in market["cash_dividends"]:
             size = canonical_size(action, self.header_budget)
@@ -235,14 +237,15 @@ class _StreamStorage:
         metrics = dict(self.metrics)
         metrics.update(total_return=None if stopped else str(Decimal(self.last_nav) / initial_value - 1),
                        max_drawdown=None if stopped else str(self.drawdown))
-        result = {"contract_version": RUN_VERSION, "run_id": self.run_id,
+        equity = self.manifest["contract_version"] == "backtest_request_v8"
+        result = {"contract_version": "backtest_run_v8" if equity else RUN_VERSION, "run_id": self.run_id,
             "account_id": self.manifest["account_id"], "status": "BLOCKED" if stopped else "COMPLETE",
             "request_manifest": self.manifest, "request_ref": self.manifest["request_ref"],
             "source_audit": self.audit.receipt, "source_audit_ref": Document.from_dict(self.audit.receipt).identity,
             "signal_ref": self.manifest["prediction_input"]["prediction_ref"],
             "market_ref": self.manifest["market_input"]["market_ref"],
             "profile_ref": self.manifest["profile_input"]["profile_ref"],
-            "core_version": "axiom.stock_portfolio/3", "runtime_version": STREAM_RUNTIME_VERSION,
+            "core_version": "axiom.stock_portfolio/3", "runtime_version": "axiom.backtest/8" if equity else STREAM_RUNTIME_VERSION,
             "implementation_ref": IMPLEMENTATION_REF, "committed_sequence": ledger.sequence,
             "initial_nav_minor": initial_value, "final_account": {"cash_minor": ledger.cash,
                 "receivable_minor": sum(ledger.receivables.values()), "positions": ledger.positions,
@@ -251,6 +254,8 @@ class _StreamStorage:
             "limitations": limitations, "result_parts": self.parts,
             "account_events": self.account_events,
             "account_events_ref": Document.from_dict(self.account_events).identity}
+        if equity:
+            result["final_account"]["equity_entitlements"] = ledger.equity_entitlements
         # The complete header is small by contract. Measure its canonical
         # stream before Document creates a full JSON string or decoded copy.
         header_bytes = canonical_size({**result, "content_digest": "sha256:" + "0" * 64}, self.header_budget)

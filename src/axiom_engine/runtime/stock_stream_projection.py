@@ -110,8 +110,8 @@ def _run_header(wire):
     require("account_events" in wire and "account_events_ref" in wire,
             "saved account event view/ref required")
     fields(wire, RUN_FIELDS)
-    require(wire["contract_version"] == "backtest_run_v7" and
-            wire["runtime_version"] == "axiom.backtest/7" and
+    require(wire["contract_version"] in ("backtest_run_v7", "backtest_run_v8") and
+            wire["runtime_version"] == ("axiom.backtest/8" if wire["contract_version"] == "backtest_run_v8" else "axiom.backtest/7") and
             wire["core_version"] == "axiom.stock_portfolio/3", "invalid saved v7 version tuple")
     require(wire["status"] in ("COMPLETE", "BLOCKED"), "invalid saved run status")
     for key in ("run_id", "request_ref", "source_audit_ref", "signal_ref", "market_ref",
@@ -121,6 +121,7 @@ def _run_header(wire):
     require(wire["content_digest"] == _hash_wire(unsigned), "saved v7 content digest mismatch")
     request = wire["request_manifest"]
     validate_manifest(request)
+    require((wire["contract_version"] == "backtest_run_v8") == (request["contract_version"] == "backtest_request_v8"), "saved equity request/run mismatch")
     require(wire["request_ref"] == request["request_ref"] and
             wire["account_id"] == request["account_id"] and
             wire["signal_ref"] == request["prediction_input"]["prediction_ref"] and
@@ -155,7 +156,21 @@ def _account_events(wire, request, audit):
     """The small saved view is a binding, not another native-source audit."""
     from .stock_inputs import validate_cash_action
     events = wire["account_events"]
-    fields(events, "contract_version request_ref market_ref profile_ref cash_dividends source_refs limitations")
+    equity = wire["contract_version"] == "backtest_run_v8"
+    fields(events, "contract_version request_ref market_ref profile_ref cash_dividends source_refs limitations" + (" equity_facts action_facts_ref" if equity else ""))
+    if equity:
+        from .stock_equity import validate_facts, cash_action
+        parent_refs = events["equity_facts"]["parent_native_refs"]
+        native_refs = {i["native_ref"] for i in request["market_input"]["native_inputs"] if i["role"]=="execution"}
+        require(set(parent_refs)<=native_refs and events["source_refs"]==parent_refs, "unbound saved equity native parents")
+        validate_facts(events["equity_facts"], universe=request["scope"]["execution_universe"], calendar=request["scope"]["calendar"],parent_refs=parent_refs)
+        require(events["equity_facts"]["snapshot_id"] != request["market_input"]["execution_snapshot_id"],
+            "saved supplement cannot masquerade as old execution Snapshot")
+        require(events["action_facts_ref"]==request["action_facts_artifact"]["content_digest"]==_hash_wire(events["equity_facts"]), "saved equity facts ref mismatch")
+        expected = [cash_action(a,request["scope"]["calendar"]) for a in events["equity_facts"]["actions"] if a["identity_status"]=="RESOLVED" and a["record_date"] is not None and a["ex_date"] is not None and a["cash_dividend_before_tax_per_share"] is not None and decimal(a["cash_dividend_before_tax_per_share"])>0]
+        require(events["cash_dividends"]==expected and len(expected)==audit["counts"]["cash_actions"] and len(events["equity_facts"]["actions"])==audit["counts"]["equity_actions"], "saved equity catalog count mismatch")
+        require(events["contract_version"]=="stock_account_events_v2" and wire["account_events_ref"]==_hash_wire(events) and all(events[n]==wire[n] for n in ("request_ref","market_ref","profile_ref")), "saved equity event binding mismatch")
+        return
     require(events["contract_version"] == "stock_account_events_v1" and
             wire["account_events_ref"] == _hash_wire(events) and
             all(events[name] == wire[name] for name in ("request_ref", "market_ref", "profile_ref")),
@@ -364,8 +379,12 @@ def _saved_business(wire, rows, profile):
             integer(row.get("sequence"), 1)
             require(previous < row["sequence"] <= wire["committed_sequence"], "saved ledger sequence mismatch")
             previous = row["sequence"]
-    _saved_balances(wire, rows, fills)
-    _saved_cash_actions(wire, rows)
+    if wire["contract_version"]=="backtest_run_v8":
+        from .stock_equity import verify_saved
+        verify_saved(wire,rows,profile)
+    else:
+        _saved_balances(wire, rows, fills)
+        _saved_cash_actions(wire, rows)
     metrics = wire["metrics"]
     expected = dict(total_fees_minor=sum(fill["fee_minor"] for fill in fills.values()),
                     turnover_minor=sum(fill["gross_minor"] for fill in fills.values()), fill_count=len(fills),
@@ -592,7 +611,7 @@ def _load_stock_backtest_projection(path, *, artifact_reader, limits):
                                                read_size=limits["max_read_bytes"])
     require(observed_size == profile_size and _hash_wire(profile) == profile_artifact["content_digest"] ==
             wire["profile_ref"], "saved profile content/reference mismatch")
-    require(profile.get("contract_version") == "stock_daily_open_profile_v2" and
+    require(profile.get("contract_version") == ("stock_daily_open_profile_v3" if wire["contract_version"]=="backtest_run_v8" else "stock_daily_open_profile_v2") and
             profile.get("stock_execution_rules_ref") == request["profile_input"]["stock_execution_rules_ref"] ==
             _hash_wire(profile["stock_execution_rules"]) and
             profile.get("stock_fee_schedule_ref") == request["profile_input"]["stock_fee_schedule_ref"] ==

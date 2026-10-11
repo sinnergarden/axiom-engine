@@ -899,6 +899,7 @@ class StockInputSource:
     @staticmethod
     def _artifacts(manifest):
         yield manifest["profile_input"]["artifact"]
+        if "action_facts_artifact" in manifest: yield manifest["action_facts_artifact"]
         for entry in manifest["market_input"]["native_inputs"]:
             yield entry["artifact"]
         from .stock_stream_contracts import prediction_artifacts
@@ -1369,10 +1370,12 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
     require(bool(manifest["market_input"]["warmup_sessions"]) and
             manifest["market_input"]["warmup_sessions"][-1] < calendar[0], "Explicit preceding stock warmup required")
     profile_index = source._index(manifest["profile_input"]["artifact"], budget)
+    equity = manifest.get("stock_action_policy") == "registered_equity_v1"
+    from .stock_equity import equity_profile, validate_facts, cash_action
     profile = profile_index.whole()
     require(profile_index.content_digest == manifest["profile_input"]["profile_ref"], "Stock profile identity mismatch")
     rules = profile["stock_execution_rules"]; rules_index = validate_execution_rules(rules)
-    require(profile == stock_daily_open_profile_v2(execution_rules=rules, fee_schedule=profile["stock_fee_schedule"],
+    require(profile == (equity_profile if equity else stock_daily_open_profile_v2)(execution_rules=rules, fee_schedule=profile["stock_fee_schedule"],
         unknown_status_policy=profile.get("unknown_status_policy")) and rules["calendar"] == calendar and
         rules["universe"] == universe and scope["supported_universe_ref"] == support_ref(universe), "Stock profile/rules scope mismatch")
     for name in ("stock_execution_rules_ref", "stock_fee_schedule_ref"):
@@ -1529,8 +1532,21 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
                         _warmup_visibility(right, [day], universe, names)
                         del left, left_bindings
                     del right, right_bindings
+        equity_facts = None
+        if equity:
+            action_index = source._index(manifest["action_facts_artifact"], budget)
+            equity_facts = validate_facts(action_index.whole(), universe=universe, calendar=calendar, parent_refs=source_refs[4:6])
+            require(equity_facts["snapshot_id"] != manifest["market_input"]["execution_snapshot_id"],
+                "supplemental action facts require their new execution Snapshot")
+            source._memory.reserve_global(("projected", "equity_facts"), _encoded_size(equity_facts))
+            original_keys = {canonical({n:d["native_record"][n] for n in ("security_id","report_period","announcement_date","process_status")}) for d in diagnostics if d["native_record"]["process_status"] == "实施"}
+            aliases = {canonical(a) for action in equity_facts["actions"] for a in action["aliases"]}
+            require(original_keys <= aliases, "equity catalog omits original implemented action identity")
+            cash = [cash_action(a, calendar) for a in equity_facts["actions"] if a["identity_status"] == "RESOLVED" and a["record_date"] is not None and a["ex_date"] is not None and a["cash_dividend_before_tax_per_share"] is not None and decimal(a["cash_dividend_before_tax_per_share"]) > 0]
+            diagnostics.extend(factor_blocks)
+            blocks = []
         # Original v6 emits factors security-major, even when delivery is date-major.
-        blocks.extend(sorted(factor_blocks, key=lambda item: (item["security_id"], item["effective_session"])))
+        if not equity: blocks.extend(sorted(factor_blocks, key=lambda item: (item["security_id"], item["effective_session"])))
         del previous_factor
         for security in universe:
             source._memory.release_global(("previous_factor", security))
@@ -1539,15 +1555,19 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
         del ended
         limitations = sorted({x for c in contexts for x in c.get("limitations", [])}) + [
             "OBSERVED IMPLEMENTED ACTIONS ONLY: nonimplemented uncertainty remains diagnostic; no complete action-history claim.",
-            "Stock cash source lacks PAY dates; gross-before-tax receivables remain pending until verified native payment.",
+            ("Supplemental Data dates drive the explicit gross-before-tax simulation; actual receipt clock is preserved." if equity else
+             "Stock cash source lacks PAY dates; gross-before-tax receivables remain pending until verified native payment."),
             "Native UNKNOWN and actual field availability are retained; daily open/volume/limits are retrospective execution evidence."]
         market_header = {"contract_version": "market_replay_v4", "price_basis": "unadjusted", "calendar": calendar,
                          "universe": universe, "cash_dividends": cash, "action_diagnostics": diagnostics,
                          "action_blocks": blocks, "source_refs": source_refs, "limitations": limitations,
                          "stock_execution_rules_ref": profile["stock_execution_rules_ref"], "membership_ref": source_refs[6],
                          "lifecycle_policy": LIFECYCLE_POLICY}
+        if equity:
+            market_header.update(equity_facts=equity_facts, action_facts_ref=manifest["action_facts_artifact"]["content_digest"])
+            limitations.append(profile["equity_simulation"]["limitation"])
         source._memory.reserve_global(("projected", "market_header"), _encoded_size({key: value for key, value in market_header.items()
-            if key not in ("cash_dividends", "action_diagnostics", "action_blocks")}))
+            if key not in ("cash_dividends", "action_diagnostics", "action_blocks", "equity_facts")}))
         receipt = {"contract_version": "stock_input_audit_v1", "request_ref": manifest["request_ref"],
                    "market_ref": manifest["market_input"].get("market_ref"),
                    "prediction_ref": manifest.get("prediction_input", {}).get("prediction_ref"),
@@ -1558,6 +1578,9 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
                               "market_rows": market_rows,
                               "cash_actions": len(cash), "action_diagnostics": len(diagnostics), "action_blocks": len(blocks)},
                    "limitations": limitations}
+        if equity:
+            source._memory.reserve_global(("projected", "equity_cash"), _encoded_size(cash))
+            receipt["counts"]["equity_actions"] = len(equity_facts["actions"])
         if manifest.get('prediction_input',{}).get('contract_version')=='stock_prediction_input_refs_v2':
             from .stock_signal_inputs import prediction_targets
             receipt.update(contract_version='stock_input_audit_v2',prediction_targets=prediction_targets(frames))

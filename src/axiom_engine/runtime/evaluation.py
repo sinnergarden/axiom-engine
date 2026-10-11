@@ -72,6 +72,7 @@ def _verify_run(run):
                   "cash_dividends": wire["account_events"]["cash_dividends"],
                   "source_refs": [item["native_ref"] for item in request["market_input"]["native_inputs"]],
                   "limitations": request["limitations"]}
+        if wire["contract_version"]=="backtest_run_v8": market["equity_facts"]=wire["account_events"]["equity_facts"]
         # A private calculation view keeps the original v7/run identity; it
         # is never serialized or admitted as an old complete source contract.
         return {**wire, **run.rows, "plan": {**request, **scope, "market_replay": market,
@@ -183,7 +184,7 @@ def _validate_scope(scope, run, snapshots):
     require(isinstance(scope, DividendScope), "DividendScope required")
     wire = scope.to_dict()
     plan = run["plan"]
-    if run["contract_version"] == "backtest_run_v7":
+    if run["contract_version"] in ("backtest_run_v7", "backtest_run_v8"):
         fields(wire, "contract_version start_session end_session knowledge_cutoff universe coverage actions source_refs account_events_ref limitations")
         events = run["account_events"]
         require(wire["contract_version"] == "dividend_scope_v3" and
@@ -365,7 +366,7 @@ def _evaluate(run, benchmark, spec, dividend_scope):
                 "saved NAV requires an ordered frozen calendar and strict prior anchor")
     calendar, days, series = _account_series(saved)
     anchor = calendar[calendar.index(days[0]) - 1]
-    if saved["contract_version"] == "backtest_run_v7":
+    if saved["contract_version"] in ("backtest_run_v7", "backtest_run_v8"):
         snapshots = {saved["request_manifest"]["market_input"]["execution_snapshot_id"]}
     else:
         snapshots = _provenance(saved["plan"]["market_replay"])
