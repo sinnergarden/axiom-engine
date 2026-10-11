@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "axiom-engine"
-version = "0.3.1"
+version = "0.3.2"
 requires-python = ">=3.11"
 description = "Deterministic Core features and offline cached-signal account backtests"
 dependencies = []
@@ -12,6 +12,7 @@ dependencies = []
 [project.optional-dependencies]
 forward-returns = ["numpy"]
 feature-columns = ["numpy"]
+feature-library = ["numpy"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
