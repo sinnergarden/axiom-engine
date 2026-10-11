@@ -97,6 +97,24 @@ cash compensation or fractional assets. Profile/request/run identities change;
 the saved prediction and Data identities remain intact. Replay still uses the
 same Core, simulator, T+1, fee schedule and original prices.
 
+`stock_action_facts_v1` also accepts the explicit historical clock declaration
+`mixed_reviewed_sources_v1`. Data freezes the applicable ordinary-holder cash
+and share scalars and binds its reviewed interpretation through source refs;
+Engine consumes those scalars without interpreting issuer restructuring plans.
+Each action keeps its dependency-gated availability and actual receipt time.
+Unknown share entitlements remain unknown and can still block a held account.
+
+Saved Derived combinations bind the global `IMPLEMENTATION_REF` and admission
+requires it to equal the current Engine version. Even an accounting-only change
+therefore rejects an older Derived combination although SignalPlan arithmetic
+has not changed. For this experiment, regenerate the combination from the same
+saved raw predictions under the final Engine version, save a new identity and
+report that migration's time and resource cost. Do not retrain, rebuild Features,
+retain an inaccurate implementation hash or bypass the check. Raw prediction
+bindings do not have this Derived-only equality gate, and saved accounts remain
+readable. Separate component semantic identities are future maintenance; this
+release does not change signal correctness or introduce a compatibility layer.
+
 `settle_stock_share_allocation(*, registered_quantity, shares_per_share,
 policy='reject_non_integer', actual_quantity=None, evidence_refs=())` is a pure
 allocation function. `confirmed_integer_credit` requires an actual nonnegative

@@ -117,7 +117,8 @@ def validate_facts(wire, *, universe, calendar, parent_refs):
         len(set(wire['supplemental_view_refs']))==len(wire['supplemental_view_refs']), 'new corporate-action ViewRefs required')
     for ref in wire['supplemental_view_refs']: digest(ref)
     instant(wire['observed_at'])
-    require(wire['availability_basis']=='declared_vendor_assumption', 'explicit supplemental event clock basis required')
+    require(wire['availability_basis'] in ('declared_vendor_assumption', 'mixed_reviewed_sources_v1'),
+            'explicit supplemental event clock basis required')
     require(type(wire['actions']) is list and type(wire['limitations']) is list and
             all(type(x) is str for x in wire['limitations']), 'explicit action catalog required')
     ids, aliases = set(), set()
