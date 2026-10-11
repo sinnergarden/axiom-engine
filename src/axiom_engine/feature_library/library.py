@@ -182,7 +182,7 @@ class FeatureLibrary:
     def _index(self):
         path = self.root / 'index.json'
         if not path.exists(): return seal({'contract_version': INDEX_VERSION, 'partitions': []}, 'index_ref')
-        require(path.stat().st_size <= min(self.limits['maximum_matrix_bytes']//8, 64*1024**2),
+        require(path.stat().st_size <= self.limits['maximum_matrix_bytes']//8,
                 'coverage index exceeds metadata budget')
         value = read_json(path)
         require(value.get('contract_version') == INDEX_VERSION and
@@ -211,13 +211,14 @@ class FeatureLibrary:
 
     @staticmethod
     def _summary(descriptor, part):
-        return {**descriptor, 'sessions': part['sessions'], 'security_ids': part['security_ids'],
+        return {**descriptor, 'sessions': part['sessions'], 'security_axis_ref': digest(part['security_ids']),
             'columns': part['columns'], 'semantic_refs': part['semantic_refs'],
             'dependency_refs': part['dependency_refs']}
 
     def plan_coverage(self, request, source_adapter):
         """Read metadata and source dependency receipts; never run Core or write."""
         days, securities, sample, definitions = request.admitted()
+        security_axis_ref=digest(securities)
         dependencies = source_adapter.dependency_refs(definitions, days, securities)
         require(set(dependencies) == set(days), 'complete daily dependency bindings required')
         parts = self._index()['partitions']; hits, gaps = [], []
@@ -225,7 +226,7 @@ class FeatureLibrary:
             require(set(dependencies[day]) == set(definitions) and
                     all(is_ref(ref) for ref in dependencies[day].values()), 'exact column dependency bindings required')
             for column, definition in definitions.items():
-                matches = [p for p in parts if p['sessions'] == [day] and p['security_ids'] == securities and
+                matches = [p for p in parts if p['sessions'] == [day] and p['security_axis_ref'] == security_axis_ref and
                     column in p['columns'] and p['semantic_refs'][column] == definition['semantic_ref'] and
                     p['dependency_refs'][column] == dependencies[day][column]]
                 if matches:
