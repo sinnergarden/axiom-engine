@@ -95,7 +95,7 @@ class StockStrategyTests(unittest.TestCase):
                 carried = plan_stock_portfolio(StockPredictionFrame.from_dict(bad),
                     account=account, context=context, top_k=1).to_dict()
                 self.assertNotIn(future, carried["selected_security_ids"])
-                self.assertEqual(carried["trace"][0]["excluded_members"][0]["feature_lifecycle"], "not_listed")
+                self.assertEqual(carried["trace"][0]["excluded_members"][0]["lifecycle"], "not_listed")
 
     def test_configuration_and_legacy_factory_remain_explicit(self):
         from axiom_engine.runtime.stock_inputs import ELIGIBILITY_ID

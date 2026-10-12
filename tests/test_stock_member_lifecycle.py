@@ -14,7 +14,7 @@ from axiom_engine.runtime import StockInputSource, run_backtest, stock_portfolio
 from axiom_engine.runtime.stock_inputs import validate_stock_request
 from axiom_engine.runtime.stock_stream_contracts import read_budget
 from axiom_engine._implementation import IMPLEMENTATION_REF
-from test_csi300 import BOARD_IDS, DAYS, core_context, frame_for
+from test_csi300 import BOARD_IDS, DAYS, core_context, frame_for, bind_lifecycle
 from test_csi300_runtime import full_request
 from test_stock_native_lifecycle import event_rules, terminal
 from test_stock_stream_inputs import LIMITS, source_fixture
@@ -46,6 +46,7 @@ def context_for(rules, k, feature=DAYS[2], trade=DAYS[3]):
     for quote in context['reference_prices'].values():
         quote.update(session=feature, available_at=feature+'T12:00:00Z')
     context['reference_prices'].pop(RETIRED)
+    bind_lifecycle(context, rules)
     return context
 
 
@@ -99,10 +100,9 @@ class MemberLifecycleTests(unittest.TestCase):
                     context=context, top_k=k, rules_index=validate_execution_rules(rules)).to_dict()
                 self.assertEqual(result, private)
                 excluded = result['trace'][0]['excluded_members'][0]
-                self.assertEqual((excluded['security_id'], excluded['feature_lifecycle'], excluded['trade_lifecycle']),
-                                 (RETIRED, 'delisted', 'delisted'))
+                self.assertEqual((excluded['security_id'], excluded['lifecycle']), (RETIRED, 'delisted'))
                 identity = next(r for r in rules['identity_input']['rows'] if r['security_id']==RETIRED)
-                self.assertEqual(excluded['source_refs'], identity['source_refs'])
+                self.assertEqual(excluded['source_refs'][1:], identity['source_refs'])
                 self.assertEqual(result['trace'][0]['pit_member_count'], 4)
                 self.assertNotIn(RETIRED, result['selected_security_ids'])
                 self.assertFalse(any(i['security_id']==RETIRED for i in result['intents']))
@@ -113,13 +113,28 @@ class MemberLifecycleTests(unittest.TestCase):
                     self.assertEqual(result['status'], 'DECISION_COMPLETE')
         self.assertEqual(wire, before)
 
-    def test_listing_end_on_intended_trade_day_excludes_prior_active_member(self):
+    def test_trade_day_only_delisting_does_not_enter_core_candidate_clock(self):
         rules = event_rules(); frame = StockPredictionFrame.from_dict(frame_for(rules, scores={RETIRED:100}))
+        context = context_for(rules, 1, DAYS[1], DAYS[2])
+        context['reference_prices'][RETIRED] = deepcopy(next(iter(context['reference_prices'].values())))
         result = plan_stock_portfolio(frame, account=dict(cash_minor=50000000, positions={}, version=0),
-            context=context_for(rules, 1, DAYS[1], DAYS[2]), top_k=1).to_dict()
-        self.assertEqual((result['trace'][0]['excluded_members'][0]['feature_lifecycle'],
-                          result['trace'][0]['excluded_members'][0]['trade_lifecycle']), ('active', 'delisted'))
-        self.assertNotIn(RETIRED, result['selected_security_ids'])
+            context=context, top_k=1).to_dict()
+        self.assertIn(RETIRED, result['selected_security_ids'])
+        self.assertTrue(any(i['security_id']==RETIRED and i['side']=='BUY' for i in result['intents']))
+        self.assertFalse(any(t['reason']=='INELIGIBLE_LISTING_LIFECYCLE' for t in result['trace']))
+        from axiom_engine.core.stock_rules import quantity_rule_at, rule_at
+        self.assertEqual(quantity_rule_at(rules, RETIRED, DAYS[2])['buy_minimum'], 100)
+        with self.assertRaisesRegex(ContractError, 'outside verified listing'):
+            rule_at(rules, RETIRED, DAYS[2])
+        from axiom_engine.runtime.backtest import _simulate
+        from axiom_engine.runtime.accounting import AccountLedger
+        plan = full_request(rules=rules, k=1, mutate_native=carry, mutate_frame=carry_frame).to_dict()
+        row = validate_stock_request(plan)[5][DAYS[2], RETIRED]
+        ledger = AccountLedger(cash_minor=50000000, calendar=DAYS, settlement_sessions=1)
+        order = _simulate(result['intents'][0], row, ledger, plan['profile'], DAYS[2], 'synthetic', 0)
+        self.assertEqual((order['submitted_quantity'], order['filled_quantity']), (0, 0))
+        self.assertEqual(order['reason'], 'MISSING_STOCK_LIFECYCLE_CAPABILITY')
+        self.assertEqual(ledger.positions, {})
 
     def test_configured_strategies_use_separate_mask_with_original_candidates(self):
         rules = event_rules(); wire = frame_for(rules, scores={RETIRED:100})
@@ -151,6 +166,64 @@ class MemberLifecycleTests(unittest.TestCase):
         context.update(stock_execution_rules=damaged, stock_execution_rules_ref=Document.from_dict(damaged).identity)
         with self.assertRaises(ContractError):
             plan_stock_portfolio(frame, account=dict(cash_minor=50000000, positions={}, version=0), context=context, top_k=1)
+
+    def test_best_effort_event_clock_and_actual_observation_are_separate(self):
+        from axiom_engine.core.stock_lifecycle import validate_feature_lifecycle_input
+        rules = event_rules(); context = context_for(rules, 1)
+        proof = validate_feature_lifecycle_input(context['stock_feature_lifecycle'],
+            identities=validate_execution_rules(rules)[0], rules_ref=context['stock_execution_rules_ref'],
+            feature_session=DAYS[2], feature_cutoff=DAYS[2]+'T20:30:00+08:00')
+        fact = proof.facts[RETIRED]
+        self.assertEqual(fact['policy_available_at'], DAYS[2]+'T00:00:00+08:00')
+        self.assertEqual(fact['first_observed_at'], '2026-10-03T16:00:00+00:00')
+        self.assertEqual(fact['original_availability_basis'], 'first_observed_at')
+        self.assertEqual(fact['availability_basis'], 'declared_vendor_assumption')
+        self.assertIsNone(fact['native_usable_from'])
+
+    def test_native_owner_clock_and_policy_cannot_be_replaced_by_masks(self):
+        rules = event_rules(); frame = StockPredictionFrame.from_dict(frame_for(rules))
+        original = context_for(rules, 1)
+        for change in ('owner', 'clock', 'operational', 'bool'):
+            context = deepcopy(original); value = context['stock_feature_lifecycle']
+            if change == 'owner':
+                value['owner_batch']['records'][0]['market_state'] = 'delisted'
+            elif change == 'clock':
+                value['binding']['knowledge_cutoff'] = DAYS[3]+'T20:30:00+08:00'
+                value['reference'] = Document.from_dict(value['binding']).identity
+            elif change == 'operational':
+                value['owner_batch']['context']['query']['pit_policy'] = 'operational_pit_v1'
+                bind_lifecycle(context, rules, value['owner_batch'])
+            else:
+                value['eligible'] = True
+            with self.subTest(change=change), self.assertRaises(ContractError):
+                plan_stock_portfolio(frame, account=dict(cash_minor=50000000, positions={}, version=0),
+                                     context=context, top_k=1)
+
+    def test_unknown_feature_lifecycle_retains_unknown_reason(self):
+        rules = event_rules(); context = context_for(rules, 1)
+        batch = context['stock_feature_lifecycle']['owner_batch']
+        for row in batch['records']:
+            if row['session'] == DAYS[2]:
+                row['market_state'] = 'unknown_status'
+        for meta in batch['field_meta']['market_state']['by_key']:
+            if meta['session'] == DAYS[2]:
+                meta.update(missing_reason='identity_not_visible_at_cutoff', usable_from=None)
+        bind_lifecycle(context, rules, batch)
+        result = plan_stock_portfolio(StockPredictionFrame.from_dict(frame_for(rules)),
+            account=dict(cash_minor=50000000, positions={}, version=0), context=context, top_k=1).to_dict()
+        self.assertEqual(result['status'], 'NO_DECISION')
+        self.assertTrue(all(r['reason']=='UNKNOWN_STOCK_LIFECYCLE' and r['market_state']=='unknown_status'
+                            for r in result['trace'][0]['excluded_members']))
+
+    def test_equivalent_original_utc_clock_is_preserved(self):
+        rules = event_rules(); context = context_for(rules, 1)
+        batch = context['stock_feature_lifecycle']['owner_batch']
+        batch['context']['query']['cutoff_by_session'][DAYS[2]] = DAYS[2]+'T12:30:00+00:00'
+        bind_lifecycle(context, rules, batch)
+        result = plan_stock_portfolio(StockPredictionFrame.from_dict(frame_for(rules)),
+            account=dict(cash_minor=50000000, positions={}, version=0), context=context, top_k=1).to_dict()
+        self.assertEqual(result['status'], 'DECISION_COMPLETE')
+        self.assertEqual(context['stock_feature_lifecycle']['binding']['knowledge_cutoff'], DAYS[2]+'T12:30:00+00:00')
 
     def test_retired_holding_still_stops_before_nav_and_is_not_discarded(self):
         plan = full_request(rules=event_rules(), k=1, mutate_native=carry, mutate_frame=carry_frame)

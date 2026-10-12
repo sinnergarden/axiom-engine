@@ -236,6 +236,14 @@ def rule_at(wire, security, day, *, validated=None):
     index, grouped = validate_execution_rules(wire) if validated is None else validated
     require(security in index and wire["verified_from"] <= day <= wire["verified_through"] and listed(index[security], day),
             "stock order outside verified listing/rule window")
+    return quantity_rule_at(wire, security, day, validated=(index, grouped))
+
+
+def quantity_rule_at(wire, security, day, *, validated=None):
+    """Sizing rule only; lifecycle admission belongs to the execution clock."""
+    index, grouped = validate_execution_rules(wire) if validated is None else validated
+    require(security in index and wire["verified_from"] <= day <= wire["verified_through"],
+            "stock quantity rule outside verified window")
     return interval_at(grouped.get(index[security]["board"], []), day)
 
 

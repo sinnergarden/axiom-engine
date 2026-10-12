@@ -129,7 +129,8 @@ class _StreamStorage:
         self._emitted = {kind: 0 for kind in RESULT_GROUPS[:-1]}
         self._drained = dict(self._emitted)
         self.pending_bytes = 0
-        self.sink._external_pending_bytes = lambda: self.pending_bytes
+        self.lifecycle_bytes = 0
+        self.sink._external_pending_bytes = lambda: self.pending_bytes + self.lifecycle_bytes
         self.metrics = {"total_fees_minor": 0, "turnover_minor": 0, "fill_count": 0,
             "unfilled_order_count": 0, "unsubmitted_order_count": 0,
             "unsubmitted_quantity": 0, "incomplete_order_count": 0}
@@ -161,9 +162,14 @@ class _StreamStorage:
         require(kind in RESULT_GROUPS[:-1], "unknown pending stock output group")
         scratch = max(8, min(16384, self.budget["max_buffer_bytes"] // 8))
         size = canonical_size(row, self.budget["max_buffer_bytes"], scratch_bytes=scratch)
-        require(self.pending_bytes + self.sink.buffered_bytes + scratch + size <= self.budget["max_buffer_bytes"],
+        require(self.pending_bytes + self.lifecycle_bytes + self.sink.buffered_bytes + scratch + size <= self.budget["max_buffer_bytes"],
                 "stock pending output budget exceeded before history addition")
         self.pending_bytes += size
+
+    def reserve_lifecycle(self, size):
+        require(self.pending_bytes + self.lifecycle_bytes + self.sink.buffered_bytes + size <= self.budget["max_buffer_bytes"],
+                "prior Feature lifecycle proof exceeds Runtime buffer budget before allocation")
+        self.lifecycle_bytes = size
 
     def observe_order(self, order):
         self.metrics["unfilled_order_count"] += order["unfilled_quantity"] > 0

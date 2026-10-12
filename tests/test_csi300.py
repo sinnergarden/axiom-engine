@@ -1,6 +1,7 @@
 """Synthetic source-bound four-board goldens; no suppliers, Data or fitted models."""
 from copy import deepcopy
 import unittest
+from unittest.mock import patch
 
 from axiom_engine.core import ContractError, StockPredictionFrame, plan_stock_portfolio
 from axiom_engine.core.contracts import Document
@@ -78,7 +79,7 @@ def frame_for(rules, *, scores=None, invalid=()):
 
 
 def core_context(rules, k):
-    return dict(trade_session=rules["calendar"][1], feature_session=rules["calendar"][0],
+    context = dict(trade_session=rules["calendar"][1], feature_session=rules["calendar"][0],
         decision_time=rules["calendar"][1]+"T08:55:00+08:00", knowledge_cutoff=rules["calendar"][0]+"T20:30:00+08:00",
         reference_prices={s:dict(price="10", session=rules["calendar"][0],
             available_at=rules["calendar"][0]+"T12:00:00Z", source_refs=[REF]) for s in rules["universe"]},
@@ -86,6 +87,32 @@ def core_context(rules, k):
         supported_security_ids=rules["universe"], supported_universe_ref=support_ref(rules["universe"]),
         portfolio_policy=csi300_stock_portfolio_policy(top_k=k, execution_universe=rules["universe"], execution_rules=rules),
         stock_execution_rules=rules, stock_execution_rules_ref=Document.from_dict(rules).identity)
+    bind_lifecycle(context, rules)
+    return context
+
+
+def bind_lifecycle(context, rules, batch=None):
+    """Closed original synthetic native evidence for the public Core context."""
+    from axiom_engine.core.stock_lifecycle import lifecycle_binding
+    import test_stocks as legacy
+    if batch is None:
+        index = validate_execution_rules(rules)[0]
+        with patch.object(legacy, "DAYS", rules["calendar"]), patch.object(legacy, "SECURITIES", rules["universe"]):
+            batch = legacy.native_inputs(state="normal_trading")[0]
+        for row, meta in zip(batch["records"], batch["field_meta"]["market_state"]["by_key"]):
+            identity = index[row["security_id"]]; day = row["session"]
+            if day < identity["listing_date"]:
+                row["market_state"] = "not_listed"; meta.update(usable_from=None, missing_reason=None)
+            elif identity["delisting_date"] is not None and day >= identity["delisting_date"]:
+                row["market_state"] = "delisted"
+                proof = identity.get("_stock_delisting_evidence") or dict(revision_id="synthetic",raw_batch_id="synthetic")
+                meta.update(usable_from=None, missing_reason=None, evidence_domain="listing_events",
+                            **{name:proof[name] for name in ("revision_id","raw_batch_id")})
+    binding = lifecycle_binding(owner_native_ref=Document.from_dict(batch).identity,
+        feature_session=context["feature_session"], knowledge_cutoff=batch["context"]["query"]["cutoff_by_session"][context["feature_session"]],
+        stock_execution_rules_ref=context["stock_execution_rules_ref"])
+    context["stock_feature_lifecycle"] = dict(reference=Document.from_dict(binding).identity, binding=binding, owner_batch=batch)
+    return context
 
 
 class FrozenRuleTests(unittest.TestCase):

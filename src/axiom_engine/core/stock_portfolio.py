@@ -5,7 +5,7 @@ import re
 
 from .contracts import Document, digest, fields, integer, number, require, session, text
 from .portfolio import PortfolioDecision, decimal, minor
-from .stock_rules import (validate_execution_rules, rule_at, interval_at, listed, floor_quantity, legal_quantity,
+from .stock_rules import (validate_execution_rules, quantity_rule_at, interval_at, floor_quantity, legal_quantity,
                           support_ref as csi300_support_ref, CSI300_ELIGIBILITY, CANDIDATE_POLICY)
 
 STOCK_PORTFOLIO_VERSION = "axiom.stock_portfolio/1"
@@ -122,13 +122,14 @@ def plan_stock_portfolio(frame, *, account, context, top_k=None):
         return _plan(frame, account, context, top_k)
 
 
-def _plan_admitted_stock_portfolio(wire, rows, *, account, context, top_k, rules_index=None):
+def _plan_admitted_stock_portfolio(wire, rows, *, account, context, top_k, rules_index=None, feature_lifecycle=None):
     """Runtime-private reuse after its full entry admission; no public bypass tag."""
     with localcontext(Context(prec=40, rounding=ROUND_HALF_UP)):
-        return _plan(None, account, context, top_k, admitted=(wire, rows), admitted_rules=rules_index)
+        return _plan(None, account, context, top_k, admitted=(wire, rows), admitted_rules=rules_index,
+                     admitted_lifecycle=feature_lifecycle)
 
 
-def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
+def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None, admitted_lifecycle=None):
     wire, rows = validate_stock_predictions(frame) if admitted is None else admitted
     v2 = wire['contract_version']=='stock_prediction_run_v2'
     derived=wire['contract_version']=='derived_signal_run_v1'
@@ -146,7 +147,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
             unsigned = dict(wire); reference = unsigned.pop("signal_run_ref")
             require(Document.from_dict(unsigned).identity == reference, "Saved v2 prediction identity mismatch")
     fields(context, "trade_session feature_session decision_time knowledge_cutoff reference_prices commission_rate minimum_commission_minor slippage_bps account_state_version supported_security_ids supported_universe_ref" +
-           (" portfolio_policy stock_execution_rules stock_execution_rules_ref" if full else " lot_size") +
+           (" portfolio_policy stock_execution_rules stock_execution_rules_ref stock_feature_lifecycle" if full else " lot_size") +
            (" strategy_state pending_share_quantities reserved_security_ids risk_observations" if strategy else "") +
            (" feature_knowledge_cutoff" if modern else ""))
     session(context["trade_session"]); session(context["feature_session"])
@@ -213,19 +214,19 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
                     (derived or instant(row['simulated_model_available_at'])<cutoff), 'Inconsistent staged decision clock')
     source_members = [row for row in batch if row["member"] and row["security_id"] in supported]
     eligible, lifecycle_excluded = [], []
+    lifecycle = None
+    if full:
+        from .stock_lifecycle import validate_feature_lifecycle_input
+        lifecycle = validate_feature_lifecycle_input(context["stock_feature_lifecycle"], identities=rule_index[0],
+            rules_ref=context["stock_execution_rules_ref"], feature_session=context["feature_session"],
+            feature_cutoff=context["feature_session"]+"T20:30:00+08:00", admitted=admitted_lifecycle)
+        lifecycle_facts = lifecycle.facts
     for row in source_members:
         if full:
-            identity = rule_index[0][row["security_id"]]
-            # The validated lifecycle is independent of the vendor observation.
-            # Check the intended trade date too; no execution prices/volume enter Core.
-            states = {label: ("active" if listed(identity, context[name]) else
-                            "not_listed" if context[name] < identity["listing_date"] else "delisted")
-                      for label, name in (("feature_lifecycle", "feature_session"), ("trade_lifecycle", "trade_session"))}
-            if any(state != "active" for state in states.values()):
-                lifecycle_excluded.append({"security_id": row["security_id"], **states,
-                    "reason": "DELISTED" if "delisted" in states.values() else "NOT_LISTED",
-                    "listing_date": identity["listing_date"], "delisting_date": identity["delisting_date"],
-                    "source_refs": identity["source_refs"]})
+            fact = lifecycle_facts[row["security_id"]]
+            if fact["lifecycle"] != "active":
+                lifecycle_excluded.append({"security_id": row["security_id"], **fact,
+                    "reason": "UNKNOWN_STOCK_LIFECYCLE" if fact["lifecycle"] == "unknown" else fact["lifecycle"].upper()})
                 continue
         eligible.append(row)
     result = {"contract_version": version, "feature_session": context["feature_session"],
@@ -236,6 +237,8 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         result["top_k"] = k
     if full:
         result["stock_execution_rules_ref"] = context["stock_execution_rules_ref"]
+        result["stock_feature_lifecycle_ref"] = lifecycle.reference
+        result["stock_feature_lifecycle_binding"] = lifecycle.binding
     if v2:
         result["prediction_clock"] = {"clock_basis": wire["clock_basis"],
             "feature_knowledge_cutoff": batch[0]["feature_knowledge_cutoff"],
@@ -356,7 +359,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
             result["targets"][security] = strategy_targets["preserve_quantities"][security]
             continue
         if full:
-            rule = rule_at(rules, security, context["trade_session"], validated=rule_index)
+            rule = quantity_rule_at(rules, security, context["trade_session"], validated=rule_index)
             result["targets"][security] = floor_quantity(raw, rule["buy_minimum"], rule["buy_increment"])
             if security in selected and not result["targets"][security]:
                 result["trace"].append({"reason": "TARGET_BELOW_MINIMUM_QUANTITY", "security_id": security,
@@ -368,7 +371,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         quantity = min(reduction, position["sellable_quantity"])
         available = quantity
         if full and quantity:
-            rule = rule_at(rules, security, context["trade_session"], validated=rule_index)
+            rule = quantity_rule_at(rules, security, context["trade_session"], validated=rule_index)
             quantity = legal_quantity(reduction, "SELL", rule, held=position["quantity"],
                                       sellable=position["sellable_quantity"], apply_maximum=False)
             if quantity < available:
@@ -384,7 +387,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         current = account["positions"].get(security, {"quantity": 0})["quantity"]
         increase = max(0, result["targets"][security] - current)
         if full:
-            rule = rule_at(rules, security, context["trade_session"], validated=rule_index)
+            rule = quantity_rule_at(rules, security, context["trade_session"], validated=rule_index)
             quantity = legal_quantity(increase, "BUY", rule, apply_maximum=False)
             if quantity < increase:
                 result["trace"].append({"reason": "BELOW_MINIMUM_ORDER_QUANTITY" if not quantity else "ORDER_QUANTITY_INCREMENT",
@@ -397,7 +400,12 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         **({} if legacy else {"top_k": k}), "tie_break": "security_id_asc",
         "budget_basis": BUDGET_BASIS, "reference_budget_minor": minor(budget), "sizing": "previous_native_close",
         "score_semantics": wire["score_semantics"], "cash_check": "actual_fill_cash"})
-    identity = Document.from_dict({"contract": version, **({"frame_ref": wire["signal_run_ref"]} if modern else {"frame": wire}), "context": context, "account": account,
+    identity_context = dict(context)
+    if full:
+        # The original native digest closes the proof; do not duplicate its full
+        # batch in the logical identity or private Runtime context.
+        identity_context["stock_feature_lifecycle"] = lifecycle.context()
+    identity = Document.from_dict({"contract": version, **({"frame_ref": wire["signal_run_ref"]} if modern else {"frame": wire}), "context": identity_context, "account": account,
                                   **({} if legacy else {"top_k": k})}).identity
     for index, intent in enumerate(result["intents"]):
         intent.update(intent_id=identity + ":" + str(index), expected_account_version=account["version"], valid_until=context["trade_session"])

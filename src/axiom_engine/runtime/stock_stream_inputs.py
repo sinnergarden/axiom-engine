@@ -1064,7 +1064,8 @@ class StockInputSource:
             stage.reserve(upper)
             rows = _project_stock_rows(batches=batches[:4], universe=manifest["scope"]["execution_universe"],
                 calendar=list(days), identities=prepared["rules_index"][0], source_refs=prepared["source_refs"],
-                membership_batch=batches[4], expanded=True)
+                membership_batch=batches[4], expanded=True,
+                lifecycle_owner_ref=prepared["native_by_day"]["execution", "states", days[0]].content_digest)
             row_bytes = sum(_encoded_size(row) for row in rows)
             require(row_bytes <= upper, "Stock projection exceeds reserved decoded growth bound")
             stage.release(upper); stage.reserve(row_bytes)
