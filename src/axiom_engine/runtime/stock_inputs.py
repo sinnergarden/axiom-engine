@@ -297,6 +297,9 @@ def validate_stock_request(plan, *, legacy_saved_top5=False):
             "_stock_factor_valid": factors[key] is not None,
             "_stock_factor_missing_reason": factor_meta[key].get("missing_reason"),
             "_stock_factor_source_ref": factor_ref, "_stock_close_missing_reason": close_meta[key].get("missing_reason"),
+            "_stock_lifecycle_meta": state_metadata[key], "_stock_lifecycle_owner_ref": refs[0],
+            "_stock_lifecycle_policy": batches[0]["context"]["query"]["pit_policy"],
+            "_stock_lifecycle_cutoff": batches[0]["context"]["query"]["cutoff_by_session"][key[0]],
             "_stock_member": member_rows[key]["is_member"]} for key, row in indexed.items()}
     seen = set()
     for action in market["cash_dividends"]:

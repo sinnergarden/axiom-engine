@@ -5,6 +5,7 @@ from ..core.stock_portfolio import instant
 from .stock_inputs import TAX_CONVENTION
 from .stock_evidence import native_ref, pack_stock_batches, scoped_bundle
 from ..core.stock_rules import validate_execution_rules, listed, LIFECYCLE_POLICY
+from ..core.stock_lifecycle import native_lifecycle_active as _stock_lifecycle_active
 
 STOCK_EVENT_FIELDS = ("implementation_announcement_date", "record_date", "ex_date",
     "cash_dividend_before_tax_per_share", "bonus_shares_per_share", "capital_transfer_shares_per_share",
@@ -60,7 +61,8 @@ def _membership_index(batch, *, universe, calendar, identities):
 
 
 def _membership_rows(batch, *, universe, calendar, identities):
-    """Validate admitted original membership row views without rebinding query."""
+    """Admit source observations; carried membership is not listing evidence."""
+    require(set(identities) == set(universe), "complete stock membership identity union required")
     rows, meta = {}, {}
     for native in batch["records"]:
         key = native["session"], native["security_id"]
@@ -74,7 +76,6 @@ def _membership_rows(batch, *, universe, calendar, identities):
     require(set(rows) == set(meta) == expected, "incomplete PIT stock membership grid")
     for (day, security), row in rows.items():
         require(_visible(meta[day, security], day + "T20:30:00+08:00"), "unavailable PIT stock member flag")
-        require(not row["is_member"] or listed(identities[security], day), "PIT member outside listing lifecycle")
     return rows
 
 
@@ -103,47 +104,8 @@ def _stock_metadata(batch, name, keys=("session", "security_id")):
     return result
 
 
-def _stock_lifecycle_active(identity, day, state, metadata):
-    """Use original per-session state; nullable identity end is not immortality.
-
-    The admitted state batch binds its original event revision/Raw references.
-    Missing state usable_from stays missing; best-effort query clocks are not
-    upgraded to strict historical receipt evidence. No event date is inferred.
-    """
-    first, last = identity["listing_date"], identity["delisting_date"]
-    location = identity["security_id"] + "/" + day
-    if state == "not_listed":
-        require(day < first, "native not_listed contradicts canonical lifecycle: " + location)
-        return False
-    if state == "delisted":
-        require(first <= day and (last is None or last <= day),
-                "native delisted contradicts canonical lifecycle: " + location)
-        require(metadata.get("missing_reason") is None and
-                metadata.get("evidence_domain") in ("listing_events", "security_master") and
-                all(type(metadata.get(name)) is str and bool(metadata[name])
-                    for name in ("revision_id", "raw_batch_id")),
-                "native delisted lacks bound lifecycle evidence: " + location)
-        if identity.get('_stock_identity_version') == 2:
-            proof = identity.get('_stock_delisting_evidence')
-            require(proof is not None and metadata.get('evidence_domain')=='listing_events' and
-                    all(metadata[name]==proof[name] for name in ('revision_id','raw_batch_id')),
-                    "native lifecycle selects a different original event revision: " + location)
-            if metadata.get('availability_basis') == 'first_observed_at':
-                require(all(metadata.get(name) is None or
-                            instant(metadata[name]) == instant(proof[name])
-                            for name in ('first_observed_at', 'usable_from')),
-                        "native lifecycle observation time differs from original event proof: " + location)
-        available = metadata.get("usable_from")
-        require(available is None or instant(available) <= instant(day + "T20:30:00+08:00"),
-                "future native lifecycle evidence: " + location)
-        return False
-    active = listed(identity, day)
-    require(state == "unknown_status" or active,
-            "native stock state contradicts canonical listing lifecycle: " + location)
-    return active
-
 def _project_stock_rows(*, batches, universe, calendar, identities, source_refs,
-                        membership_batch=None, expanded=False):
+                        membership_batch=None, expanded=False, lifecycle_owner_ref=None):
     """Project admitted original row views with the same v6 visibility rules."""
     states, prices, limits, factors = batches
     full = identities is not None
@@ -178,7 +140,6 @@ def _project_stock_rows(*, batches, universe, calendar, identities, source_refs,
                     ended.add(security)
                 require(is_listed or all(p[key][n] is None for n in ("open", "close", "volume_shares")),
                         "unlisted stock carries observed market facts")
-                require(is_listed or not members[key]["is_member"], "PIT member outside native lifecycle")
                 if day < identities[security]['listing_date']:
                     require(f[key]['factor'] is None and all(l[key][name] is None for name in ('up_limit','down_limit')),
                             "pre-listing diagnostic carries factor/limit facts")
@@ -206,8 +167,28 @@ def _project_stock_rows(*, batches, universe, calendar, identities, source_refs,
             "_stock_factor_missing_reason": factor_meta[row["session"], row["security_id"]].get("missing_reason"),
             "_stock_factor_source_ref": source_refs[3],
             "_stock_close_missing_reason": close_meta[row["session"], row["security_id"]].get("missing_reason"),
+            "_stock_lifecycle_meta": meta["market_state"][row["session"], row["security_id"]],
+            "_stock_lifecycle_owner_ref": lifecycle_owner_ref or source_refs[0],
+            "_stock_lifecycle_policy": states["context"]["query"]["pit_policy"],
+            "_stock_lifecycle_cutoff": states["context"]["query"]["cutoff_by_session"][row["session"]],
             "_stock_member": members[row["session"], row["security_id"]]["is_member"]} for row in rows]
     return rows
+
+
+def _feature_lifecycle_from_rows(rows, day, universe, identities, rules_ref):
+    """Consume original admission only; retain one prior-day proof, no Data read."""
+    from ..core.stock_lifecycle import _compile_feature_lifecycle, lifecycle_binding
+    records, metadata, owners, cutoffs = {}, {}, set(), set()
+    for security in universe:
+        row = rows[day, security]
+        require(row["_stock_lifecycle_policy"] == "best_effort_vendor_v1", "Feature lifecycle PIT policy mismatch")
+        records[security] = {name: row[name] for name in ("security_id", "session", "market_state")}
+        metadata[security] = row["_stock_lifecycle_meta"]
+        owners.add(row["_stock_lifecycle_owner_ref"]); cutoffs.add(row["_stock_lifecycle_cutoff"])
+    require(len(owners) == len(cutoffs) == 1, "Feature lifecycle original owner/clock mismatch")
+    binding = lifecycle_binding(owner_native_ref=owners.pop(), feature_session=day,
+        knowledge_cutoff=cutoffs.pop(), stock_execution_rules_ref=rules_ref)
+    return _compile_feature_lifecycle(binding, records, metadata, identities)
 
 
 class _StockActionStream(dict):

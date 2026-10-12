@@ -399,6 +399,7 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                            settlement_sessions=profile["settlement_sessions"], positions=plan["initial_account"]["positions"],
                            output_guard=storage.reserve_output if streaming else None)
     quotes, marks, entitlements = {}, {}, {}
+    feature_lifecycle = None
     registrations, applications, mark_basis = {}, [], {}
     nav, positions, orders, decisions = [], [], [], []
     order_index = 0
@@ -493,7 +494,8 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                     context.update(supported_security_ids=plan["execution_universe"], supported_universe_ref=plan["supported_universe_ref"])
                     if v6:
                         context.update(portfolio_policy=plan["portfolio_policy"], stock_execution_rules=profile["stock_execution_rules"],
-                                       stock_execution_rules_ref=plan["stock_execution_rules_ref"])
+                                       stock_execution_rules_ref=plan["stock_execution_rules_ref"],
+                                       stock_feature_lifecycle=feature_lifecycle.context())
                     if strategy:
                         from .stock_strategy_rights import registered_share_reservations
                         reserved_rights = registered_share_reservations(ledger, equity_actions) if equity else []
@@ -502,7 +504,8 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                     if scheduled:
                         context["feature_knowledge_cutoff"] = first["feature_knowledge_cutoff"]
                         decision = _plan_admitted_stock_portfolio(active, active_rows, account=ledger.account(),
-                            context=context, top_k=plan["portfolio_policy"]["top_k"], rules_index=rules_index).to_dict()
+                            context=context, top_k=plan["portfolio_policy"]["top_k"], rules_index=rules_index,
+                            feature_lifecycle=feature_lifecycle).to_dict()
                     else:
                         decision = plan_stock_portfolio(StockPredictionFrame.from_dict(signal), account=ledger.account(),
                             context=context, top_k=plan["portfolio_policy"]["top_k"]).to_dict()
@@ -555,6 +558,21 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                 mark_basis[security] = None
         if streaming:
             row = None
+        if v6:
+            feature_lifecycle = None
+            if streaming:
+                storage.lifecycle_bytes = 0
+        if (v6 and index+1 < len(calendar) and plan["start_session"] <= calendar[index+1] <= plan["end_session"] and
+                date.fromisoformat(calendar[index+1]).isocalendar()[:2] != date.fromisoformat(day).isocalendar()[:2]):
+            from .stock_market import _feature_lifecycle_from_rows
+            if streaming:
+                storage.reserve_lifecycle(4096 + sum(2048 + 2*len(Document.from_dict(
+                    rows[day, security]["_stock_lifecycle_meta"]).payload) for security in market["universe"]))
+            feature_lifecycle = _feature_lifecycle_from_rows(rows, day, market["universe"], rules_index[0],
+                                                           plan["stock_execution_rules_ref"])
+            if streaming:
+                require(2*len(feature_lifecycle._wire.payload) <= storage.lifecycle_bytes,
+                        "Feature lifecycle proof exceeds reserved budget")
         if day < plan["start_session"]:
             continue
         for item in sorted(splits, key=lambda i: i["event"]["event_id"]):

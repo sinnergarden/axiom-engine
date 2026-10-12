@@ -184,7 +184,7 @@ class NativeLifecycleTests(unittest.TestCase):
             with self.subTest(args=args),self.assertRaises(ContractError):
                 _stock_lifecycle_active(*args)
 
-    def test_prelisting_unknown_retains_original_reason_and_false_member_is_required(self):
+    def test_prelisting_unknown_retains_original_reason_and_source_membership(self):
         security = 'cnstock.688200.SH.20240103'
         rules = rules_for({BOARD_IDS['SSE_MAIN']:'SSE_MAIN',security:'SSE_STAR'})
         def mutate(batches,membership):
@@ -205,7 +205,11 @@ class NativeLifecycleTests(unittest.TestCase):
             mutate(batches,membership)
             for row in membership['records']:
                 if row['security_id']==security:row['is_member']=True
-        with self.assertRaises(ContractError):full_request(rules=rules,k=1,mutate_native=wrong)
+        carried=full_request(rules=rules,k=1,mutate_native=wrong,
+            mutate_frame=lambda frame:[row.update(member=True) for row in frame['rows'] if row['security_id']==security]).to_dict()
+        admitted=validate_stock_request(carried)[5][DAYS[0],security]
+        self.assertEqual((admitted['market_state'],admitted['_stock_listed'],admitted['_stock_member']),
+                         ('unknown_status',False,True))
 
     def test_original_terminal_evidence_retained_factor_limits_and_stream_admission(self):
         plan=full_request(mutate_native=terminal,mutate_frame=terminal_frame).to_dict()
