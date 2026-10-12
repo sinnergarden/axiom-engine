@@ -385,7 +385,11 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
     if strategy:
         from ..core.stock_strategy import initial_strategy_state, STRATEGY_PORTFOLIO_VERSION
         core_version = STRATEGY_PORTFOLIO_VERSION
-        strategy_state, risk_observations = initial_strategy_state(), {}
+        strategy_state, risk_observations = initial_strategy_state(plan["portfolio_policy"]["strategy_spec"]), {}
+        market_risk = None
+        if "market_gate" in plan["portfolio_policy"]["strategy_spec"]:
+            from .stock_strategy_saved import BoundMarketRiskInput
+            market_risk = BoundMarketRiskInput(plan)
     rules_index = None
     if v6:
         from ..core.stock_rules import validate_execution_rules
@@ -501,6 +505,11 @@ def _run(request, *, decoded_plan=None, admitted=None, storage=None):
                         reserved_rights = registered_share_reservations(ledger, equity_actions) if equity else []
                         context.update(strategy_state=strategy_state, risk_observations=risk_observations,
                                        pending_share_quantities=share_pending if equity else {}, reserved_security_ids=reserved_rights)
+                        if market_risk is not None:
+                            from .stock_strategy_saved import registered_market_risk_rights
+                            context.update(market_observation=market_risk.observation(previous, plan["risk_input_ref"]),
+                                risk_input_ref=plan["risk_input_ref"],
+                                registered_stock_right_security_ids=registered_market_risk_rights(ledger, equity_actions))
                     if scheduled:
                         context["feature_knowledge_cutoff"] = first["feature_knowledge_cutoff"]
                         decision = _plan_admitted_stock_portfolio(active, active_rows, account=ledger.account(),

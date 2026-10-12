@@ -20,15 +20,18 @@ class StockStrategy(Protocol):
     def plan(self, *, inputs: dict, state: dict) -> StrategyTargets: ...
 
 
-def stock_strategy_spec(*, selection="top_k", top_k=5, rank_buffer=None, exit_overlay=None):
+def stock_strategy_spec(*, selection="top_k", top_k=5, rank_buffer=None, exit_overlay=None, market_gate=None):
     wire = deepcopy(dict(contract_version="stock_strategy_spec_v1", selection=selection,
                          top_k=top_k, rank_buffer=rank_buffer, exit_overlay=exit_overlay))
+    if market_gate is not None:
+        wire["market_gate"] = deepcopy(market_gate)
     validate_strategy_spec(wire)
     return wire
 
 
 def validate_strategy_spec(wire):
-    fields(wire, "contract_version selection top_k rank_buffer exit_overlay")
+    fields(wire, "contract_version selection top_k rank_buffer exit_overlay" +
+           (" market_gate" if "market_gate" in wire else ""))
     require(wire["contract_version"] == "stock_strategy_spec_v1", "unsupported strategy spec")
     integer(wire["top_k"], 1)
     require(wire["selection"] in ("top_k", "rank_buffer"), "unsupported stock selection")
@@ -37,6 +40,14 @@ def validate_strategy_spec(wire):
         integer(wire["rank_buffer"]["keep_rank"], wire["top_k"])
     else:
         require(wire["rank_buffer"] is None, "TopK does not take a rank buffer")
+    if "market_gate" in wire:
+        gate = wire["market_gate"]
+        fields(gate, "rule security_id window_sessions check")
+        require(gate["rule"] == "close_above_sma" and
+                gate["check"] == "rebalance_sessions_only", "unsupported market gate")
+        require(type(gate["security_id"]) is str and bool(gate["security_id"]), "market series ID required")
+        integer(gate["window_sessions"], 2)
+        require(gate["window_sessions"] <= 252, "market gate window exceeds bounded scope")
     overlay = wire["exit_overlay"]
     if overlay is not None:
         fields(overlay, "take_profit stop_loss cost_basis check cooldown_rebalance_sessions reentry")
@@ -49,8 +60,11 @@ def validate_strategy_spec(wire):
     return wire
 
 
-def initial_strategy_state():
-    return dict(contract_version="stock_strategy_state_v1", check_index=0, exits={})
+def initial_strategy_state(spec=None):
+    state = dict(contract_version="stock_strategy_state_v1", check_index=0, exits={})
+    if spec is not None and "market_gate" in spec:
+        state["market_mode"] = "uninitialized"
+    return state
 
 
 def strategy_support_ref(universe, universe_id):
@@ -79,9 +93,14 @@ def validate_strategy_policy(policy, universe, rules_ref):
 
 
 def validate_strategy_state(state, universe):
-    fields(state, "contract_version check_index exits")
+    fields(state, "contract_version check_index exits" + (" market_mode" if "market_mode" in state else ""))
     require(state["contract_version"] == "stock_strategy_state_v1", "unsupported strategy state")
     integer(state["check_index"])
+    if "market_mode" in state:
+        require(state["market_mode"] in ("uninitialized", "risk_on", "exit_pending", "risk_off"),
+                "invalid market gate state")
+        require(state["market_mode"] != "uninitialized" or state["check_index"] == 0,
+                "market gate cannot forget an initialized state")
     require(type(state["exits"]) is dict and set(state["exits"]) <= set(universe), "exit state outside scope")
     for item in state["exits"].values():
         fields(item, "phase remaining_checks")
@@ -101,6 +120,47 @@ def _instant(value):
     return point
 
 
+def validate_market_observation(observation, gate, feature, risk_input_ref):
+    """Pure clock/identity admission; the native binding is independently owned by Runtime."""
+    fields(observation, "contract_version risk_input_ref native_ref security_id feature_session knowledge_cutoff points observation_ref")
+    require(observation["contract_version"] == "stock_market_observation_v1" and
+            observation["risk_input_ref"] == risk_input_ref and
+            observation["security_id"] == gate["security_id"] and observation["feature_session"] == feature,
+            "market observation binding mismatch")
+    for key in ("risk_input_ref", "native_ref", "observation_ref"): digest(observation[key])
+    require(Document.from_dict({k:v for k,v in observation.items() if k != "observation_ref"}).identity ==
+            observation["observation_ref"], "market observation identity mismatch")
+    cutoff = _instant(feature+"T20:30:00+08:00")
+    require(_instant(observation["knowledge_cutoff"]) == cutoff, "market observation cutoff mismatch")
+    points = observation["points"]
+    require(type(points) is list and len(points) == gate["window_sessions"], "complete market window required")
+    days=[];values=[]
+    for point in points:
+        fields(point, "session close usable_from revision_id raw_batch_id first_observed_at availability_basis evidence_ref")
+        session(point["session"])
+        require(point["session"] <= feature and _instant(point["usable_from"]) <= cutoff,
+                "future market risk information")
+        require(type(point["close"]) in (int, float, str) and type(point["close"]) is not bool,
+                "observed market close required")
+        value = decimal(str(point["close"]))
+        require(value > 0, "positive market close required")
+        for key in ("revision_id", "raw_batch_id", "availability_basis"):
+            require(type(point[key]) is str and bool(point[key]), "market point provenance required")
+        _instant(point["first_observed_at"])
+        days.append(point["session"]);values.append(value)
+    require(days == sorted(set(days)) and days[-1] == feature, "market window date mismatch")
+    average = sum(values, Decimal(0))/len(values)
+    return values[-1] > average, str(average)
+
+
+def market_gate_transition(previous_mode, risk_on, owned_security_ids):
+    """A liquidation latch clears only from actual stock/share-right flatness."""
+    pending = bool(owned_security_ids) and previous_mode in ("exit_pending", "risk_off")
+    if not risk_on or pending:
+        return ("exit_pending" if owned_security_ids else "risk_off"), True
+    return "risk_on", False
+
+
 class ConfiguredStockStrategy:
     """A small built-in composition implementing the public pure protocol."""
     def __init__(self, spec):
@@ -112,7 +172,9 @@ class ConfiguredStockStrategy:
             return self._plan(inputs, state)
 
     def _plan(self, inputs, state):
-        fields(inputs, "feature_session trade_session universe candidates positions pending_share_quantities cash_minor reference_prices risk_observations constraints")
+        gated = "market_gate" in self._spec.to_dict()
+        fields(inputs, "feature_session trade_session universe candidates positions pending_share_quantities cash_minor reference_prices risk_observations constraints" +
+               (" market_observation risk_input_ref" if gated else ""))
         feature, trade = inputs["feature_session"], inputs["trade_session"]
         session(feature); session(trade)
         require(feature < trade, "strategy requires a completed prior session")
@@ -124,6 +186,7 @@ class ConfiguredStockStrategy:
         constraints = inputs["constraints"]
         fields(constraints, "max_positions reserved_security_ids" +
                (" quantity_rules" if "quantity_rules" in constraints else "") +
+               (" registered_stock_right_security_ids" if gated else "") +
                (" eligible_security_ids" if "eligible_security_ids" in constraints else ""))
         eligible = constraints.get("eligible_security_ids", universe)
         require(type(eligible) is list and len(set(eligible)) == len(eligible) and set(eligible) <= set(universe),
@@ -143,6 +206,7 @@ class ConfiguredStockStrategy:
         require(type(reserved) is list and len(set(reserved)) == len(reserved) and set(reserved) <= set(universe),
                 "reserved stock rights outside scope")
         validate_strategy_state(state, universe)
+        require(("market_mode" in state) == gated, "market state/spec mismatch")
         integer(inputs["cash_minor"])
         positions, pending = inputs["positions"], inputs["pending_share_quantities"]
         require(type(positions) is dict and type(pending) is dict and
@@ -175,6 +239,23 @@ class ConfiguredStockStrategy:
         ranks = {r["security_id"]: i+1 for i, r in enumerate(ranked)}
         next_state = deepcopy(state); next_state["check_index"] += 1
         trace, blocked, forced, newly_forced = [], set(), set(), set()
+        market_suppressed = False
+        if gated:
+            registered = constraints["registered_stock_right_security_ids"]
+            require(type(registered) is list and registered == sorted(set(registered)) and
+                    set(registered) <= set(universe), "registered market risk rights outside scope")
+            owned = sorted(held | set(registered))
+            risk_on, average = validate_market_observation(inputs["market_observation"],
+                spec["market_gate"], feature, inputs["risk_input_ref"])
+            mode, market_suppressed = market_gate_transition(state["market_mode"], risk_on, owned)
+            next_state["market_mode"] = mode
+            if market_suppressed: forced.update(owned)
+            trace.append(dict(reason="MARKET_GATE", observation=deepcopy(inputs["market_observation"]),
+                risk_input_ref=inputs["risk_input_ref"], risk_on=risk_on, average_close=average,
+                mode_before=state["market_mode"], mode_after=mode,
+                ownership=dict(positions={s:dict(p) for s,p in positions.items() if p["quantity"]},
+                    pending_share_quantities={s:q for s,q in pending.items() if q},
+                    reserved_security_ids=sorted(reserved), registered_stock_right_security_ids=registered)))
         overlay = spec["exit_overlay"]
         require(overlay is not None or not state["exits"], "exit state requires an exit overlay")
         for s, item in list(next_state["exits"].items()):
@@ -226,8 +307,10 @@ class ConfiguredStockStrategy:
                           pending_share_quantity=pending.get(s, 0)) for s in sorted(frozen))
         available = [r["security_id"] for r in ranked if r["security_id"] not in blocked | frozen]
         selected = sorted(frozen)
-        insufficient = spec["selection"] == "top_k" and len([s for s in ranks if s not in blocked]) < k
-        if insufficient:
+        insufficient = not market_suppressed and spec["selection"] == "top_k" and len([s for s in ranks if s not in blocked]) < k
+        if market_suppressed:
+            selected = []; preserve = {}
+        elif insufficient:
             preserve.update({s: positions.get(s, {}).get("quantity", 0) for s in sorted(held - forced)})
             selected = sorted(held - forced)
             trace.append(dict(reason="INSUFFICIENT_ELIGIBLE_MEMBERS", count=len([s for s in ranks if s not in blocked]), top_k=k))
