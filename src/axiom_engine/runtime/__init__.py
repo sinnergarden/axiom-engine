@@ -24,6 +24,8 @@ from .stock_native_view import StockNativeViewSource
 from .stock_owned_inputs import AdmittedStockInputs, admit_stock_inputs
 from .stock_market_owner import (StockMarketSpec, AdmittedStockMarket, admit_stock_market_inputs,
                                  bind_stock_prediction_inputs)
+from .stock_prepared_inputs import (save_stock_market_inputs, load_stock_market_inputs,
+                                    save_stock_prediction_inputs, load_stock_prediction_inputs)
 from .stock_stream_outputs import StockResultSink
 from .stock_stream_projection import SavedRunProjection, load_stock_backtest_projection
 
@@ -41,4 +43,6 @@ __all__ = ["StockActionFacts", "equity_profile", "equity_request", "settle_stock
            "build_fill_display", "save_fill_display", "load_fill_display",
            "run_stock_backtest", "audit_stock_backtest_source", "stock_run_id",
            "StockInputSource", "StockNativeViewSource", "AdmittedStockInputs", "admit_stock_inputs",
-           "StockMarketSpec", "AdmittedStockMarket", "admit_stock_market_inputs", "bind_stock_prediction_inputs", "StockResultSink", "SavedRunProjection", "load_stock_backtest_projection"]
+           "StockMarketSpec", "AdmittedStockMarket", "admit_stock_market_inputs", "bind_stock_prediction_inputs",
+           "save_stock_market_inputs", "load_stock_market_inputs", "save_stock_prediction_inputs", "load_stock_prediction_inputs",
+           "StockResultSink", "SavedRunProjection", "load_stock_backtest_projection"]

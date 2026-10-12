@@ -6,7 +6,7 @@ from array import array
 from contextlib import contextmanager
 import json
 import os
-import tempfile
+import tempfile  # Existing resource-monitoring hooks share InputStore's module.
 from threading import Lock, get_ident
 from time import perf_counter
 from urllib.parse import urlparse
@@ -18,9 +18,9 @@ from .stock_stream_contracts import (artifact_identity, identity_view, read_budg
                                      validate_limits, validate_manifest, _validate_scope)
 from .stock_stream_inputs import (StockInputSource, _DecodedMemory, _audit, _encoded_size,
     _frames, _grid, _native_header, _pair, _path, _warmup_visibility)
-from .stock_stream_outputs import _json_pieces
 from .stock_schedule import CLOCK_POLICY
 from .stock_inputs import ACTION_POLICY
+from .stock_input_store import InputStore as _Store, INPUT_SEMANTICS
 
 _TOKEN = object()
 _PAIRS = (("market", ("open", "high", "low", "close", "volume_shares", "amount_cny")),
@@ -72,7 +72,7 @@ class StockMarketSpec(Document):
 
 
 def _market_key(spec):
-    return canonical(identity_view(spec.to_dict())).encode()
+    return canonical({"input_semantics":INPUT_SEMANTICS, **identity_view(spec.to_dict())}).encode()
 
 
 def _basis_key(plan):
@@ -81,75 +81,12 @@ def _basis_key(plan):
         "native_inputs": [item for item in market["native_inputs"] if item["role"] == "prediction_basis"]}})).encode()
 
 
-class _Store:
-    """Quota covers private bytes plus retained key/index volume, before growth."""
-    def __init__(self, maximum, fixed, label):
-        integer(maximum, 1)
-        require(fixed <= maximum, label+" exceeds quota before allocation")
-        self.maximum, self.fixed, self.label = maximum, fixed, label
-        self.offsets = array("Q")
-        self.file = tempfile.TemporaryFile(mode="w+b")
-        self.bytes = 0
-        self.write_seconds = 0
-
-    @property
-    def used(self):
-        return self.fixed + len(self.offsets)*8 + self.bytes
-
-    def charge(self, size):
-        require(self.used+size <= self.maximum, self.label+" exceeds quota before index growth")
-        self.fixed += size
-
-    def write(self, value, memory):
-        started = perf_counter()
-        require(self.used+16 <= self.maximum, self.label+" exceeds quota before index growth")
-        memory.replace_global(("private_offsets", id(self)), (len(self.offsets)+2)*8)
-        start = self.file.seek(0, 2)
-        with memory.stage() as scratch:
-            scratch.reserve(2048)
-            for piece in _json_pieces(value, piece_chars=64):
-                require(self.fixed+len(self.offsets)*8+16+self.file.tell()+len(piece) <= self.maximum,
-                        self.label+" exceeds quota before write")
-                self.file.write(piece)
-        self.offsets.extend((start, self.file.tell()-start))
-        self.bytes = self.file.tell()
-        self.write_seconds += perf_counter()-started
-        return len(self.offsets)//2-1
-
-    def write_metadata(self,reference,header,memory):
-        """Retain a full original header once, outside account day offsets."""
-        number=self.write({'contract_version':'stock_signal_metadata_v1','signal_ref':reference,'header':header},memory)
-        start,length=self.offsets[2*number:2*number+2]
-        del self.offsets[2*number:2*number+2]
-        self.charge(16+len(reference))
-        memory.replace_global(('private_offsets',id(self)),len(self.offsets)*8)
-        return {'signal_ref':reference,'offset':start,'length':length}
-
-    def read(self, number, memory, budget):
-        start, length = self.offsets[2*number:2*number+2]
-        stage = memory.stage()
-        try:
-            stage.reserve(3*length)
-            self.file.seek(start); raw = bytearray(); remaining = length
-            while remaining:
-                chunk = self.file.read(min(remaining, budget["max_read_bytes"], 65536))
-                require(bool(chunk), "Private stock input store truncated")
-                raw.extend(chunk); remaining -= len(chunk)
-            value = json.loads(raw); raw = chunk = None
-            stage.release(2*length)
-            return value, stage
-        except BaseException:
-            stage.close(); raise
-
-    def close(self):
-        self.file.close(); self.offsets = array("Q")
-
-
 def _release_source(source):
     source._close_private_views()
     source._indexes = {}; source._prepared = None; source._audited = False
     source._memory = None; source._scan_native_scopes = {}; source._scan_row_limits = {}
     source._inventory_sizes = {}; source._prediction_paths = set()
+    source._sharing_native_views = False
 
 
 class AdmittedStockMarket:
@@ -163,6 +100,7 @@ class AdmittedStockMarket:
         self._calendar, self._block_sessions = tuple(calendar), block_sessions
         self._native, self._blocks, self._meta = native, blocks, meta
         self._inventory = inventory; self._proofs = {}; self._statistics = statistics
+        self._prediction_cache = {}
 
     def _check(self):
         require(os.getpid() == self._pid, "Admitted stock market belongs to its creating process")
@@ -185,7 +123,33 @@ class AdmittedStockMarket:
     def statistics(self):
         self._check()
         return {**json.loads(canonical(self._statistics)), "owned_bytes": self._store.used,
-                "signal_borrows": self._borrows, "basis_proofs": len(self._proofs)}
+                "signal_borrows": self._borrows, "basis_proofs": len(self._proofs),
+                "cached_prediction_bytes":sum(s["store"].used for s in self._prediction_cache.values())}
+
+    def _prediction_slot(self, key, maximum):
+        self._assert_lease()
+        slot = self._prediction_cache.get(key)
+        if slot is not None:
+            require(slot["store"].used <= maximum, "Cached prediction exceeds this call's owned budget")
+        return slot
+
+    def _cache_prediction(self, key, store, inventory, statistics, maximum):
+        self._assert_lease()
+        limit = min(maximum,self._store.maximum)
+        # Drop only unborrowed private input copies. Published artifacts and
+        # every live owner remain immutable and independent of this eviction.
+        for old,slot in list(self._prediction_cache.items()):
+            if old != key and slot["leases"] == 0:
+                slot["store"].close(); del self._prediction_cache[old]
+        used = sum(s["store"].used for s in self._prediction_cache.values())
+        if key in self._prediction_cache or used+store.used > limit: return False
+        self._prediction_cache[key] = dict(store=store,inventory=inventory,statistics=statistics,leases=1)
+        return True
+
+    def _release_prediction(self,key):
+        self._assert_lease(); slot = self._prediction_cache[key]
+        require(slot["leases"] > 0, "Invalid prediction input lease release")
+        slot["leases"] -= 1
 
     def _matches(self, request):
         self._check()
@@ -243,6 +207,8 @@ class AdmittedStockMarket:
             require(self._borrows == 0, "Cannot close market with Signal borrows")
             if not self._closed:
                 self._closed = True; self._store.close()
+                for slot in self._prediction_cache.values(): slot["store"].close()
+                self._prediction_cache.clear()
                 self._native.clear(); self._blocks.clear(); self._proofs.clear()
                 self._key = self._inventory = b""
         finally:
@@ -299,7 +265,7 @@ def admit_stock_market_inputs(spec, *, source, block_sessions, limits, max_marke
                                                   execution_rules=audit.globals["profile"]["stock_execution_rules"])
             meta = store.write({"globals": audit.globals, "lifecycle": audit.lifecycle, "policy": policy,
                 "counts": audit.receipt["counts"], "descriptors": descriptors,
-                "implementation_ref": IMPLEMENTATION_REF}, source._memory)
+                "implementation_ref": IMPLEMENTATION_REF, "input_semantics":INPUT_SEMANTICS}, source._memory)
             stats = {"source_admissions": 1, "source_audit_seconds": perf_counter()-started-store.write_seconds,
                 "capture_seconds": store.write_seconds,
                 "source_operations": source.statistics["source_operations"],
@@ -375,6 +341,23 @@ def bind_stock_prediction_inputs(market, request, *, source, limits, max_signal_
         try:
             _release_source(source)
             source._file_parse_events = []; source._cjson_spool_bytes = 0
+            from .stock_owned_inputs import AdmittedStockInputs, _IMPORT, _input_key
+            key = _input_key(plan); slot = market._prediction_slot(key,max_signal_bytes)
+            if slot is not None:
+                from .stock_rules import _validate_admitted_account_policy
+                _validate_admitted_account_policy(plan["portfolio_policy"],universe=plan["scope"]["execution_universe"],
+                    rules_ref=plan["profile_input"]["stock_execution_rules_ref"])
+                stats = json.loads(canonical(slot["statistics"]))
+                stats.update(source_admissions=0,source_audit_seconds=0,capture_seconds=0,source_operations={},
+                             owned_read_bytes=0,owned_record_decodes=0,account_bindings=0,prediction_reuses=1)
+                store = slot["store"]
+                result = AdmittedStockInputs(_IMPORT,store.file,store.offsets,key,market._block_sessions,
+                    slot["inventory"],stats,market=market,projection_store=store,cache_key=key)
+                slot["leases"] += 1; market._retain()
+                market._statistics["prediction_reuses"] = market._statistics.get("prediction_reuses",0)+1
+                market._statistics["basis_reuses"] += 1
+                market._statistics["signal_bindings"] += 1
+                return result
             return _bind(market, plan, source, limits, max_signal_bytes)
         except (KeyError, IndexError, TypeError, OSError) as exc:
             raise ContractError("Malformed or unreadable fixed stock prediction: "+str(exc)) from exc
@@ -419,13 +402,13 @@ def _bind(market, plan, source, limits, maximum):
             members, member_metadata = _grid(member_view, selected[1], universe)
             member_key = selected
     try:
-        require(meta["implementation_ref"] == IMPLEMENTATION_REF, "Admitted stock implementation differs")
+        require(meta.get("input_semantics") == INPUT_SEMANTICS, "Admitted stock input semantics differ")
         validate_top_k(plan["portfolio_policy"]["top_k"], universe)
         if plan["portfolio_policy"].get("contract_version") == "stock_portfolio_policy_v4":
-            from .stock_rules import validate_full_stock_policy
+            from .stock_rules import _validate_admitted_account_policy
             require(plan["portfolio_policy"]["universe_id"] == "csi300", "admitted CSI300 market cannot authorize another membership pool")
-            validate_full_stock_policy(plan["portfolio_policy"], execution_universe=universe,
-                                       execution_rules=meta["globals"]["profile"]["stock_execution_rules"])
+            _validate_admitted_account_policy(plan["portfolio_policy"], universe=universe,
+                rules_ref=meta["globals"]["profile"]["stock_execution_rules_ref"])
         else:
             require(plan["portfolio_policy"] == {**meta["policy"], "top_k": plan["portfolio_policy"]["top_k"]},
                     "Stock portfolio policy mismatch")
@@ -458,12 +441,14 @@ def _bind(market, plan, source, limits, maximum):
                     selected = {native_by_day[kind, d] for d in days}
                     require(len(selected) == 1, "Stock block crosses native parent scope; reduce block_sessions")
                     index = next(iter(selected))
+                    if index is None:
+                        # Same immutable original batch, Snapshot and selected
+                        # scope: cold market admission already checked this exact
+                        # grid, order, cutoff, units, metadata and warmup view.
+                        continue
                     with source._memory.stage() as stage:
                         right = market._native_view(kind, days, source._memory, budget, stage)
-                        if index is None:
-                            left = right
-                        else:
-                            left, _, refs = index.batch_view(days, budget, reservation=stage)
+                        left, _, refs = index.batch_view(days, budget, reservation=stage)
                         _pair(left, right, days, universe, names)
                         if warmup:
                             _warmup_visibility(left, days, universe, names)
@@ -492,7 +477,18 @@ def _bind(market, plan, source, limits, maximum):
         require(store.used+16 <= store.maximum, "max_signal_bytes exceeds quota before index growth")
         source._memory.reserve_global(("private_offsets", id(store)), 16)
         store.offsets.extend((0, 0))
-        headers={};metadata_locations=[]
+        headers={};metadata_locations=[]; lineage={}; signal_orders={}; order_count=0
+        source._memory.reserve_global("original_order_maps",64*(len(universe)+len(calendar)))
+        source._memory.reserve_global("original_lineage_wrappers",512*sum(
+            len(frame["parents"]) if frame.get("kind") == "derived" else 1 for frame in frames))
+        security_ordinals = {s:i for i,s in enumerate(universe)}
+        feature_ordinals = {d:i for i,d in enumerate(calendar)}
+        for frame in frames:
+            originals = frame["parents"].values() if frame.get("kind") == "derived" else (frame,)
+            for original in originals:
+                ref = original["header"]["signal_run_ref"]
+                lineage[ref] = {"binding":original["item"], "header":original["header"],
+                                "spec":original["spec"], "model":original["model"]}
         if modern:
             for frame in frames:
                 reference=frame['header']['signal_run_ref'];headers[reference]=frame['header']
@@ -518,6 +514,13 @@ def _bind(market, plan, source, limits, maximum):
                                     "Original saved fold child changed after admission")
                             bindings.append(parent)
                         rows, used, refs = frame["index"].rows(("rows",), [feature], budget, reservation=stage)
+                    spans = frame["index"].groups[(('rows',),feature)]
+                    reference = frame["header"]["signal_run_ref"]
+                    order_count += len(rows)
+                    source._memory.replace_global("original_signal_order",16*order_count)
+                    packed_order = signal_orders.setdefault(reference,array("Q"))
+                    for i,row in enumerate(rows):
+                        packed_order.extend((spans[2*i],feature_ordinals[feature]*len(universe)+security_ordinals[row["security_id"]]))
                     bindings += refs
                     with source._memory.stage() as validation:
                         validation.reserve(3*(_encoded_size(frame["header"])+sum(_encoded_size(r) for r in rows)+32))
@@ -549,7 +552,20 @@ def _bind(market, plan, source, limits, maximum):
         if modern:
             from .stock_signal_inputs import prediction_targets
             receipt.update(contract_version='stock_input_audit_v2',prediction_targets=prediction_targets(frames))
-        number = store.write({"receipt": receipt, "signal_limitations": sorted({v for f in frames for v in f["header"]["limitations"]}),
+        source._memory.replace_global("original_signal_order",48*order_count)
+        orders = {}
+        for ref,values in signal_orders.items():
+            with source._memory.stage() as sorting:
+                sorting.reserve(32*len(values))
+                pairs = sorted((values[i],values[i+1]) for i in range(0,len(values),2))
+                orders[ref] = [ordinal for _,ordinal in pairs]
+                pairs = None
+        signal_orders.clear()
+        packed_order = values = None
+        source._memory.replace_global("original_signal_order",32*order_count)
+        number = store.write({"receipt": receipt, "input_semantics":INPUT_SEMANTICS,
+            "raw_lineage":lineage, "signal_orders":orders,
+            "signal_limitations": sorted({v for f in frames for v in f["header"]["limitations"]}),
             **({'signal_headers':headers,'signal_metadata_locations':metadata_locations} if modern else {})}, source._memory)
         # Place metadata at logical slot zero without moving private bytes.
         store.offsets[:2] = store.offsets[2*number:2*number+2]; del store.offsets[2*number:2*number+2]
@@ -565,7 +581,7 @@ def _bind(market, plan, source, limits, maximum):
         if modern:
             stats.update(signal_metadata_records=len(metadata_locations),signal_metadata_bytes=sum(i['length'] for i in metadata_locations))
         result = AdmittedStockInputs(_IMPORT, store.file, store.offsets, binding_key, market._block_sessions,
-                                     inventory_wire, stats, market=market)
+                                     inventory_wire, stats, market=market, projection_store=store)
         if key not in market._proofs:
             old_fixed = market._store.fixed
             try:
@@ -578,6 +594,8 @@ def _bind(market, plan, source, limits, maximum):
         else:
             market._statistics["basis_reuses"] += 1
         market._retain(); market._statistics["signal_bindings"] += 1
+        if market._cache_prediction(binding_key,store,inventory_wire,stats,maximum):
+            result._AdmittedStockInputs__cache_key = binding_key
         store = None
         return result
     finally:

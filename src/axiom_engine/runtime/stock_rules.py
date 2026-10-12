@@ -85,6 +85,23 @@ def validate_full_stock_policy(policy, *, execution_universe, execution_rules):
     return policy
 
 
+def _validate_admitted_account_policy(policy, *, universe, rules_ref):
+    """Check each policy against this owner's already admitted rule identity."""
+    from ..core.stock_strategy import validate_strategy_spec
+    from ..core.stock_rules import CSI300_ELIGIBILITY, CANDIDATE_POLICY
+    validate_top_k(policy.get("top_k"), universe)
+    common = dict(top_k=policy["top_k"], rebalance="weekly_first_trading_session", budget_basis=BUDGET_BASIS,
+                  candidate_policy=CANDIDATE_POLICY, stock_execution_rules_ref=rules_ref)
+    if policy.get("contract_version") == "stock_portfolio_policy_v4":
+        spec = policy.get("strategy_spec"); validate_strategy_spec(spec)
+        require(spec["top_k"] == policy["top_k"], "Stock strategy capacity mismatch")
+        expected = dict(contract_version="stock_portfolio_policy_v4", eligibility_id="pit_a_share_strategy_v1",
+            universe_id="csi300", strategy_spec=spec, strategy_spec_ref=Document.from_dict(spec).identity, **common)
+    else: expected = dict(eligibility_id=CSI300_ELIGIBILITY, **common)
+    require(policy == expected, "Stock account policy differs from admitted pool/rules")
+    return policy
+
+
 def portfolio_support_ref(policy, universe):
     from ..core.stock_rules import support_ref
     return (strategy_support_ref(universe, policy["universe_id"])

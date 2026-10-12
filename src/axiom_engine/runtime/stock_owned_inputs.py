@@ -1,8 +1,8 @@
 """Process-local, bounded ownership of fully admitted stock execution inputs.
 
-The private temporary file is not an artifact or a persisted admission flag.
-It has no published path and no writer after import. Each account receives
-fresh decoded blocks, while original canonical sources are consumed once.
+Private captures and checked immutable artifacts use the same source owner.
+Each account receives fresh decoded blocks; closing its lease releases the
+market borrow, and the market owns any bounded prediction cache until close.
 """
 from array import array
 from contextlib import contextmanager
@@ -21,28 +21,37 @@ _IMPORT = object()
 
 
 def _input_key(plan):
-    # Every other manifest field remains bound, including non-TopK policy,
-    # profile/fees/rules, clock/action policy, scope, all original refs and
-    # their exact ArtifactRef envelopes. Locations retain their existing
-    # delivery-only semantics; this owner never opens a replacement path.
-    value = identity_view(plan)
-    for name in ("request_ref", "account_id", "initial_account"):
-        value.pop(name)
-    value["portfolio_policy"].pop("top_k")
+    from .stock_input_store import INPUT_SEMANTICS
+    # Explicit input selection identity. Account policy is checked separately
+    # on every call; it cannot choose another pool, clock or source through this
+    # key. Original raw/derived bindings and exact ArtifactRef envelopes remain.
+    value = identity_view({name:plan[name] for name in
+        ("scope","profile_input","market_input","prediction_input","stock_action_policy","clock_policy")})
+    if "action_facts_artifact" in plan:
+        from .stock_stream_contracts import artifact_identity
+        value["action_facts_artifact"] = artifact_identity(plan["action_facts_artifact"])
+    # The request owner validates this optional independent dependency. Keep
+    # its complete envelope conservatively until its exact relocation ABI is
+    # published; a risk-ref change must never reuse prediction admission.
+    for name in ("risk_input","risk_input_ref"):
+        if name in plan: value[name] = plan[name]
+    value["input_semantics"] = INPUT_SEMANTICS
     return canonical(value).encode("utf-8")
 
 
 class AdmittedStockInputs(StockInputSource):
     """Opaque sequential-account source; construct only with admit_stock_inputs.
 
-    close()/context-manager exit release the private store. No account can
+    close()/context-manager exit release this input lease. No account can
     mutate a later account's inputs through its decoded globals or blocks.
     """
-    def __init__(self, token, store, offsets, key, block_sessions, inventory, statistics, *, market=None):
+    def __init__(self, token, store, offsets, key, block_sessions, inventory, statistics, *, market=None, projection_store=None, cache_key=None):
         require(token is _IMPORT, "Use admit_stock_inputs; admission flags are unsupported")
         super().__init__()
         self.__owner_pid = os.getpid()
         self.__store = store
+        self.__projection_store = projection_store
+        self.__cache_key = cache_key
         self.__offsets = offsets
         self.__key = key
         self.__block_sessions = block_sessions
@@ -81,6 +90,12 @@ class AdmittedStockInputs(StockInputSource):
         plan = validate_manifest(manifest)
         validate_top_k(plan["portfolio_policy"]["top_k"], plan["scope"]["execution_universe"])
         require(_input_key(plan) == self.__key, "Stock inputs differ from the complete admitted capability")
+        from .stock_rules import _validate_admitted_account_policy
+        _validate_admitted_account_policy(plan["portfolio_policy"], universe=plan["scope"]["execution_universe"],
+            rules_ref=plan["profile_input"]["stock_execution_rules_ref"])
+        from .._implementation import IMPLEMENTATION_REF
+        require(all(frame.get("kind") != "derived" or frame["implementation_ref"] == IMPLEMENTATION_REF
+                    for frame in plan["prediction_input"]["frames"]), "Derived input implementation differs")
         return plan
 
     def __owner(self):
@@ -105,6 +120,11 @@ class AdmittedStockInputs(StockInputSource):
 
     def __read(self, number, budget):
         self.__owner()
+        if self.__projection_store is not None:
+            value, stage = self.__projection_store._read_record(number, self._memory, budget)
+            self.__statistics["owned_read_bytes"] += self.__offsets[2*number+1]
+            self.__statistics["owned_record_decodes"] += 1
+            return value, stage
         start, length = self.__offsets[2*number:2*number+2]
         stage = self._memory.stage()
         try:
@@ -147,11 +167,15 @@ class AdmittedStockInputs(StockInputSource):
         stage.close()
         self._memory.reserve_global("owned_globals", size)
         receipt = meta["receipt"]
-        require(receipt["implementation_ref"] == implementation_ref, "Admitted stock implementation differs")
+        from .stock_input_store import INPUT_SEMANTICS
+        require(meta.get("input_semantics") == INPUT_SEMANTICS, "Admitted stock input semantics differ")
         require(all(receipt["counts"][name] <= limits["max_"+name]
                     for name in ("market_rows", "prediction_rows")), "Admitted stock actual row limit exceeded")
         receipt["request_ref"] = plan["request_ref"]
-        self._prepared = {'request_ref':plan['request_ref'],'signal_headers':meta.get('signal_headers',{})}
+        receipt["implementation_ref"] = implementation_ref
+        self._prepared = {'request_ref':plan['request_ref'],'signal_headers':meta.get('signal_headers',{}),
+            'raw_lineage':meta.get('raw_lineage',{}), 'signal_orders':meta.get('signal_orders',{}),
+            'signal_metadata_locations':meta.get('signal_metadata_locations',[])}
         self.__statistics["account_bindings"] += 1
         if self.__market is None:
             globals_value, lifecycle = meta["globals"], meta["lifecycle"]
@@ -218,10 +242,13 @@ class AdmittedStockInputs(StockInputSource):
                 if self.__market is not None:
                     with self.__market._scope():
                         self.__market._release()
+                        if self.__cache_key is not None: self.__market._release_prediction(self.__cache_key)
                     if self.__owns_market:
                         self.__market_final_stats = self.__market.statistics
                 self.__closed = True
-                self.__store.close()
+                if self.__cache_key is None:
+                    if self.__projection_store is None: self.__store.close()
+                    else: self.__projection_store.close()
                 self.__offsets = array("Q")
                 self.__key = self.__inventory = b""
                 self._memory = self._prepared = None
