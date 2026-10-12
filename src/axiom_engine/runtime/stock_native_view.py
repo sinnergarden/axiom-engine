@@ -263,7 +263,7 @@ class _NativeIndex:
             if close is not None: close()
             self._drop_pending()
 
-    def batch_view(self, days, budget, *, reservation):
+    def batch_view(self, days, budget, *, reservation, _borrowed=False):
         self.unchanged()
         require(reservation.memory is self.source._memory, 'One native decoded budget required')
         if self._event:
@@ -277,8 +277,8 @@ class _NativeIndex:
             if self._cache_stage is not None: self._cache_stage.close()
             self._cache_stage = self.source._memory.stage(); stage = self._cache_stage
             stage.reserve(3*_encoded_size([self.header(), self.batch['field_meta']])+1024)
-            window = {'context':deepcopy(self.header()), 'records':[],
-                'field_meta':{n:{**deepcopy(h),'by_key':[]} for n,h in self.batch['field_meta'].items()}}
+            window = {'context':self.header(), 'records':[],
+                'field_meta':{n:{**h,'by_key':[]} for n,h in self.batch['field_meta'].items()}}
             ordinals = []; parts = {}; wanted = set(days)
             while True:
                 if self._pending is None or self._position == len(self._pending['records']):
@@ -298,10 +298,15 @@ class _NativeIndex:
                 'ordinals':ordinals, 'parts':list(parts.values())}]
             stage.reserve(3*_encoded_size(refs)+512)
             self._cache = window, refs; self._cache_days = days
-        used = 3*_encoded_size(self._cache)+512
+            self._cache_used = 3*_encoded_size(self._cache)+512
+        used = self._cache_used
         reservation.reserve(used)
-        view, bindings = deepcopy(self._cache)
+        view, bindings = self._cache if _borrowed else deepcopy(self._cache)
         return view, used, bindings
+
+    def _borrow_view(self, days, budget, *, reservation):
+        """Invocation-private read-only window; no borrower outlives capture."""
+        return self.batch_view(days,budget,reservation=reservation,_borrowed=True)
 
     def close(self):
         self.source._check()

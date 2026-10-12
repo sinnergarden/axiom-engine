@@ -60,10 +60,15 @@ def _membership_index(batch, *, universe, calendar, identities):
     return _membership_rows(batch, universe=universe, calendar=calendar, identities=identities)
 
 
-def _membership_rows(batch, *, universe, calendar, identities):
+def _membership_rows(batch, *, universe, calendar, identities, _grid=None):
     """Admit source observations; carried membership is not listing evidence."""
     require(set(identities) == set(universe), "complete stock membership identity union required")
-    rows, meta = {}, {}
+    rows, meta = ({}, {}) if _grid is None else (_grid[0], _grid[1]["is_member"])
+    if _grid is not None:
+        for (day, security), row in rows.items():
+            require(type(row["is_member"]) is bool, "missing PIT stock member flag")
+            require(_visible(meta[day,security],day+"T20:30:00+08:00"), "unavailable PIT stock member flag")
+        return rows
     for native in batch["records"]:
         key = native["session"], native["security_id"]
         require(key not in rows and type(native["is_member"]) is bool, "duplicate or missing PIT stock member flag")
@@ -105,16 +110,18 @@ def _stock_metadata(batch, name, keys=("session", "security_id")):
 
 
 def _project_stock_rows(*, batches, universe, calendar, identities, source_refs,
-                        membership_batch=None, expanded=False, lifecycle_owner_ref=None):
+                        membership_batch=None, expanded=False, lifecycle_owner_ref=None, _grids=None):
     """Project admitted original row views with the same v6 visibility rules."""
     states, prices, limits, factors = batches
     full = identities is not None
-    members = (_membership_rows(membership_batch, universe=universe, calendar=calendar, identities=identities)
+    members = (_membership_rows(membership_batch, universe=universe, calendar=calendar, identities=identities,
+                _grid=None if _grids is None else _grids["membership"])
                if full else None)
-    p, s, l, f = map(_keyed_stock, (prices, states, limits, factors))
-    meta = {name: _stock_metadata(batch, native) for name, batch, native in
-        (("open", prices, "open"), ("close", prices, "close"), ("volume_shares", prices, "volume_shares"),
-         ("limit_up", limits, "up_limit"), ("limit_down", limits, "down_limit"), ("market_state", states, "market_state"))}
+    p, s, l, f = (map(_keyed_stock, (prices, states, limits, factors)) if _grids is None else
+                  (_grids[k][0] for k in ("market","states","limits","factor")))
+    meta = {name: (_stock_metadata(batch, native) if _grids is None else _grids[kind][1][native]) for name, batch, native, kind in
+        (("open", prices, "open","market"), ("close", prices, "close","market"), ("volume_shares", prices, "volume_shares","market"),
+         ("limit_up", limits, "up_limit","limits"), ("limit_down", limits, "down_limit","limits"), ("market_state", states, "market_state","states"))}
     rows = []
     ended = set()
     for day in calendar:
@@ -159,8 +166,8 @@ def _project_stock_rows(*, batches, universe, calendar, identities, source_refs,
             rows.append(row)
     if expanded:
         require(full and membership_batch is not None, "expanded stock rows need original membership")
-        factor_meta = _stock_metadata(factors, "factor")
-        close_meta = _stock_metadata(prices, "close")
+        factor_meta = _stock_metadata(factors,"factor") if _grids is None else _grids["factor"][1]["factor"]
+        close_meta = _stock_metadata(prices,"close") if _grids is None else _grids["market"][1]["close"]
         rows = [{**row, "_stock_listed": _stock_lifecycle_active(identities[row["security_id"]], row["session"],
             row["market_state"], meta["market_state"][row["session"], row["security_id"]]),
             "_stock_factor_valid": f[row["session"], row["security_id"]]["factor"] is not None,

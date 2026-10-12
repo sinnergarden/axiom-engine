@@ -130,3 +130,37 @@ zero numeric tolerance. Only declared source/output provenance and run-prefix ID
 are normalized. Complete finite/Unknown/depth/canonical-byte and original business
 gates remain in use; no Data/Research/Feature/fit/predict/supplier calls occurred.
 No private account metrics or original locations are reproduced here.
+
+
+## 2026-10-12 input reuse synthetic probe
+
+One probe used 606 synthetic securities, 32 calendar sessions and 18,786 raw-v3
+prediction rows, with primary Top5 rank-buffer keep10 and control Top5. It made
+no real Data queries, supplier calls, fit/predict calls or real account runs.
+It ran before final snapshot validation and review corrections. The numbers
+below are measurements of that probe, not performance acceptance of the final
+source head or of the seven-year workload. The probe was not repeated.
+
+| Stage | Seconds |
+|---|---:|
+| Synthetic fixture save | 2.089 |
+| Native cold | 0.635 |
+| Market cold | 7.869 |
+| Prediction cold | 5.696 |
+| Prepared input save | 0.029 |
+| Market reopen | 1.843 |
+| Prediction reopen | 1.140 |
+| Primary account and result load | 1.278 |
+| Second prediction reuse | 0.006 |
+| Control account and result load | 1.324 |
+
+The second strategy had zero original prediction admissions or captures.
+The store wrote 24 records and 10,063,556 packed bytes. The observed macOS
+process peak RSS was 637,124,608 bytes. RSS is distinct from canonical decoded
+byte accounting. Original raw-v2 business comparisons and the fresh-process,
+raw-v3/Derived, held-equity/lifecycle and corruption checks use small fixtures.
+
+The first-market target of at most 600 seconds, warm market/prediction preparation
+target of at most 60 seconds and full seven-year business equivalence still need
+coordinator-authorized real acceptance. Research publishing was about 595 seconds
+in the earlier workload and remains a separate critical path.

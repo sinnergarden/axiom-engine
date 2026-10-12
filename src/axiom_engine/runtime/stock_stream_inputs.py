@@ -169,8 +169,8 @@ def _object_size(parts):
 
 
 def _encoded_size(value):
-    from .stock_stream_outputs import _json_pieces
-    return sum(len(piece) for piece in _json_pieces(value, piece_chars=64))
+    from .stock_input_store import encoded_size
+    return encoded_size(value)
 
 
 def _path(artifact, *, must_exist=True):
@@ -1039,6 +1039,12 @@ class StockInputSource:
 
     def _native(self, role, kind, days, budget, *, reservation=None):
         """Read original sections once each; multiple query files may share a role."""
+        window = self._prepared.get("_window")
+        if role == "execution" and window is not None and tuple(days) == window["days"]:
+            value,_,bindings = window["views"][kind]
+            used = _encoded_size(bindings)
+            reservation.reserve(used)
+            return value,used,bindings
         selected = {}
         for day in days:
             entry = self._prepared["native_by_day"].get((role, kind, day))
@@ -1046,7 +1052,8 @@ class StockInputSource:
             selected.setdefault(entry, []).append(day)
         require(len(selected) == 1, "Stock block crosses native parent scope; reduce block_sessions")
         index, selected_days = next(iter(selected.items()))
-        return index.batch_view(selected_days, budget, reservation=reservation)
+        reader = index._borrow_view if getattr(self,"_sharing_native_views",False) and hasattr(index,"_borrow_view") else index.batch_view
+        return reader(selected_days, budget, reservation=reservation)
 
     def _block(self, manifest, days, budget):
         from .stock_market import _project_stock_rows
@@ -1060,12 +1067,15 @@ class StockInputSource:
             # Bound both the original projection and expanded-row construction
             # while original native rows are still live.  This is a conservative
             # byte bound, not a numeric or execution-policy approximation.
-            upper = 2*native_used + 1024*len(days)*len(manifest["scope"]["execution_universe"])
+            window = prepared.get("_window")
+            source_size = native_used if window is None else window["bytes"]
+            upper = 2*source_size + 1024*len(days)*len(manifest["scope"]["execution_universe"])
             stage.reserve(upper)
             rows = _project_stock_rows(batches=batches[:4], universe=manifest["scope"]["execution_universe"],
                 calendar=list(days), identities=prepared["rules_index"][0], source_refs=prepared["source_refs"],
                 membership_batch=batches[4], expanded=True,
-                lifecycle_owner_ref=prepared["native_by_day"]["execution", "states", days[0]].content_digest)
+                lifecycle_owner_ref=prepared["native_by_day"]["execution", "states", days[0]].content_digest,
+                _grids=None if window is None else window["grids"])
             row_bytes = sum(_encoded_size(row) for row in rows)
             require(row_bytes <= upper, "Stock projection exceeds reserved decoded growth bound")
             stage.release(upper); stage.reserve(row_bytes)
@@ -1328,6 +1338,25 @@ def _frames(source, manifest, budget, *, require_coverage=True, raw_only=False):
     return frames, trade_map
 
 
+@contextmanager
+def _stock_window(source, days, budget, universe):
+    """One invocation-private read-only original window and its keyed grids."""
+    views, grids = {}, {}
+    with source._memory.stage() as stage:
+        try:
+            for kind in ("states","market","limits","factor","membership"):
+                view,used,bindings = source._native("execution",kind,days,budget,reservation=stage)
+                stage.reserve(64*(len(view["records"])+sum(len(f["by_key"]) for f in view["field_meta"].values())))
+                views[kind] = view,used,bindings
+                grids[kind] = _grid(view,days,universe)
+            source._prepared["_window"] = {"days":tuple(days),"views":views,"grids":grids,
+                "bytes":sum(value[1] for value in views.values())}
+            yield
+        finally:
+            source._prepared.pop("_window",None)
+            view = bindings = None; views.clear(); grids.clear()
+
+
 def _audit(source, manifest, block_sessions, budget, limits, implementation_ref, *, market_only=False, capture=None):
     from .stock_stream_contracts import validate_manifest, validate_limits, check_inventory_rows, resolve_prediction_inventory
     from .stock_market import _project_stock_actions, _visible
@@ -1353,6 +1382,7 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
     source._file_parse_events = []; source._cjson_spool_bytes = 0
     source._memory = _DecodedMemory(budget["max_decoded_bytes"], scalar_cache_bytes=source._scalar_cache_bytes)
     source._memory.reserve_global(("request", manifest["request_ref"]), _encoded_size(manifest))
+    source._sharing_native_views = market_only
     source._inventory_sizes = {str(_path(item["artifact"])) if "artifact" in item else item["manifest_uri"]: item["file_bytes"]
                                for item in inventory["files"]}
     source._scan_row_limits = {}
@@ -1426,98 +1456,98 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
         ended = set()
         for offset in range(0, len(calendar), block_sessions):
             days = tuple(calendar[offset:offset+block_sessions])
-            # Pair original price/factor/member facts and provenance, not synthetic PASS flags.
-            for kind, names in (("market", ("open", "high", "low", "close", "volume_shares", "amount_cny")),
-                                ("factor", ("factor",)), ("membership", ("is_member",))):
-                with source._memory.stage() as stage:
-                    if market_only:
-                        right, _, right_bindings = source._native("execution", kind, days, budget, reservation=stage)
-                        _grid(right, days, universe)
-                        capture("native", (kind, days), {"view": right, "bindings": right_bindings}, stage)
-                    else:
-                        left, _, left_bindings = source._native("prediction_basis", kind, days, budget, reservation=stage)
-                        right, _, right_bindings = source._native("execution", kind, days, budget, reservation=stage)
-                        _pair(left, right, days, universe, names)
-                        del left, left_bindings
-                    del right, right_bindings
-            with source._memory.stage() as stage:
-                factor, _, factor_bindings = source._native("execution", "factor", days, budget, reservation=stage)
-                frows, fmeta = _grid(factor, days, universe)
-                from .stock_market import _stock_lifecycle_active
-                state, _, state_bindings = source._native("execution", "states", days, budget, reservation=stage)
-                srows, smeta = _grid(state, days, universe)
-                require(factor["field_meta"]["factor"]["unit"] == "dimensionless", "Unexpected stock factor unit")
-                for day in days:
-                    for security in universe:
-                        key = day, security; value = frows[key]["factor"]; metadata = fmeta["factor"][key]
-                        if value is None:
-                            require(bool(metadata.get("missing_reason")), "Null stock factor requires native missing reason")
-                            source._memory.replace_global(("previous_factor", security), _encoded_size({security: None}))
-                            previous_factor[security] = None
+            with _stock_window(source,days,budget,universe) if market_only else nullcontext():
+                # Pair original price/factor/member facts and provenance, not synthetic PASS flags.
+                for kind, names in (("market", ("open", "high", "low", "close", "volume_shares", "amount_cny")),
+                                    ("factor", ("factor",)), ("membership", ("is_member",))):
+                    with source._memory.stage() as stage:
+                        if market_only:
+                            right, _, right_bindings = source._native("execution", kind, days, budget, reservation=stage)
+                            capture("native", (kind, days), {"view": right, "bindings": right_bindings}, stage)
                         else:
-                            require(_visible(metadata, day+"T20:30:00+08:00") and
-                                    decimal(str(value), minimum=0) > 0, "Unavailable/invalid original stock factor")
-                            if not _stock_lifecycle_active(rules_index[0][security], day,
-                                    srows[key]["market_state"], smeta["market_state"][key]):
+                            left, _, left_bindings = source._native("prediction_basis", kind, days, budget, reservation=stage)
+                            right, _, right_bindings = source._native("execution", kind, days, budget, reservation=stage)
+                            _pair(left, right, days, universe, names)
+                            del left, left_bindings
+                        del right, right_bindings
+                with source._memory.stage() as stage:
+                    factor, _, factor_bindings = source._native("execution", "factor", days, budget, reservation=stage)
+                    frows, fmeta = source._prepared["_window"]["grids"]["factor"] if market_only else _grid(factor, days, universe)
+                    from .stock_market import _stock_lifecycle_active
+                    state, _, state_bindings = source._native("execution", "states", days, budget, reservation=stage)
+                    srows, smeta = source._prepared["_window"]["grids"]["states"] if market_only else _grid(state, days, universe)
+                    require(factor["field_meta"]["factor"]["unit"] == "dimensionless", "Unexpected stock factor unit")
+                    for day in days:
+                        for security in universe:
+                            key = day, security; value = frows[key]["factor"]; metadata = fmeta["factor"][key]
+                            if value is None:
+                                require(bool(metadata.get("missing_reason")), "Null stock factor requires native missing reason")
                                 source._memory.replace_global(("previous_factor", security), _encoded_size({security: None}))
                                 previous_factor[security] = None
-                                continue
-                            old = previous_factor.get(security)
-                            if old is not None and old != value:
-                                size = _object_size([(name, _encoded_size(item)) for name, item in (
-                                    ("security_id", security), ("effective_session", day), ("available_at", metadata["usable_from"]),
-                                    ("reason", "UNEXPLAINED_FACTOR_CHANGE"), ("source_refs", [source_refs[3]]))])
-                                source._memory.reserve_global(("factor_block", security, day), size)
-                                item = {"security_id": security, "effective_session": day,
-                                        "available_at": metadata["usable_from"], "reason": "UNEXPLAINED_FACTOR_CHANGE", "source_refs": [source_refs[3]]}
-                                factor_blocks.append(item)
-                            source._memory.replace_global(("previous_factor", security), _encoded_size({security: value}))
-                            previous_factor[security] = value
-                del factor, frows, fmeta, factor_bindings, metadata, state, state_bindings, srows, smeta
-            block = source._block(manifest, days, budget)
-            try:
-                market_rows += len(block.market_rows)
-                require(market_rows <= limits["max_market_rows"], "Stock market row budget exceeded")
-                for row in block.market_rows.values():
-                    security = row["security_id"]
-                    require(not row["_stock_listed"] or security not in ended,
-                            "native lifecycle reopens a delisted canonical identity: " + security + "/" + row["session"])
-                    if row["market_state"] == "delisted" and security not in ended:
-                        source._memory.reserve_global(("delisted", security), _encoded_size(security)+128)
-                        ended.add(security)
-                    if row["session"] < rules_index[0][row["security_id"]]["listing_date"]:
-                        lifecycle["pre_listing_null"] += 1
-                    elif row["_stock_listed"] and (not row["_stock_factor_valid"] or
-                            any(row[name] is None for name in ("open", "close", "volume_shares", "limit_up", "limit_down"))):
-                        lifecycle["member_gap" if row["_stock_member"] else "listed_nonmember_gap"] += 1
-                row = None
-                if market_only:
-                    capture("block", days, block, block._reservation)
-                for trade, (header, indexed) in block.signals.items():
-                    feature = trade_map[trade][1]
-                    with source._memory.stage() as stage:
-                        validation_bytes = 3*(_encoded_size(header) + sum(_encoded_size(row) for row in indexed.values()) + 32)
-                        stage.reserve(validation_bytes)
-                        # Reading view only; the original parent identity was checked above.
-                        validated_wire = checked = membership = members = member_metadata = member_bindings = None
-                        try:
-                            from .stock_signal_inputs import check_day_rows
-                            checked=check_day_rows(trade_map[trade][0],feature,list(indexed.values()))
-                            require(len(checked) == len(universe), "Incomplete original saved prediction date group")
-                            membership, _, member_bindings = source._native("execution", "membership", [feature], budget, reservation=stage)
-                            members, member_metadata = _grid(membership, [feature], universe)
-                            from .stock_signal_inputs import validate_day
-                            validate_day(trade_map[trade][0],feature,checked,members,member_metadata,
-                                         source._prepared['native_by_day']['execution','membership',feature].content_digest)
-                            prediction_rows += len(checked)
-                            require(prediction_rows <= limits["max_prediction_rows"], "Stock prediction row budget exceeded")
-                        finally:
-                            validated_wire = checked = membership = members = member_metadata = member_bindings = row = None
-            finally:
-                row = header = indexed = None
-                reservation = block._reservation
-                block = None
-                reservation.close()
+                            else:
+                                require(_visible(metadata, day+"T20:30:00+08:00") and
+                                        decimal(str(value), minimum=0) > 0, "Unavailable/invalid original stock factor")
+                                if not _stock_lifecycle_active(rules_index[0][security], day,
+                                        srows[key]["market_state"], smeta["market_state"][key]):
+                                    source._memory.replace_global(("previous_factor", security), _encoded_size({security: None}))
+                                    previous_factor[security] = None
+                                    continue
+                                old = previous_factor.get(security)
+                                if old is not None and old != value:
+                                    size = _object_size([(name, _encoded_size(item)) for name, item in (
+                                        ("security_id", security), ("effective_session", day), ("available_at", metadata["usable_from"]),
+                                        ("reason", "UNEXPLAINED_FACTOR_CHANGE"), ("source_refs", [source_refs[3]]))])
+                                    source._memory.reserve_global(("factor_block", security, day), size)
+                                    item = {"security_id": security, "effective_session": day,
+                                            "available_at": metadata["usable_from"], "reason": "UNEXPLAINED_FACTOR_CHANGE", "source_refs": [source_refs[3]]}
+                                    factor_blocks.append(item)
+                                source._memory.replace_global(("previous_factor", security), _encoded_size({security: value}))
+                                previous_factor[security] = value
+                    del factor, frows, fmeta, factor_bindings, metadata, state, state_bindings, srows, smeta
+                block = source._block(manifest, days, budget)
+                try:
+                    market_rows += len(block.market_rows)
+                    require(market_rows <= limits["max_market_rows"], "Stock market row budget exceeded")
+                    for row in block.market_rows.values():
+                        security = row["security_id"]
+                        require(not row["_stock_listed"] or security not in ended,
+                                "native lifecycle reopens a delisted canonical identity: " + security + "/" + row["session"])
+                        if row["market_state"] == "delisted" and security not in ended:
+                            source._memory.reserve_global(("delisted", security), _encoded_size(security)+128)
+                            ended.add(security)
+                        if row["session"] < rules_index[0][row["security_id"]]["listing_date"]:
+                            lifecycle["pre_listing_null"] += 1
+                        elif row["_stock_listed"] and (not row["_stock_factor_valid"] or
+                                any(row[name] is None for name in ("open", "close", "volume_shares", "limit_up", "limit_down"))):
+                            lifecycle["member_gap" if row["_stock_member"] else "listed_nonmember_gap"] += 1
+                    row = None
+                    if market_only:
+                        capture("block", days, block, block._reservation)
+                    for trade, (header, indexed) in block.signals.items():
+                        feature = trade_map[trade][1]
+                        with source._memory.stage() as stage:
+                            validation_bytes = 3*(_encoded_size(header) + sum(_encoded_size(row) for row in indexed.values()) + 32)
+                            stage.reserve(validation_bytes)
+                            # Reading view only; the original parent identity was checked above.
+                            validated_wire = checked = membership = members = member_metadata = member_bindings = None
+                            try:
+                                from .stock_signal_inputs import check_day_rows
+                                checked=check_day_rows(trade_map[trade][0],feature,list(indexed.values()))
+                                require(len(checked) == len(universe), "Incomplete original saved prediction date group")
+                                membership, _, member_bindings = source._native("execution", "membership", [feature], budget, reservation=stage)
+                                members, member_metadata = _grid(membership, [feature], universe)
+                                from .stock_signal_inputs import validate_day
+                                validate_day(trade_map[trade][0],feature,checked,members,member_metadata,
+                                             source._prepared['native_by_day']['execution','membership',feature].content_digest)
+                                prediction_rows += len(checked)
+                                require(prediction_rows <= limits["max_prediction_rows"], "Stock prediction row budget exceeded")
+                            finally:
+                                validated_wire = checked = membership = members = member_metadata = member_bindings = row = None
+                finally:
+                    row = header = indexed = None
+                    reservation = block._reservation
+                    block = None
+                    reservation.close()
         warmup = manifest["market_input"]["warmup_sessions"]
         for day in warmup:
             for kind, names in (("market", ("open", "high", "low", "close", "volume_shares", "amount_cny")), ("factor", ("factor",))):
