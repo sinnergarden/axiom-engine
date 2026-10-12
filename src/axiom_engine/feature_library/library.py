@@ -180,6 +180,14 @@ def _partition_arrays(store, part):
     return arrays
 
 
+def _partition_buffer_paths(part):
+    for descriptor in part['buffers'].values():
+        if 'path' in descriptor: yield descriptor['path']
+        elif descriptor['encoding']=='dense': yield descriptor['buffer']['path']
+        elif descriptor['encoding']=='sparse_zero':
+            yield descriptor['indices']['path']; yield descriptor['values']['path']
+
+
 class FeatureLibrary:
     """One local cache root; immutable records are authoritative, index rebuildable."""
     def __init__(self, root, *, maximum_source_bytes=8*1024**3, maximum_working_bytes=512*1024**2,
@@ -358,12 +366,12 @@ class FeatureLibrary:
                 del result, arrays, inputs
             require(len(final_hits)==len(coverage['sessions'])*len(coverage['definitions']),
                     'Feature coverage remains incomplete')
+            if self._session is not None: self._session['store'].validate_boundary()
             view = compact_view(coverage, final_hits)
             descriptor = write_part(self.root, view, 'view_ref')
             self._publish_index(shards)
             stats['coverage_root_writes']=1
             if self._session is not None:
-                self._session['store'].check()
                 stats['admission_file_hash_calls']=admitted.metrics['file_hash_calls']-baseline['file_hash_calls']
                 stats['admission_hash_bytes']=admitted.metrics['hash_bytes']-baseline['hash_bytes']
             return descriptor, stats
@@ -408,6 +416,7 @@ class FeatureView:
                     all(is_ref(r) for r in part['semantic_refs'].values()) and
                     all(is_ref(r) for r in part['dependency_refs'].values()), 'view partition coverage mismatch')
             parts[ref]=part
+        else: store.check_path(partition_descriptor(desc)['path'])
         part=parts[ref]
         require(part['sessions']==[day] and column in part['columns'] and
                 part['semantic_refs'][column]==self._view['definitions'][column]['semantic_ref'],
@@ -424,100 +433,113 @@ class FeatureView:
         bytes and content refs are admitted before returning their receipts;
         source eligibility/PIT remains the source adapter's responsibility.
         """
-        self._store.check()
-        columns=list(self._view['columns'] if columns is None else columns)
-        require(bool(columns) and len(columns)==len(set(columns)) and
-                all((session,c) in self._tiles for c in columns), 'Feature receipt selection outside view')
-        cached=all(self._tiles[session,c]['partition_ref'] in self._parts for c in columns)
-        # Planning years of dependencies must not accumulate every date's
-        # metadata in one owner and repeatedly stat all previous parents. Reuse
-        # projected parents, otherwise admit this day's receipts in a bounded
-        # metadata epoch; original array admission still happens in project().
-        owner=(nullcontext(self._store) if cached else VerifiedMatrixStore(
-            maximum_source_bytes=self._store.maximum_source_bytes,
-            maximum_matrix_bytes=self._store.maximum_matrix_bytes,
-            maximum_parent_bytes=self._store.maximum_parent_bytes))
-        result={}
-        with owner as store:
-            parts=self._parts if cached else {}
-            for column in columns:
-                part=self._partition(session,column,store=store,parts=parts)
-                result[column]={'semantic_ref':part['semantic_refs'][column],
-                    'dependency_ref':part['dependency_refs'][column],
-                    'source_bindings':deepcopy(part['column_source_bindings'][column]),
-                    'partition':partition_descriptor(self._tiles[session,column])}
-        self._store.check()
-        return result
+        with self.operation():
+            columns=list(self._view['columns'] if columns is None else columns)
+            require(bool(columns) and len(columns)==len(set(columns)) and
+                    all((session,c) in self._tiles for c in columns), 'Feature receipt selection outside view')
+            cached=all(self._tiles[session,c]['partition_ref'] in self._parts for c in columns)
+            # Planning years of dependencies must not accumulate every date's
+            # metadata in one owner and repeatedly stat all previous parents. Reuse
+            # projected parents, otherwise admit this day's receipts in a bounded
+            # metadata epoch; original array admission still happens in project().
+            owner=(nullcontext(self._store) if cached else VerifiedMatrixStore(
+                maximum_source_bytes=self._store.maximum_source_bytes,
+                maximum_matrix_bytes=self._store.maximum_matrix_bytes,
+                maximum_parent_bytes=self._store.maximum_parent_bytes))
+            result={}
+            with owner as store, store.operation():
+                parts=self._parts if cached else {}
+                for column in columns:
+                    part=self._partition(session,column,store=store,parts=parts)
+                    result[column]={'semantic_ref':part['semantic_refs'][column],
+                        'dependency_ref':part['dependency_refs'][column],
+                        'source_bindings':deepcopy(part['column_source_bindings'][column]),
+                        'partition':partition_descriptor(self._tiles[session,column])}
+            return result
 
     @property
     def identity(self): return self._view['view_ref']
 
+    @contextmanager
+    def operation(self):
+        """Keep an adapter's actual consumption and publication in one lease."""
+        with self._store.operation():
+            self._store.check_path(self.descriptor['path'])
+            yield self
+
+    def validate_boundary(self):
+        """Explicit publication check; outside a lease checks the whole owner."""
+        self._store.check_path(self.descriptor['path'])
+        self._store.validate_boundary()
+
     def describe(self):
         """Stable reference, stages, physical/sample coverage and projection abilities."""
-        self._store.check()
-        return {'contract_version':'feature_view_capabilities_v1', 'view_ref':self.identity,
-            **deepcopy({k:self._view[k] for k in ('sessions','security_ids','sample_universe','columns','definitions')}),
-            'complete':True, 'supports_projection':True, 'missing_values_preserved':True}
+        with self.operation():
+            return {'contract_version':'feature_view_capabilities_v1', 'view_ref':self.identity,
+                **deepcopy({k:self._view[k] for k in ('sessions','security_ids','sample_universe','columns','definitions')}),
+                'complete':True, 'supports_projection':True, 'missing_values_preserved':True}
 
     def project(self, keys=None, columns=None):
         """Return owned readonly packed arrays in requested key/column order."""
         import numpy as np
-        self._store.check(); view = self._view
-        columns = list(view['columns'] if columns is None else columns)
-        require(bool(columns) and len(columns) == len(set(columns)) and set(columns) <= set(view['columns']),
-                'ordered unique Feature columns required')
-        keys = ([(s,d) for d in view['sessions'] for s in view['sample_universe']] if keys is None else list(keys))
-        require(bool(keys) and len(set(keys)) == len(keys) and all(s in view['security_ids'] and d in view['sessions'] for s,d in keys),
-                'unique keys inside fixed Feature view required')
-        shape = len(keys), len(columns)
-        require(len(keys)*len(columns)*50 <= self._store.maximum_matrix_bytes, 'Feature projection budget exceeded')
-        out = {name:np.zeros(shape, dtype='bool' if name == 'validity' else 'float64' if name == 'values'
-                           else 'int64' if name == 'available_at_utc_us' else 'int32') for name in ARRAYS}
-        reasons = [None]; source_sets = [[]]; bindings = {}; used = {}
-        targets={}
-        for i,(_,day) in enumerate(keys): targets.setdefault(day,[]).append(i)
-        tiles=self._tiles
-        for day,target in targets.items():
-            for j, column in enumerate(columns):
-                desc = tiles[day,column]; ref = desc['partition_ref']
-                if ref not in used:
-                    part = self._partition(day,column)
-                    if ref not in self._loaded: self._loaded[ref] = _partition_arrays(self._store, part)
-                    arrays = self._loaded[ref]
-                    reason_map=[]; source_map=[]
-                    for reason in part['core_header']['reason_dictionary']:
-                        if reason not in reasons: reasons.append(reason)
-                        reason_map.append(reasons.index(reason))
-                    for sources in part['core_header']['source_sets']:
-                        if sources not in source_sets: source_sets.append(sources)
-                        source_map.append(source_sets.index(sources))
-                    for binding in part['core_header']['source_bindings']:
-                        require(binding['id'] not in bindings or bindings[binding['id']] == binding, 'conflicting source ID')
-                        bindings[binding['id']] = binding
-                    used[ref]=(part,arrays,np.asarray(reason_map),np.asarray(source_map),
-                        {s:i for i,s in enumerate(part['security_ids'])},
-                        {c:i for i,c in enumerate(part['columns'])})
-                part,arrays,reason_map,source_map,axis,positions = used[ref]
-                require(part['semantic_refs'][column] == view['definitions'][column]['semantic_ref'], 'view Feature semantics mismatch')
-                col = positions[column]
-                rows = [axis[keys[i][0]] for i in target]
-                for name in ARRAYS:
-                    values = arrays[name][0,rows,col]
-                    if name == 'reason_codes': values = reason_map[values]
-                    if name == 'source_codes': values = source_map[values]
-                    out[name][target,j] = values
-        self._store.check()
-        selected=sorted(set(int(code) for code in np.unique(out['source_codes'])))
-        remap=np.zeros(len(source_sets),dtype='int32')
-        for code,old in enumerate(selected): remap[old]=code
-        source_sets=[source_sets[old] for old in selected]
-        out['source_codes']=remap[out['source_codes']]
-        actual_sources={source for group in source_sets for source in group}
-        for name, array in out.items(): out[name]=np.frombuffer(array.tobytes(),dtype=array.dtype).reshape(shape)
-        return {**out, 'keys':keys, 'schema':[deepcopy(view['definitions'][c]['schema']) for c in columns],
-            'reason_dictionary':reasons, 'source_sets':source_sets,
-            'source_bindings':[bindings[source] for source in sorted(actual_sources)],
-            'view_ref':self.identity, 'partition_refs':list(used), 'null_available_at_utc_us':-(2**63)}
+        with self.operation():
+            view = self._view
+            columns = list(view['columns'] if columns is None else columns)
+            require(bool(columns) and len(columns) == len(set(columns)) and set(columns) <= set(view['columns']),
+                    'ordered unique Feature columns required')
+            keys = ([(s,d) for d in view['sessions'] for s in view['sample_universe']] if keys is None else list(keys))
+            require(bool(keys) and len(set(keys)) == len(keys) and all(s in view['security_ids'] and d in view['sessions'] for s,d in keys),
+                    'unique keys inside fixed Feature view required')
+            shape = len(keys), len(columns)
+            require(len(keys)*len(columns)*50 <= self._store.maximum_matrix_bytes, 'Feature projection budget exceeded')
+            out = {name:np.zeros(shape, dtype='bool' if name == 'validity' else 'float64' if name == 'values'
+                               else 'int64' if name == 'available_at_utc_us' else 'int32') for name in ARRAYS}
+            reasons = [None]; source_sets = [[]]; bindings = {}; used = {}
+            targets={}
+            for i,(_,day) in enumerate(keys): targets.setdefault(day,[]).append(i)
+            tiles=self._tiles
+            for day,target in targets.items():
+                for j, column in enumerate(columns):
+                    desc = tiles[day,column]; ref = desc['partition_ref']
+                    if ref not in used:
+                        part = self._partition(day,column)
+                        if ref not in self._loaded: self._loaded[ref] = _partition_arrays(self._store, part)
+                        for path in _partition_buffer_paths(part): self._store.check_path(path)
+                        arrays = self._loaded[ref]
+                        reason_map=[]; source_map=[]
+                        for reason in part['core_header']['reason_dictionary']:
+                            if reason not in reasons: reasons.append(reason)
+                            reason_map.append(reasons.index(reason))
+                        for sources in part['core_header']['source_sets']:
+                            if sources not in source_sets: source_sets.append(sources)
+                            source_map.append(source_sets.index(sources))
+                        for binding in part['core_header']['source_bindings']:
+                            require(binding['id'] not in bindings or bindings[binding['id']] == binding, 'conflicting source ID')
+                            bindings[binding['id']] = binding
+                        used[ref]=(part,arrays,np.asarray(reason_map),np.asarray(source_map),
+                            {s:i for i,s in enumerate(part['security_ids'])},
+                            {c:i for i,c in enumerate(part['columns'])})
+                    part,arrays,reason_map,source_map,axis,positions = used[ref]
+                    require(part['semantic_refs'][column] == view['definitions'][column]['semantic_ref'], 'view Feature semantics mismatch')
+                    col = positions[column]
+                    rows = [axis[keys[i][0]] for i in target]
+                    for name in ARRAYS:
+                        values = arrays[name][0,rows,col]
+                        if name == 'reason_codes': values = reason_map[values]
+                        if name == 'source_codes': values = source_map[values]
+                        out[name][target,j] = values
+            selected=sorted(set(int(code) for code in np.unique(out['source_codes'])))
+            remap=np.zeros(len(source_sets),dtype='int32')
+            for code,old in enumerate(selected): remap[old]=code
+            source_sets=[source_sets[old] for old in selected]
+            out['source_codes']=remap[out['source_codes']]
+            actual_sources={source for group in source_sets for source in group}
+            for name, array in out.items(): out[name]=np.frombuffer(array.tobytes(),dtype=array.dtype).reshape(shape)
+            self.validate_boundary()
+            return {**out, 'keys':keys, 'schema':[deepcopy(view['definitions'][c]['schema']) for c in columns],
+                'reason_dictionary':reasons, 'source_sets':source_sets,
+                'source_bindings':[bindings[source] for source in sorted(actual_sources)],
+                'view_ref':self.identity, 'partition_refs':list(used), 'null_available_at_utc_us':-(2**63)}
 
     def close(self):
         self._tiles.clear(); self._parts.clear()
