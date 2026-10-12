@@ -20,7 +20,7 @@ from .stock_stream_inputs import (StockInputSource, StockInputBlock, StockSource
 _IMPORT = object()
 
 
-def _input_key(plan):
+def _projection_key(plan):
     from .stock_input_store import INPUT_SEMANTICS
     # Explicit input selection identity. Account policy is checked separately
     # on every call; it cannot choose another pool, clock or source through this
@@ -30,12 +30,18 @@ def _input_key(plan):
     if "action_facts_artifact" in plan:
         from .stock_stream_contracts import artifact_identity
         value["action_facts_artifact"] = artifact_identity(plan["action_facts_artifact"])
-    # The request owner validates this optional independent dependency. Keep
-    # its complete envelope conservatively until its exact relocation ABI is
-    # published; a risk-ref change must never reuse prediction admission.
+    value["input_semantics"] = INPUT_SEMANTICS
+    return canonical(value).encode("utf-8")
+
+
+def _input_key(plan):
+    # Each handle binds the complete current request capability. The immutable
+    # prediction projection has no risk observation or portable risk approval.
+    projection = _projection_key(plan)
+    if not (set(plan) & {"risk_input","risk_input_ref"}): return projection
+    value = json.loads(projection)
     for name in ("risk_input","risk_input_ref"):
         if name in plan: value[name] = plan[name]
-    value["input_semantics"] = INPUT_SEMANTICS
     return canonical(value).encode("utf-8")
 
 
@@ -45,7 +51,7 @@ class AdmittedStockInputs(StockInputSource):
     close()/context-manager exit release this input lease. No account can
     mutate a later account's inputs through its decoded globals or blocks.
     """
-    def __init__(self, token, store, offsets, key, block_sessions, inventory, statistics, *, market=None, projection_store=None, cache_key=None):
+    def __init__(self, token, store, offsets, key, block_sessions, inventory, statistics, *, market=None, projection_store=None, cache_key=None, projection_key=None):
         require(token is _IMPORT, "Use admit_stock_inputs; admission flags are unsupported")
         super().__init__()
         self.__owner_pid = os.getpid()
@@ -54,6 +60,7 @@ class AdmittedStockInputs(StockInputSource):
         self.__cache_key = cache_key
         self.__offsets = offsets
         self.__key = key
+        self.__projection_key = key if projection_key is None else projection_key
         self.__block_sessions = block_sessions
         self.__inventory = inventory
         self.__statistics = statistics
@@ -251,6 +258,7 @@ class AdmittedStockInputs(StockInputSource):
                     else: self.__projection_store.close()
                 self.__offsets = array("Q")
                 self.__key = self.__inventory = b""
+                self.__projection_key = b""; self.__cache_key = None
                 self._memory = self._prepared = None
                 if self.__owns_market:
                     self.__market.close()

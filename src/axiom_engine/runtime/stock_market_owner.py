@@ -3,6 +3,7 @@
 No persisted trust marker, Data writer or second account executor is introduced.
 """
 from array import array
+from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
 import json
 import os
@@ -99,6 +100,12 @@ class AdmittedStockMarket:
         self._store, self._key = store, key
         self._calendar, self._block_sessions = tuple(calendar), block_sessions
         self._native, self._blocks, self._meta = native, blocks, meta
+        # The existing per-native-key index allowance also covers these
+        # borrowed key/date pointer vectors; lookup never scans all history.
+        self._native_sorted = {}
+        for key in native: self._native_sorted.setdefault(key[0],[]).append(key)
+        for keys in self._native_sorted.values(): keys.sort(key=lambda key:key[1][0])
+        self._native_starts = {kind:[key[1][0] for key in keys] for kind,keys in self._native_sorted.items()}
         self._inventory = inventory; self._proofs = {}; self._statistics = statistics
         self._prediction_cache = {}
 
@@ -171,7 +178,10 @@ class AdmittedStockMarket:
 
     def _native_key(self, kind, days):
         self._check()
-        selected = next((key for key in self._native if key[0] == kind and set(days) <= set(key[1])), None)
+        wanted = set(days); keys = self._native_sorted.get(kind,()); starts = self._native_starts.get(kind,())
+        i = bisect_right(starts,min(days))-1
+        lo = bisect_left(starts,starts[i]) if i >= 0 else 0
+        selected = next((key for key in keys[lo:i+1] if wanted <= set(key[1])),None)
         require(selected is not None, "Missing admitted original market view")
         return selected
 
@@ -210,6 +220,7 @@ class AdmittedStockMarket:
                 for slot in self._prediction_cache.values(): slot["store"].close()
                 self._prediction_cache.clear()
                 self._native.clear(); self._blocks.clear(); self._proofs.clear()
+                self._native_sorted.clear(); self._native_starts.clear()
                 self._key = self._inventory = b""
         finally:
             self._lock.release()
@@ -337,37 +348,39 @@ def bind_stock_prediction_inputs(market, request, *, source, limits, max_signal_
     integer(max_signal_bytes, 1); limits = validate_limits(limits)
     plan = validate_manifest(request)
     require(len(request.payload.encode()) <= limits["max_block_bytes"], "stock request manifest exceeds decoded budget")
-    with market._scope(), source.execution_scope():
-        try:
-            _release_source(source)
-            source._file_parse_events = []; source._cjson_spool_bytes = 0
-            from .stock_owned_inputs import AdmittedStockInputs, _IMPORT, _input_key
-            key = _input_key(plan); slot = market._prediction_slot(key,max_signal_bytes)
-            if slot is not None:
-                from .stock_rules import _validate_admitted_account_policy
-                _validate_admitted_account_policy(plan["portfolio_policy"],universe=plan["scope"]["execution_universe"],
-                    rules_ref=plan["profile_input"]["stock_execution_rules_ref"])
-                stats = json.loads(canonical(slot["statistics"]))
-                stats.update(source_admissions=0,source_audit_seconds=0,capture_seconds=0,source_operations={},
-                             owned_read_bytes=0,owned_record_decodes=0,account_bindings=0,prediction_reuses=1)
-                store = slot["store"]
-                result = AdmittedStockInputs(_IMPORT,store.file,store.offsets,key,market._block_sessions,
-                    slot["inventory"],stats,market=market,projection_store=store,cache_key=key)
-                slot["leases"] += 1; market._retain()
-                market._statistics["prediction_reuses"] = market._statistics.get("prediction_reuses",0)+1
-                market._statistics["basis_reuses"] += 1
-                market._statistics["signal_bindings"] += 1
-                return result
-            return _bind(market, plan, source, limits, max_signal_bytes)
-        except (KeyError, IndexError, TypeError, OSError) as exc:
-            raise ContractError("Malformed or unreadable fixed stock prediction: "+str(exc)) from exc
-        finally:
-            _release_source(source)
+    with market._scope():
+        from .stock_owned_inputs import AdmittedStockInputs, _IMPORT, _input_key, _projection_key
+        key = _input_key(plan); projection_key = _projection_key(plan)
+        slot = market._prediction_slot(projection_key,max_signal_bytes)
+        if slot is not None:
+            from .stock_rules import _validate_admitted_account_policy
+            _validate_admitted_account_policy(plan["portfolio_policy"],universe=plan["scope"]["execution_universe"],
+                rules_ref=plan["profile_input"]["stock_execution_rules_ref"])
+            stats = json.loads(canonical(slot["statistics"]))
+            stats.update(source_admissions=0,source_audit_seconds=0,capture_seconds=0,source_operations={},
+                         owned_read_bytes=0,owned_record_decodes=0,account_bindings=0,prediction_reuses=1)
+            store = slot["store"]
+            result = AdmittedStockInputs(_IMPORT,store.file,store.offsets,key,market._block_sessions,
+                slot["inventory"],stats,market=market,projection_store=store,cache_key=projection_key,projection_key=projection_key)
+            slot["leases"] += 1; market._retain()
+            market._statistics["prediction_reuses"] = market._statistics.get("prediction_reuses",0)+1
+            market._statistics["basis_reuses"] += 1
+            market._statistics["signal_bindings"] += 1
+            return result
+        with source.execution_scope():
+            try:
+                _release_source(source)
+                source._file_parse_events = []; source._cjson_spool_bytes = 0
+                return _bind(market, plan, source, limits, max_signal_bytes)
+            except (KeyError, IndexError, TypeError, OSError) as exc:
+                raise ContractError("Malformed or unreadable fixed stock prediction: "+str(exc)) from exc
+            finally:
+                _release_source(source)
 
 
 def _bind(market, plan, source, limits, maximum):
     from ..core.stock_portfolio import StockPredictionFrame, validate_stock_predictions, validate_top_k, instant
-    from .stock_owned_inputs import AdmittedStockInputs, _IMPORT, _input_key
+    from .stock_owned_inputs import AdmittedStockInputs, _IMPORT, _input_key, _projection_key
     started = perf_counter()
     budget = read_budget(limits); scope = plan["scope"]; calendar = scope["calendar"]; universe = scope["execution_universe"]
     key = _basis_key(plan); proof = market._proofs.get(key)
@@ -414,6 +427,14 @@ def _bind(market, plan, source, limits, maximum):
                     "Stock portfolio policy mismatch")
         native_by_day, contexts = {}, []
         execution = {canonical(artifact_identity(d["entry"]["artifact"])): d for d in meta["descriptors"]}
+        member_owners = {}
+        source._memory.reserve_global("member_owner_index",128*len(calendar))
+        for descriptor in meta["descriptors"]:
+            if descriptor["kind"] == "membership":
+                for day in descriptor["days"]:
+                    require(day not in member_owners,"Overlapping admitted membership owners")
+                    member_owners[day] = descriptor["entry"]["native_ref"]
+        require(set(calendar) <= member_owners.keys(),"Missing admitted membership owner")
         if proof is None:
             for entry in plan["market_input"]["native_inputs"]:
                 if entry["role"] != "prediction_basis":
@@ -465,7 +486,7 @@ def _bind(market, plan, source, limits, maximum):
         frames, trade_map = _frames(source, plan, budget)
         resolve_prediction_inventory(inventory,source,limits)
         modern=plan['prediction_input']['contract_version']=='stock_prediction_input_refs_v2'
-        binding_key = _input_key(plan); inventory_wire = canonical(inventory).encode()
+        binding_key = _input_key(plan); projection_key = _projection_key(plan); inventory_wire = canonical(inventory).encode()
         proof_cost = 0 if key in market._proofs else len(key)+_encoded_size(proof)+64
         require(market._store.used+proof_cost <= market._store.maximum,
                 "max_market_bytes exceeds quota before pairing proof retention")
@@ -530,7 +551,7 @@ def _bind(market, plan, source, limits, maximum):
                         membership_for(feature)
                         from .stock_signal_inputs import validate_day
                         validate_day(frame,feature,checked,members,member_metadata,
-                            next(d['entry']['native_ref'] for d in meta['descriptors'] if d['kind']=='membership' and feature in d['days']))
+                            member_owners[feature])
                         prediction_rows += len(checked)
                         require(prediction_rows <= limits["max_prediction_rows"], "Stock prediction row budget exceeded")
                         wire = checked = row = None
@@ -581,7 +602,7 @@ def _bind(market, plan, source, limits, maximum):
         if modern:
             stats.update(signal_metadata_records=len(metadata_locations),signal_metadata_bytes=sum(i['length'] for i in metadata_locations))
         result = AdmittedStockInputs(_IMPORT, store.file, store.offsets, binding_key, market._block_sessions,
-                                     inventory_wire, stats, market=market, projection_store=store)
+                                     inventory_wire, stats, market=market, projection_store=store,projection_key=projection_key)
         if key not in market._proofs:
             old_fixed = market._store.fixed
             try:
@@ -594,8 +615,8 @@ def _bind(market, plan, source, limits, maximum):
         else:
             market._statistics["basis_reuses"] += 1
         market._retain(); market._statistics["signal_bindings"] += 1
-        if market._cache_prediction(binding_key,store,inventory_wire,stats,maximum):
-            result._AdmittedStockInputs__cache_key = binding_key
+        if market._cache_prediction(projection_key,store,inventory_wire,stats,maximum):
+            result._AdmittedStockInputs__cache_key = projection_key
         store = None
         return result
     finally:

@@ -61,6 +61,80 @@ class PreparedInputTests(unittest.TestCase):
                 self.assertEqual(actual["run_id"],expected["run_id"])
                 self.assertEqual(view.rows,oracle.rows)
 
+    def test_original_native_locator_relocation_keeps_logical_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); request=request_for(root)
+            with market_for(request) as market:
+                mr=save_stock_market_inputs(market,root/"m",limits=LIMITS)
+            relocated=deepcopy(request)
+            for entry in relocated["market_input"]["native_inputs"]:
+                entry["artifact"]["manifest_uri"] += ".relocated"
+            with patch("axiom_engine.runtime.stock_stream_inputs._CanonicalIndex",side_effect=AssertionError("ancestor opened")):
+                with load_stock_market_inputs(mr,StockMarketSpec.from_request(BacktestRequest.from_dict(relocated)),
+                        limits=LIMITS,max_market_bytes=2_000_000):
+                    pass
+
+    def test_cache_hit_uses_closed_native_source_without_entering_its_scope(self):
+        from test_stock_native_view import (open_native_view,synthetic_request,carrier,DATA_LIMITS,
+            ADAPTER_LIMITS,ACTIVE)
+        from axiom_engine.runtime import StockNativeViewSource,admit_stock_market_inputs,bind_stock_prediction_inputs
+        if open_native_view is None: self.skipTest("pinned Data native consumer unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); request=synthetic_request(root); reference,_=carrier(root/"native",request)
+            handle=open_native_view(root/"native",manifest_sha256=reference,limits=DATA_LIMITS)
+            source=StockNativeViewSource(native_views=[handle],max_active_bytes=ACTIVE)
+            try:
+                with admit_stock_market_inputs(StockMarketSpec.from_request(BacktestRequest.from_dict(request)),
+                        source=source,block_sessions=2,limits=ADAPTER_LIMITS,max_market_bytes=2_000_000) as market:
+                    with bind(market,request,limits=ADAPTER_LIMITS): pass
+                    source.close(); handle.close()
+                    with patch.object(source,"execution_scope",side_effect=AssertionError("closed original scope entered")):
+                        with bind_stock_prediction_inputs(market,BacktestRequest.from_dict(request),source=source,
+                                limits=ADAPTER_LIMITS,max_signal_bytes=2_000_000) as inputs:
+                            self.assertEqual(inputs.statistics["source_admissions"],0)
+                            self.assertEqual(inputs.statistics["capture_seconds"],0)
+                    self.assertEqual(market.statistics["signal_borrows"],0)
+            finally:
+                if not source._closed: source.close()
+                handle.close()
+
+    def test_risk_switch_reuses_projection_but_rebinds_request_capability(self):
+        import inspect
+        if "market_gate" not in inspect.signature(stock_strategy_spec).parameters:
+            self.skipTest("runs with the separately reviewed risk integration")
+        from test_stock_market_gate import GATE,dependency,bind_risk
+        from axiom_engine.core.contracts import Document
+        from axiom_engine.runtime.stock_owned_inputs import _projection_key,_input_key
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); plain=configured(request_for(root),stock_strategy_spec(top_k=3))
+            gated=bind_risk(configured(plain,stock_strategy_spec(top_k=3,market_gate=GATE)),dependency(plain["scope"]["calendar"]))
+            changed_risk=deepcopy(gated["risk_input"]);changed_risk["view"]["records"][-1]["close"]=11.0
+            changed_risk["native_ref"]=Document.from_dict(changed_risk["view"]).identity
+            changed=bind_risk(gated,changed_risk)
+            self.assertEqual(_projection_key(plain),_projection_key(gated))
+            self.assertEqual(_projection_key(gated),_projection_key(changed))
+            self.assertNotEqual(_input_key(gated),_input_key(changed))
+            with market_for(plain) as market,bind(market,plain) as old:
+                pr=save_stock_prediction_inputs(old,root/"p",limits=LIMITS)
+                with self.assertRaises(ContractError): old.inventory(gated)
+                with patch("axiom_engine.runtime.stock_stream_inputs._CanonicalIndex",side_effect=AssertionError("prediction reopened")):
+                    with bind(market,gated) as current:
+                        self.assertIs(current._AdmittedStockInputs__projection_store,old._AdmittedStockInputs__projection_store)
+                        self.assertEqual(current.statistics["source_admissions"],0)
+                        with self.assertRaises(ContractError): current.inventory(changed)
+                    with bind(market,changed) as current:
+                        self.assertEqual(current.statistics["capture_seconds"],0)
+                    with load_stock_prediction_inputs(market,pr,BacktestRequest.from_dict(gated),
+                            limits=LIMITS,max_signal_bytes=2_000_000) as reopened:
+                        reopened.inventory(gated)
+                        with self.assertRaises(ContractError): reopened.inventory(changed)
+                    invalid=deepcopy(changed_risk)
+                    invalid["view"]["field_meta"]["close"]["by_key"][0]["usable_from"]=plain["scope"]["calendar"][-1]+"T21:00:00+08:00"
+                    invalid["native_ref"]=Document.from_dict(invalid["view"]).identity
+                    before=market.statistics["signal_borrows"]
+                    with self.assertRaises(ContractError): bind(market,bind_risk(gated,invalid))
+                    self.assertEqual(market.statistics["signal_borrows"],before)
+
     def test_fresh_process_offline_reopen_and_second_strategy_zero_original_reads(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); request=configured(request_for(root),stock_strategy_spec(top_k=3))

@@ -262,6 +262,7 @@ def load_stock_market_inputs(ref, spec, *, limits, max_market_bytes):
 
 
 def _validate_market_snapshot(market, spec, limits):
+    from .stock_stream_contracts import artifact_identity
     from .stock_stream_inputs import _grid, _native_header
     from .stock_inputs import _validate_stock_market_row
     from .stock_market import _stock_lifecycle_active, _membership_rows, _visible
@@ -270,6 +271,8 @@ def _validate_market_snapshot(market, spec, limits):
     from ..core.portfolio import decimal
     wire = spec.to_dict(); scope = wire["scope"]; universe = scope["execution_universe"]
     calendar = scope["calendar"]; memory = _DecodedMemory(limits["max_block_bytes"]); budget = read_budget(limits)
+    universe_set = set(universe); calendar_set = set(calendar)
+    admitted_days = calendar_set | set(wire["market_input"]["warmup_sessions"])
     with market._scope():
         meta,stage = market._globals(memory,budget)
         try:
@@ -303,9 +306,29 @@ def _validate_market_snapshot(market, spec, limits):
             previous_factor = {}; factor_blocks = []
             memory.reserve_global("prepared_factor_state",64*len(universe))
             expected_descriptors = wire["market_input"]["native_inputs"]
-            require([d["entry"] for d in descriptors] == expected_descriptors, "Prepared original source descriptors differ")
+            def logical_entry(entry):
+                fields(entry,"role native_ref artifact")
+                return dict(role=entry["role"],native_ref=entry["native_ref"],artifact=artifact_identity(entry["artifact"]))
+            require([logical_entry(d["entry"]) for d in descriptors] == [logical_entry(d) for d in expected_descriptors],
+                    "Prepared original source descriptors differ")
+            lifecycle_owners = {}; contexts = {}
+            from .stock_input_store import encoded_size
+            memory.reserve_global("prepared_descriptor_indexes",512*len(descriptors)+
+                128*sum(len(d["days"]) for d in descriptors)+sum(encoded_size(d["context"]) for d in descriptors))
+            for descriptor in descriptors:
+                with memory.stage() as encoding:
+                    encoding.reserve(2*encoded_size(descriptor["context"]))
+                    context_key = descriptor["kind"],canonical(descriptor["context"]).encode()
+                require(context_key not in contexts, "Duplicate prepared native parent/context")
+                contexts[context_key] = descriptor
+                if descriptor["kind"] == "states":
+                    for day in descriptor["days"]:
+                        require(day not in lifecycle_owners, "Overlapping prepared lifecycle owners")
+                        lifecycle_owners[day] = descriptor["entry"]["native_ref"]
+            require(calendar_set <= lifecycle_owners.keys(), "Prepared lifecycle owner coverage mismatch")
             from ..core.stock_portfolio import instant
             for number,days in enumerate(chunks):
+                day_set = set(days)
                 value,current = market._market_block(number,memory,budget)
                 try:
                     require(value["sessions"] == list(days) and len(value["market_rows"]) == len(days)*len(universe),
@@ -316,7 +339,7 @@ def _validate_market_snapshot(market, spec, limits):
                     current.reserve(64*len(indexed))
                     for row in value["market_rows"]:
                         _validate_stock_market_row({k:v for k,v in row.items() if not k.startswith("_stock_")},
-                            universe=set(universe),calendar=set(days),refs=refs,full=True)
+                            universe=universe_set,calendar=day_set,refs=refs,full=True)
                         active = _stock_lifecycle_active(identities[row["security_id"]],row["session"],
                             row["market_state"],row["_stock_lifecycle_meta"])
                         require(type(row["_stock_listed"]) is bool and row["_stock_listed"] == active and
@@ -325,9 +348,7 @@ def _validate_market_snapshot(market, spec, limits):
                                 instant(row["_stock_lifecycle_cutoff"]) == instant(row["execution_evidence_cutoff"]) and
                                 type(row["_stock_factor_valid"]) is bool and row["_stock_factor_source_ref"] == refs[3],
                                 "Prepared market lifecycle/clock mismatch")
-                        lifecycle_owners = [d["entry"]["native_ref"] for d in descriptors
-                            if d["kind"] == "states" and row["session"] in d["days"]]
-                        require(lifecycle_owners == [row["_stock_lifecycle_owner_ref"]],
+                        require(lifecycle_owners[row["session"]] == row["_stock_lifecycle_owner_ref"],
                                 "Prepared lifecycle differs from its original owner")
                         if row["market_state"] == "delisted": ended.add(row["security_id"])
                         require(active or all(row[n] is None for n in ("open","close","volume_shares")),
@@ -379,17 +400,17 @@ def _validate_market_snapshot(market, spec, limits):
                 try:
                     fields(value,"view bindings"); view = value["view"]; rows,metadata = _grid(view,days,universe)
                     require(kind in ("market","factor","membership") and
-                            set(days) <= set(calendar+wire["market_input"]["warmup_sessions"]), "Prepared native view scope mismatch")
+                            set(days) <= admitted_days, "Prepared native view scope mismatch")
                     require(not (coverage & {(kind,d) for d in days}), "Overlapping prepared native partitions")
                     coverage.update((kind,d) for d in days)
-                    selected = [d for d in descriptors if d["kind"] == kind and view["context"] == d["context"]]
-                    require(len(selected) == 1 and set(days) <= set(selected[0]["days"]), "Prepared native parent/context mismatch")
+                    selected = contexts.get((kind,canonical(view["context"]).encode()))
+                    require(selected is not None and set(days) <= set(selected["days"]), "Prepared native parent/context mismatch")
                     class Index:
-                        content_digest = selected[0]["entry"]["native_ref"]
+                        content_digest = selected["entry"]["native_ref"]
                         groups = [(('records',),d) for d in days]
                         def header(self): return view["context"]
                         def value(self,path): return view["field_meta"][path[1]][path[2]]
-                    _native_header(Index(),selected[0]["entry"],wire)
+                    _native_header(Index(),selected["entry"],wire)
                     if kind == "membership": _membership_rows(view,universe=universe,calendar=list(days),identities=identities)
                     else:
                         for name,entries in metadata.items():
@@ -416,7 +437,7 @@ def save_stock_prediction_inputs(inputs, destination, *, limits):
         market = inputs._AdmittedStockInputs__market
         require(market is not None, "Prepared predictions need their admitted market owner")
         store = inputs._AdmittedStockInputs__projection_store
-        metadata = dict(contract_version=PREDICTION_VERSION,input_key=json.loads(inputs._AdmittedStockInputs__key),
+        metadata = dict(contract_version=PREDICTION_VERSION,input_key=json.loads(inputs._AdmittedStockInputs__projection_key),
             block_sessions=inputs._AdmittedStockInputs__block_sessions,calendar=list(market._calendar),
             inventory=json.loads(inputs._AdmittedStockInputs__inventory),
             owner=dict(market_key=json.loads(market._key)))
@@ -426,14 +447,14 @@ def save_stock_prediction_inputs(inputs, destination, *, limits):
 @_checked_load
 def load_stock_prediction_inputs(market, ref, request, *, limits, max_signal_bytes):
     from .stock_market_owner import AdmittedStockMarket
-    from .stock_owned_inputs import AdmittedStockInputs, _IMPORT, _input_key
+    from .stock_owned_inputs import AdmittedStockInputs, _IMPORT, _input_key, _projection_key
     from .stock_stream_contracts import validate_manifest
     require(isinstance(market,AdmittedStockMarket), "AdmittedStockMarket required")
     plan = validate_manifest(request); market._matches(request)
     manifest,store = _load(ref,version=PREDICTION_VERSION,limits=limits,maximum=max_signal_bytes)
     try:
         key = canonical(manifest["input_key"]).encode(); fields(manifest["owner"],"market_key")
-        require(key == _input_key(plan) and canonical(manifest["owner"]["market_key"]).encode() == market._key and
+        require(key == _projection_key(plan) and canonical(manifest["owner"]["market_key"]).encode() == market._key and
                 manifest["block_sessions"] == market._block_sessions and manifest["calendar"] == list(market._calendar),
                 "Prepared prediction scope/dependency mismatch")
         stats = dict(source_admissions=0,source_audit_seconds=0,capture_seconds=0,owned_bytes=store.used,
@@ -442,8 +463,8 @@ def load_stock_prediction_inputs(market, ref, request, *, limits, max_signal_byt
         stats.update(store.prepared_statistics)
         with market._scope():
             market._retain()
-            result = AdmittedStockInputs(_IMPORT,store.file,store.offsets,key,market._block_sessions,
-                canonical(manifest["inventory"]).encode(),stats,market=market,projection_store=store)
+            result = AdmittedStockInputs(_IMPORT,store.file,store.offsets,_input_key(plan),market._block_sessions,
+                canonical(manifest["inventory"]).encode(),stats,market=market,projection_store=store,projection_key=key)
         # Existing audit checks per-account policy, target refs and globals;
         # the entire saved prediction grid is checked before ledger allocation.
         _validate_prediction_snapshot(result,request,limits)
@@ -535,7 +556,7 @@ def _validate_prediction_snapshot(inputs, request, limits):
                 full = full_headers.get(header["signal_run_ref"],header)
                 validated,indexed = validate_stock_predictions(StockPredictionFrame.from_dict({**full,"rows":list(rows.values())}))
                 require(len(indexed) == len(plan["scope"]["prediction_universe"]), "Prepared prediction grid incomplete")
-                feature = plan["scope"]["calendar"][plan["scope"]["calendar"].index(day)-1]
+                feature = plan["scope"]["calendar"][dates[day]-1]
                 require({key[0] for key in indexed} == {feature}, "Prepared prediction predecessor mismatch")
                 reference = header["signal_run_ref"]
                 require(reference in output_bindings and day not in observed_trades and day in expected_trades,
