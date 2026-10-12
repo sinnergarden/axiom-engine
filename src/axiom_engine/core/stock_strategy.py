@@ -121,7 +121,13 @@ class ConfiguredStockStrategy:
         require(type(universe) is list and bool(universe) and len(set(universe)) == len(universe), "frozen strategy universe required")
         spec = self._spec.to_dict(); k = spec["top_k"]
         require(k <= len(universe), "strategy capacity outside universe")
-        fields(inputs["constraints"], "max_positions quantity_rules reserved_security_ids")
+        constraints = inputs["constraints"]
+        fields(constraints, "max_positions quantity_rules reserved_security_ids" +
+               (" eligible_security_ids" if "eligible_security_ids" in constraints else ""))
+        eligible = constraints.get("eligible_security_ids", universe)
+        require(type(eligible) is list and len(set(eligible)) == len(eligible) and set(eligible) <= set(universe),
+                "strategy eligibility outside frozen universe")
+        eligible = set(eligible)
         require(type(inputs["constraints"]["max_positions"]) is int and inputs["constraints"]["max_positions"] == k and
                 type(inputs["constraints"]["quantity_rules"]) is dict and
                 set(inputs["constraints"]["quantity_rules"]) == set(universe), "strategy constraints outside scope")
@@ -157,7 +163,9 @@ class ConfiguredStockStrategy:
             require(type(row["member"]) is bool and type(row["valid"]) is bool, "explicit candidate masks required")
             if row["valid"]: number(row["score"])
             else: require(row["score"] is None, "invalid candidate cannot carry a score")
-        ranked = sorted((r for r in candidates if r["valid"] and r["member"]),
+        # Keep original member/valid/score facts; the caller supplies a separate
+        # lifecycle eligibility constraint after native identity admission.
+        ranked = sorted((r for r in candidates if r["valid"] and r["member"] and r["security_id"] in eligible),
                         key=lambda r: (-r["score"], r["security_id"]))
         ranks = {r["security_id"]: i+1 for i, r in enumerate(ranked)}
         next_state = deepcopy(state); next_state["check_index"] += 1

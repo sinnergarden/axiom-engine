@@ -211,10 +211,23 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
         if modern:
             require(instant(row['feature_knowledge_cutoff'])==feature_cutoff and
                     (derived or instant(row['simulated_model_available_at'])<cutoff), 'Inconsistent staged decision clock')
-        if full and row["member"]:
-            require(listed(rule_index[0][row["security_id"]], context["feature_session"]),
-                    "PIT member contradicts native stock listing interval")
-    eligible = [row for row in batch if row["member"] and row["security_id"] in supported]
+    source_members = [row for row in batch if row["member"] and row["security_id"] in supported]
+    eligible, lifecycle_excluded = [], []
+    for row in source_members:
+        if full:
+            identity = rule_index[0][row["security_id"]]
+            # The validated lifecycle is independent of the vendor observation.
+            # Check the intended trade date too; no execution prices/volume enter Core.
+            states = {label: ("active" if listed(identity, context[name]) else
+                            "not_listed" if context[name] < identity["listing_date"] else "delisted")
+                      for label, name in (("feature_lifecycle", "feature_session"), ("trade_lifecycle", "trade_session"))}
+            if any(state != "active" for state in states.values()):
+                lifecycle_excluded.append({"security_id": row["security_id"], **states,
+                    "reason": "DELISTED" if "delisted" in states.values() else "NOT_LISTED",
+                    "listing_date": identity["listing_date"], "delisting_date": identity["delisting_date"],
+                    "source_refs": identity["source_refs"]})
+                continue
+        eligible.append(row)
     result = {"contract_version": version, "feature_session": context["feature_session"],
         "trade_session": context["trade_session"], "signal_ref": wire["signal_run_ref"],
         "supported_universe_ref": context["supported_universe_ref"], "expected_account_version": account["version"],
@@ -243,8 +256,11 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
     invalid = [row for row in eligible if not row["valid"]]
     valid_count = len(eligible) if legacy else sum(row["valid"] for row in eligible)
     if full:
+        if lifecycle_excluded:
+            result["trace"].append({"reason": "INELIGIBLE_LISTING_LIFECYCLE", "pit_member_count": len(source_members),
+                "eligible_member_count": len(eligible), "excluded_members": lifecycle_excluded})
         result["trace"].append({"reason": "VALID_MEMBER_CANDIDATES", "candidate_policy": CANDIDATE_POLICY,
-            "pit_member_count": len(eligible), "valid_candidate_count": valid_count,
+            "pit_member_count": len(source_members), "valid_candidate_count": valid_count,
             "excluded_invalid_member_count": len(invalid), "excluded_invalid_members": [
                 {"security_id": row["security_id"], "invalid_reason": row["invalid_reason"]} for row in invalid]})
     if (invalid and not full) or (valid_count < k and not strategy):
@@ -277,7 +293,8 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None):
             "positions": account["positions"], "pending_share_quantities": context["pending_share_quantities"],
             "cash_minor": account["cash_minor"], "reference_prices": context["reference_prices"],
             "risk_observations": context["risk_observations"], "constraints": {"max_positions": k, "quantity_rules": quantity_rules,
-                "reserved_security_ids": context["reserved_security_ids"]}},
+                "reserved_security_ids": context["reserved_security_ids"],
+                **({"eligible_security_ids": [row["security_id"] for row in eligible]} if lifecycle_excluded else {})}},
             state=context["strategy_state"]).to_dict()
         selected = strategy_targets["selected_security_ids"]
         result.update(strategy_spec_ref=context["portfolio_policy"]["strategy_spec_ref"],

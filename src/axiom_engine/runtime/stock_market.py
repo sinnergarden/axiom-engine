@@ -60,7 +60,8 @@ def _membership_index(batch, *, universe, calendar, identities):
 
 
 def _membership_rows(batch, *, universe, calendar, identities):
-    """Validate admitted original membership row views without rebinding query."""
+    """Admit source observations; carried membership is not listing evidence."""
+    require(set(identities) == set(universe), "complete stock membership identity union required")
     rows, meta = {}, {}
     for native in batch["records"]:
         key = native["session"], native["security_id"]
@@ -74,7 +75,6 @@ def _membership_rows(batch, *, universe, calendar, identities):
     require(set(rows) == set(meta) == expected, "incomplete PIT stock membership grid")
     for (day, security), row in rows.items():
         require(_visible(meta[day, security], day + "T20:30:00+08:00"), "unavailable PIT stock member flag")
-        require(not row["is_member"] or listed(identities[security], day), "PIT member outside listing lifecycle")
     return rows
 
 
@@ -178,7 +178,6 @@ def _project_stock_rows(*, batches, universe, calendar, identities, source_refs,
                     ended.add(security)
                 require(is_listed or all(p[key][n] is None for n in ("open", "close", "volume_shares")),
                         "unlisted stock carries observed market facts")
-                require(is_listed or not members[key]["is_member"], "PIT member outside native lifecycle")
                 if day < identities[security]['listing_date']:
                     require(f[key]['factor'] is None and all(l[key][name] is None for name in ('up_limit','down_limit')),
                             "pre-listing diagnostic carries factor/limit facts")
