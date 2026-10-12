@@ -12,6 +12,7 @@ from axiom_engine.runtime.stock_stream_contracts import logical_ref, validate_ma
 from axiom_engine.runtime.stock_strategy_saved import (BoundMarketRiskInput,
     registered_market_risk_rights, validate_saved_strategy_capacity)
 from test_stock_strategy import inputs, configured
+from test_csi300 import DAYS
 from test_stock_stream_inputs import LIMITS
 from test_stock_stream import execute
 from test_stock_equity import fixture as equity_fixture, seeded, action
@@ -141,6 +142,16 @@ class StockMarketGateTests(unittest.TestCase):
                 next(t for t in trace if t["reason"]=="MARKET_GATE")["ownership"]["positions"]={}
             with self.assertRaisesRegex(ContractError,"decision account version"):
                 validate_saved_strategy_capacity(wire,bad)
+            falsely_flat=deepcopy(projection.rows)
+            second=falsely_flat["decisions"][1]
+            self.assertGreater(second["expected_account_version"],0)
+            second["expected_account_version"]=0
+            for trace in (second["trace"],second["strategy_targets"]["trace"]):
+                observed=next(t for t in trace if t["reason"]=="MARKET_GATE")
+                observed["ownership"]=dict(positions={},pending_share_quantities={},
+                    reserved_security_ids=[],registered_stock_right_security_ids=[])
+            with self.assertRaisesRegex(ContractError,"pre-trade session boundary"):
+                validate_saved_strategy_capacity(wire,falsely_flat)
             altered=deepcopy(wire);altered["request_manifest"]=bind_risk(request,dependency(request["scope"]["calendar"]))
             with self.assertRaisesRegex(ContractError,"original native dependency"):
                 validate_saved_strategy_capacity(altered,projection.rows)
@@ -152,22 +163,24 @@ class StockMarketGateTests(unittest.TestCase):
         self.assertEqual(registered_market_risk_rights(ledger,[event]),["s"])
         state["ex_applied"]=True
         self.assertEqual(registered_market_risk_rights(ledger,[event]),[])
-        data=inputs();security=data["universe"][0];calendar=[data["feature_session"],data["trade_session"]]
+        data=inputs();security=data["universe"][0];calendar=DAYS
         risk=dependency(calendar);risk["view"]["records"][-1]["close"]=20.0
         risk["native_ref"]=Document.from_dict(risk["view"]).identity
         request=bind_risk(bare_request(calendar),risk);request["portfolio_policy"]["top_k"]=1
         bound=BoundMarketRiskInput(request);spec=request["portfolio_policy"]["strategy_spec"]
         prior=initial_strategy_state(spec);prior.update(check_index=1,market_mode="exit_pending")
-        targets=ConfiguredStockStrategy(spec).plan(inputs=gated_inputs(bound=bound,risk_on=True,state=prior,
-            registered=[security]),state=prior).to_dict()
+        data=gated_inputs(bound=bound,risk_on=True,state=prior,registered=[security])
+        data.update(feature_session=DAYS[2],trade_session=DAYS[3],market_observation=bound.observation(DAYS[2],bound.reference))
+        targets=ConfiguredStockStrategy(spec).plan(inputs=data,state=prior).to_dict()
         self.assertEqual(targets["target_weights"],{});self.assertEqual(targets["force_exit_security_ids"],[security])
-        decision=dict(feature_session=calendar[0],risk_input_ref=bound.reference,expected_account_version=1,
+        decision=dict(feature_session=DAYS[2],trade_session=DAYS[3],risk_input_ref=bound.reference,expected_account_version=3,
             strategy_targets=targets)
-        row=dict(sequence=1,security_id=security,source_event_id=event["economic_event_id"],reason="EQUITY_REGISTER",
+        row=dict(sequence=1,session=DAYS[1],security_id=security,source_event_id=event["economic_event_id"],reason="EQUITY_REGISTER",
             quantity_delta=0,sellable_delta=0,pending_share_delta=0,record_quantity=0,record_pending_quantity=10)
-        wire=dict(request_manifest=request,committed_sequence=1,
+        wire=dict(request_manifest=request,committed_sequence=4,
             account_events=dict(equity_facts=dict(actions=[action(security)])))
-        rows=dict(position_ledger=[row],decisions=[decision])
+        rows=dict(position_ledger=[row],cash_ledger=[],decisions=[decision],
+            session_phases=[dict(session=d,committed_sequence=v) for d,v in zip(DAYS[1:],[2,3,4])])
         validate_saved_strategy_capacity(wire,rows)
         # Flat positions/pending do not erase a journaled, not-yet-EX registration.
         next(t for t in targets["trace"] if t["reason"]=="MARKET_GATE")["ownership"]["registered_stock_right_security_ids"]=[]

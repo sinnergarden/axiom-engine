@@ -220,6 +220,30 @@ def _validate(decision, policy, universe, previous_state, positions):
     return targets["next_state"]
 
 
+def _saved_market_decision_versions(rows):
+    """Use validated session boundaries and Runtime's existing pre-trade event phases.
+
+    SESSION_COMMITTED includes the closing NAV sequence. SETTLEMENT, equity
+    EX/LISTING and cash EX/PAY precede planning; FILL and REGISTER follow it.
+    This binds the decision clock without creating another account replay.
+    """
+    phases = {p["session"]:p["committed_sequence"] for p in rows["session_phases"]}
+    versions = {}; previous = 0
+    for day in sorted(phases):
+        versions[day] = previous
+        previous = phases[day]
+    starts = dict(versions)
+    for kind, reasons in (("position_ledger", {"SETTLEMENT", "EQUITY_EX", "EQUITY_LISTING"}),
+                          ("cash_ledger", {"DIVIDEND_EX", "DIVIDEND_PAY"})):
+        for row in rows[kind]:
+            if row["reason"] in reasons:
+                day = row["session"]
+                require(day in versions and starts[day] < row["sequence"] <= phases[day],
+                        "saved pre-trade event differs from session boundary")
+                versions[day] = max(versions[day],row["sequence"])
+    return versions
+
+
 def validate_saved_strategy_capacity(wire, rows):
     """Count actual shares, pending grants and registered stock-right slots."""
     request = wire["request_manifest"]
@@ -228,6 +252,7 @@ def validate_saved_strategy_capacity(wire, rows):
     gated = "market_gate" in request["portfolio_policy"]["strategy_spec"]
     if gated:
         bound = BoundMarketRiskInput(request)
+        decision_versions = _saved_market_decision_versions(rows)
         sellable, risk_reservations = {}, {}
         decisions = iter(rows["decisions"])
         decision = next(decisions, None)
@@ -238,6 +263,8 @@ def validate_saved_strategy_capacity(wire, rows):
             integer(version)
             require(previous_version <= version <= wire["committed_sequence"],
                     "saved market decision watermark order mismatch")
+            require(version == decision_versions.get(item["trade_session"]),
+                    "saved market decision version differs from pre-trade session boundary")
             previous_version = version
             trace = next(t for t in item["strategy_targets"]["trace"] if t.get("reason") == "MARKET_GATE")
             require(item["risk_input_ref"] == request["risk_input_ref"] and
