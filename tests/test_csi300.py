@@ -19,7 +19,7 @@ SOURCES = [{"source_key": "synthetic", "url": "https://example.test/synthetic-ru
             "content_sha256": REF, "clause": "SYNTHETIC fixture, not an official rule/source checksum"}]
 
 
-def rules_for(boards=None, *, days=None, listing_dates=None):
+def rules_for(boards=None, *, days=None, listing_dates=None, quantity_from_by_board=None):
     boards = boards or {security: board for board, security in BOARD_IDS.items()}
     days = days or DAYS
     identities = []
@@ -42,7 +42,7 @@ def rules_for(boards=None, *, days=None, listing_dates=None):
         minimum, step = (200, 1) if board == "SSE_STAR" else (100, 100)
         limit, market = ((100000, 50000) if board == "SSE_STAR" else
                          (300000, 150000) if board == "SZSE_CHINEXT" else (1000000, 1000000))
-        quantities.append(dict(board=board, effective_from="2023-04-10", effective_to=None,
+        quantities.append(dict(board=board, effective_from=(quantity_from_by_board or {}).get(board, "2023-04-10"), effective_to=None,
             buy_minimum=minimum, buy_increment=step, sell_minimum=minimum, sell_increment=step,
             full_residual_exit_allowed=True, limit_order_maximum=limit, market_order_maximum=market,
             daily_proxy_maximum=min(limit, market), price_tick="0.01", settlement_sessions=1,
@@ -51,14 +51,14 @@ def rules_for(boards=None, *, days=None, listing_dates=None):
         quantity_rules=quantities, sources=SOURCES, verified_from=days[0], verified_through=days[-1])
 
 
-def fees_for(*, through=None):
-    intervals = [dict(effective_from="2019-01-01", effective_to="2022-04-29", sell_stamp_tax_rate="0.001",
+def fees_for(*, through=None, from_session="2019-01-01"):
+    intervals = [dict(effective_from=from_session, effective_to="2022-04-29", sell_stamp_tax_rate="0.001",
                       transfer_fee_rate="0.00002", source_keys=["synthetic"]),
                  dict(effective_from="2022-04-29", effective_to="2023-08-28", sell_stamp_tax_rate="0.001",
                       transfer_fee_rate="0.00001", source_keys=["synthetic"]),
                  dict(effective_from="2023-08-28", effective_to=None, sell_stamp_tax_rate="0.0005",
                       transfer_fee_rate="0.00001", source_keys=["synthetic"])]
-    return stock_fee_schedule(intervals=intervals, sources=SOURCES, verified_from="2019-01-01",
+    return stock_fee_schedule(intervals=intervals, sources=SOURCES, verified_from=from_session,
                               verified_through=through or DAYS[-1])
 
 

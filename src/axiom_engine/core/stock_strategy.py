@@ -122,18 +122,23 @@ class ConfiguredStockStrategy:
         spec = self._spec.to_dict(); k = spec["top_k"]
         require(k <= len(universe), "strategy capacity outside universe")
         constraints = inputs["constraints"]
-        fields(constraints, "max_positions quantity_rules reserved_security_ids" +
+        fields(constraints, "max_positions reserved_security_ids" +
+               (" quantity_rules" if "quantity_rules" in constraints else "") +
                (" eligible_security_ids" if "eligible_security_ids" in constraints else ""))
         eligible = constraints.get("eligible_security_ids", universe)
         require(type(eligible) is list and len(set(eligible)) == len(eligible) and set(eligible) <= set(universe),
                 "strategy eligibility outside frozen universe")
         eligible = set(eligible)
-        require(type(inputs["constraints"]["max_positions"]) is int and inputs["constraints"]["max_positions"] == k and
-                type(inputs["constraints"]["quantity_rules"]) is dict and
-                set(inputs["constraints"]["quantity_rules"]) == set(universe), "strategy constraints outside scope")
-        for rule in inputs["constraints"]["quantity_rules"].values():
-            fields(rule, "buy_minimum buy_increment sell_minimum sell_increment daily_proxy_maximum")
-            for value in rule.values(): integer(value, 1)
+        require(type(constraints["max_positions"]) is int and constraints["max_positions"] == k,
+                "strategy constraints outside scope")
+        # Compatibility for existing pure callers: validate a supplied complete
+        # map, while the built-in weight strategy does not require or consume it.
+        if "quantity_rules" in constraints:
+            require(type(constraints["quantity_rules"]) is dict and
+                    set(constraints["quantity_rules"]) == set(universe), "strategy constraints outside scope")
+            for rule in constraints["quantity_rules"].values():
+                fields(rule, "buy_minimum buy_increment sell_minimum sell_increment daily_proxy_maximum")
+                for value in rule.values(): integer(value, 1)
         reserved = inputs["constraints"]["reserved_security_ids"]
         require(type(reserved) is list and len(set(reserved)) == len(reserved) and set(reserved) <= set(universe),
                 "reserved stock rights outside scope")

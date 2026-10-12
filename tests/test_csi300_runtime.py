@@ -26,7 +26,8 @@ from test_stock_schedule import fold, seal
 import test_stocks as legacy
 
 
-def full_request(*, rules=None, k=3, cash=50000000, mutate_native=None, mutate_frame=None):
+def full_request(*, rules=None, k=3, cash=50000000, mutate_native=None, mutate_frame=None,
+                 warmup_session="2023-12-28", fee_schedule=None):
     rules = rules or rules_for()
     calendar, universe = rules["calendar"], rules["universe"]
     identities = {r["security_id"]: r for r in rules["identity_input"]["rows"]}
@@ -69,7 +70,7 @@ def full_request(*, rules=None, k=3, cash=50000000, mutate_native=None, mutate_f
             ("fold_spec_ref", "signal_run_ref", "feature_ref", "model_ref")}}],
         listing_identity_checks=dict(checked_rows=n, paired_rows=n, mismatches=[]),
         scope=dict(execution_security_ids=universe, initial_sessions=calendar, membership_security_ids=universe,
-                   warmup_sessions=["2023-12-28"]),
+                   warmup_sessions=[warmup_session]),
         prediction_membership=dict(compared=n*(len(calendar)-1), saved_prediction_rows=n*(len(calendar)-1),
                                    model_mismatch=[], execution_mismatch=[]),
         previous_close_basis_checks=dict(all_available_at_feature_knowledge_cutoff=False,
@@ -85,7 +86,7 @@ def full_request(*, rules=None, k=3, cash=50000000, mutate_native=None, mutate_f
         for kind, index in (("states",0), ("market",1), ("factor",3), ("membership",6), ("warmup-market",1), ("warmup-factor",3)):
             batch = native[index]; query = deepcopy(batch["context"]["query"])
             if kind.startswith("warmup-"):
-                query.update(sessions=["2023-12-28"], cutoff_by_session={"2023-12-28":"2023-12-28T20:30:00+08:00"})
+                query.update(sessions=[warmup_session], cutoff_by_session={warmup_session:warmup_session+"T20:30:00+08:00"})
             proof["batches"][side+"-"+kind] = dict(wire_ref=native_ref(batch), file_digest=REF,
                 snapshot_id=proof[side]["snapshot"], reader_version=batch["context"]["reader_version"], query=query)
     proof = seal(proof, "admission_ref")
@@ -93,7 +94,7 @@ def full_request(*, rules=None, k=3, cash=50000000, mutate_native=None, mutate_f
     return BacktestRequest.from_dict(dict(contract_version="backtest_request_v6", account_id=f"synthetic-full-top{k}",
         start_session=calendar[1], end_session=calendar[-1], prediction_schedule=schedule, market_replay=market,
         initial_account=dict(cash_minor=cash, positions={}),
-        profile=stock_daily_open_profile_v2(execution_rules=rules, fee_schedule=fees_for(through=calendar[-1])),
+        profile=stock_daily_open_profile_v2(execution_rules=rules, fee_schedule=fee_schedule or fees_for(through=calendar[-1])),
         prediction_universe=universe, execution_universe=universe, supported_universe_ref=support_ref(universe),
         portfolio_policy=csi300_stock_portfolio_policy(top_k=k, execution_universe=universe, execution_rules=rules),
         stock_execution_rules_ref=reference, admission_ref=proof["admission_ref"], admission_evidence=proof,

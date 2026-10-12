@@ -5,7 +5,7 @@ import re
 
 from .contracts import Document, digest, fields, integer, number, require, session, text
 from .portfolio import PortfolioDecision, decimal, minor
-from .stock_rules import (validate_execution_rules, quantity_rule_at, interval_at, floor_quantity, legal_quantity,
+from .stock_rules import (validate_execution_rules, quantity_rule_at, floor_quantity, legal_quantity,
                           support_ref as csi300_support_ref, CSI300_ELIGIBILITY, CANDIDATE_POLICY)
 
 STOCK_PORTFOLIO_VERSION = "axiom.stock_portfolio/1"
@@ -279,23 +279,16 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None, ad
     strategy_targets = None
     if strategy:
         from .stock_strategy import ConfiguredStockStrategy
-        quantity_rules = {}
         require(rules["verified_from"] <= context["trade_session"] <= rules["verified_through"],
                 "stock strategy outside verified rule window")
-        for security in supported:
-            # The frozen union also contains nonmembers before listing and after
-            # delisting. Board constraints do not grant order eligibility; the
-            # actual sizing path still calls rule_at for every selected/held name.
-            rule = interval_at(rule_index[1].get(rule_index[0][security]["board"], []),
-                               context["trade_session"])
-            quantity_rules[security] = {name: rule[name] for name in
-                ("buy_minimum", "buy_increment", "sell_minimum", "sell_increment", "daily_proxy_maximum")}
+        # Selection produces weights and reservations. Quantity rules are read
+        # below only for names that actually need quantity sizing or an exit.
         strategy_targets = ConfiguredStockStrategy(context["portfolio_policy"]["strategy_spec"]).plan(inputs={
             "feature_session": context["feature_session"], "trade_session": context["trade_session"],
             "universe": supported, "candidates": [{name: row[name] for name in ("security_id", "score", "member", "valid")} for row in batch],
             "positions": account["positions"], "pending_share_quantities": context["pending_share_quantities"],
             "cash_minor": account["cash_minor"], "reference_prices": context["reference_prices"],
-            "risk_observations": context["risk_observations"], "constraints": {"max_positions": k, "quantity_rules": quantity_rules,
+            "risk_observations": context["risk_observations"], "constraints": {"max_positions": k,
                 "reserved_security_ids": context["reserved_security_ids"],
                 **({"eligible_security_ids": [row["security_id"] for row in eligible]} if lifecycle_excluded else {})}},
             state=context["strategy_state"]).to_dict()

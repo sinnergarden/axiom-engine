@@ -50,7 +50,7 @@ def source_fixture(root, plan=None):
             native.append(dict(role="prediction_basis", artifact=artifact, native_ref=native_ref(batch)))
     # The old synthetic v6 evidence only declared warmup pairing.  Give this
     # fixture actual separately saved original warmup batches for the v7 audit.
-    warmup = ["2023-12-28"]
+    warmup = plan["admission_evidence"]["scope"]["warmup_sessions"]
     for i in (1, 3):
         batch = deepcopy(batches[i]); anchor = market["calendar"][0]
         batch["records"] = [dict(row, session=warmup[0]) for row in batch["records"] if row["session"] == anchor]
