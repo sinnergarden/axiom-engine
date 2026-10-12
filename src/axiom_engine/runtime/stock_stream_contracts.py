@@ -103,12 +103,20 @@ def _validate_scope(scope):
 def validate_manifest(manifest):
     plan = manifest.to_dict() if isinstance(manifest, Document) else deepcopy(manifest)
     equity = plan.get("contract_version") == "backtest_request_v8"
-    fields(plan, "contract_version request_ref account_id scope initial_account portfolio_policy profile_input market_input prediction_input stock_action_policy clock_policy limitations" + (" action_facts_artifact" if equity else ""))
+    gated = "market_gate" in plan.get("portfolio_policy", {}).get("strategy_spec", {})
+    fields(plan, "contract_version request_ref account_id scope initial_account portfolio_policy profile_input market_input prediction_input stock_action_policy clock_policy limitations" + (" action_facts_artifact" if equity else "") +
+           (" risk_input risk_input_ref" if gated else ""))
     if equity: validate_artifact_ref(plan["action_facts_artifact"])
     require(plan["contract_version"] in (REQUEST_VERSION, "backtest_request_v8"), "bounded stock request required")
     text(plan["account_id"])
     scope = plan["scope"]
     _validate_scope(scope)
+    if gated:
+        from ..core.stock_strategy import validate_strategy_spec
+        from .stock_strategy_saved import validate_strategy_risk_input
+        validate_strategy_spec(plan["portfolio_policy"]["strategy_spec"])
+        validate_strategy_risk_input(plan["risk_input"], plan["risk_input_ref"],
+                                     plan["portfolio_policy"]["strategy_spec"], scope)
     fields(plan["initial_account"], "cash_minor positions")
     integer(plan["initial_account"]["cash_minor"], 1)
     require(plan["initial_account"]["positions"] == {}, "bounded stock initial holdings must be empty")
