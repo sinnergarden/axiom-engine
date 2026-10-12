@@ -143,6 +143,14 @@ with patch('axiom_engine.runtime.stock_stream_inputs._CanonicalIndex',side_effec
                 mr=save_stock_market_inputs(market,root/"m",limits=LIMITS)
                 pr=save_stock_prediction_inputs(inputs,root/"p",limits=LIMITS)
             with patch("axiom_engine.runtime.accounting.AccountLedger",side_effect=AssertionError("ledger allocated")):
+                from axiom_engine.runtime.stock_stream_inputs import _grid
+                def invalid_factor(view,days,universe):
+                    rows,metadata=_grid(view,days,universe)
+                    if "factor" in view["field_meta"]:
+                        rows[next(iter(rows))]["factor"]=-1
+                    return rows,metadata
+                with patch("axiom_engine.runtime.stock_stream_inputs._grid",side_effect=invalid_factor):
+                    with self.assertRaises(ContractError): load_stock_market_inputs(mr,StockMarketSpec.from_request(BacktestRequest.from_dict(request)),limits=LIMITS,max_market_bytes=2_000_000)
                 other=deepcopy(request); other["clock_policy"]["decision_local_time"]="08:56:00"
                 with self.assertRaises(ContractError): StockMarketSpec.from_request(BacktestRequest.from_dict(other))
                 with patch("axiom_engine.runtime.stock_prepared_inputs.INPUT_SEMANTICS","different"):

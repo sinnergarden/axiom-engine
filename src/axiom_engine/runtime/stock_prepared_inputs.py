@@ -267,6 +267,7 @@ def _validate_market_snapshot(market, spec, limits):
     from .stock_market import _stock_lifecycle_active, _membership_rows, _visible
     from .stock_rules import validate_fee_schedule
     from ..core.stock_rules import validate_execution_rules
+    from ..core.portfolio import decimal
     wire = spec.to_dict(); scope = wire["scope"]; universe = scope["execution_universe"]
     calendar = scope["calendar"]; memory = _DecodedMemory(limits["max_block_bytes"]); budget = read_budget(limits)
     with market._scope():
@@ -299,6 +300,8 @@ def _validate_market_snapshot(market, spec, limits):
             chunks = [tuple(calendar[o:o+market._block_sessions]) for o in range(0,len(calendar),market._block_sessions)]
             require(len(market._blocks) == len(chunks), "Prepared market calendar coverage mismatch")
             ended = set(); coverage = set(); descriptors = meta["descriptors"]
+            previous_factor = {}; factor_blocks = []
+            memory.reserve_global("prepared_factor_state",64*len(universe))
             expected_descriptors = wire["market_input"]["native_inputs"]
             require([d["entry"] for d in descriptors] == expected_descriptors, "Prepared original source descriptors differ")
             from ..core.stock_portfolio import instant
@@ -349,6 +352,20 @@ def _validate_market_snapshot(market, spec, limits):
                                     require(row["_stock_factor_valid"] == (fact["factor"] is not None) and
                                             row["_stock_factor_missing_reason"] == metadata["factor"][key].get("missing_reason"),
                                             "Prepared factor qualification differs from original facts")
+                                    factor = fact["factor"]; factor_meta = metadata["factor"][key]
+                                    if factor is None:
+                                        require(bool(factor_meta.get("missing_reason")), "Prepared null factor has no original reason")
+                                        previous_factor[key[1]] = None
+                                    else:
+                                        require(decimal(str(factor),minimum=0) > 0 and
+                                                _visible(factor_meta,key[0]+"T20:30:00+08:00"),
+                                                "Prepared original factor is unavailable/invalid")
+                                        old = previous_factor.get(key[1])
+                                        if row["_stock_listed"] and old is not None and old != factor:
+                                            memory.replace_global("prepared_factor_blocks",512*(len(factor_blocks)+1))
+                                            factor_blocks.append(dict(security_id=key[1],effective_session=key[0],
+                                                available_at=factor_meta["usable_from"],reason="UNEXPLAINED_FACTOR_CHANGE",source_refs=[refs[3]]))
+                                        previous_factor[key[1]] = factor if row["_stock_listed"] else None
                                     if key[0] < identities[key[1]]["listing_date"]:
                                         require(fact["factor"] is None and row["limit_up"] is None and row["limit_down"] is None,
                                                 "Prepared pre-listing diagnostics carry factor/limit facts")
@@ -383,6 +400,11 @@ def _validate_market_snapshot(market, spec, limits):
             require(coverage == {(k,d) for k in ("market","factor","membership") for d in calendar} |
                     {(k,d) for k in ("market","factor") for d in wire["market_input"]["warmup_sessions"]},
                     "Prepared native full coverage mismatch")
+            equity = wire["stock_action_policy"] == "registered_equity_v1"
+            target = globals_value["market_header"]["action_diagnostics" if equity else "action_blocks"]
+            observed = [b for b in target if b.get("reason") == "UNEXPLAINED_FACTOR_CHANGE"]
+            expected = factor_blocks if equity else sorted(factor_blocks,key=lambda b:(b["security_id"],b["effective_session"]))
+            require(observed == expected, "Prepared factor continuity restrictions differ from original facts")
             market._statistics["prepared_decoded_bytes_peak"] = memory.peak_bytes
         finally: stage.close()
 
