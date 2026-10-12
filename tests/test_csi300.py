@@ -97,7 +97,7 @@ def bind_lifecycle(context, rules, batch=None):
     import test_stocks as legacy
     if batch is None:
         index = validate_execution_rules(rules)[0]
-        with patch.object(legacy, "DAYS", rules["calendar"]), patch.object(legacy, "SECURITIES", rules["universe"]):
+        with patch.object(legacy, "DAYS", [context["feature_session"]]), patch.object(legacy, "SECURITIES", rules["universe"]):
             batch = legacy.native_inputs(state="normal_trading")[0]
         for row, meta in zip(batch["records"], batch["field_meta"]["market_state"]["by_key"]):
             identity = index[row["security_id"]]; day = row["session"]

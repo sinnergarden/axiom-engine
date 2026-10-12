@@ -130,6 +130,18 @@ def validate_feature_lifecycle_input(value, *, identities, rules_ref, feature_se
                 "invocation lifecycle capability mismatch")
         return admitted
     batch = value["owner_batch"]; context = batch["context"]; query = context["query"]
+    # Reject a historical batch before hashing/decoding its records. Public
+    # callers supply one original native day; Runtime borrows its admitted owner.
+    require(query["sessions"] == [feature_session] and
+            query["fields"] == ["close"] and
+            set(query["cutoff_by_session"]) == {feature_session} and
+            type(batch["records"]) is list and len(batch["records"]) == len(identities) and
+            set(batch["field_meta"]) <= {"close", "market_state"} and
+            all(type(meta["by_key"]) is list and len(meta["by_key"]) == len(identities)
+                for meta in batch["field_meta"].values()) and
+            type(batch["field_meta"]["market_state"]["by_key"]) is list and
+            len(batch["field_meta"]["market_state"]["by_key"]) == len(identities),
+            "public lifecycle input must be one complete native Feature day")
     require(Document.from_dict(batch).identity == binding["owner_native_ref"], "original lifecycle owner bytes mismatch")
     require(context["contract_version"] == "data_batch_v1" and context["domain"] == "market_state_diagnostics" and
             query["pit_policy"] == binding["pit_policy"] == "best_effort_vendor_v1" and

@@ -199,6 +199,29 @@ class MemberLifecycleTests(unittest.TestCase):
                 plan_stock_portfolio(frame, account=dict(cash_minor=50000000, positions={}, version=0),
                                      context=context, top_k=1)
 
+    def test_public_rejects_multiday_before_owner_hash_and_private_reuses_single_day_proof(self):
+        from axiom_engine.core import stock_lifecycle as module
+        from axiom_engine.core.stock_lifecycle import validate_feature_lifecycle_input
+        rules = event_rules(); context = context_for(rules, 1)
+        inputs = context['stock_feature_lifecycle']
+        proof = validate_feature_lifecycle_input(inputs, identities=validate_execution_rules(rules)[0],
+            rules_ref=context['stock_execution_rules_ref'], feature_session=DAYS[2],
+            feature_cutoff=DAYS[2]+'T20:30:00+08:00')
+        with patch.object(module.Document, 'from_dict', wraps=Document.from_dict) as hashing:
+            reused = validate_feature_lifecycle_input(proof.context(), identities=validate_execution_rules(rules)[0],
+                rules_ref=context['stock_execution_rules_ref'], feature_session=DAYS[2],
+                feature_cutoff=DAYS[2]+'T20:30:00+08:00', admitted=proof)
+            self.assertIs(reused, proof)
+            self.assertFalse(any(call.args[0] is inputs['owner_batch'] for call in hashing.call_args_list))
+        damaged = deepcopy(inputs)
+        damaged['owner_batch']['context']['query']['sessions'] = DAYS
+        with patch.object(module.Document, 'from_dict', wraps=Document.from_dict) as hashing:
+            with self.assertRaisesRegex(ContractError, 'one complete native Feature day'):
+                validate_feature_lifecycle_input(damaged, identities=validate_execution_rules(rules)[0],
+                    rules_ref=context['stock_execution_rules_ref'], feature_session=DAYS[2],
+                    feature_cutoff=DAYS[2]+'T20:30:00+08:00')
+            self.assertFalse(any(call.args[0] is damaged['owner_batch'] for call in hashing.call_args_list))
+
     def test_unknown_feature_lifecycle_retains_unknown_reason(self):
         rules = event_rules(); context = context_for(rules, 1)
         batch = context['stock_feature_lifecycle']['owner_batch']
