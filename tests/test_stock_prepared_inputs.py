@@ -121,6 +121,10 @@ class PreparedInputTests(unittest.TestCase):
                     with bind(market,gated) as current:
                         self.assertIs(current._AdmittedStockInputs__projection_store,old._AdmittedStockInputs__projection_store)
                         self.assertEqual(current.statistics["source_admissions"],0)
+                        from axiom_engine.runtime.stock_stream import _admit
+                        with current.execution_scope():
+                            _,audit,_=_admit(BacktestRequest.from_dict(gated),current,2,LIMITS)
+                            self.assertEqual(audit.receipt["request_ref"],gated["request_ref"])
                         with self.assertRaises(ContractError): current.inventory(changed)
                     with bind(market,changed) as current:
                         self.assertEqual(current.statistics["capture_seconds"],0)
