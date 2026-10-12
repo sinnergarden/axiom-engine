@@ -177,6 +177,8 @@ def _validate_stock_market_row(row, *, universe, calendar, refs, full):
 
 def validate_stock_request(plan, *, legacy_saved_top5=False):
     full = plan.get("contract_version") == "backtest_request_v6"
+    require("market_gate" not in plan.get("portfolio_policy", {}).get("strategy_spec", {}),
+            "market gate requires a bounded v7/v8 request with independent risk input")
     v4 = plan.get("contract_version") in ("backtest_request_v4", "backtest_request_v6")
     fields(plan, "contract_version account_id start_session end_session market_replay initial_account profile prediction_universe execution_universe supported_universe_ref portfolio_policy admission_ref admission_evidence stock_action_policy " +
            ("prediction_schedule" if v4 else "signal_frame") + (" stock_execution_rules_ref" if full else ""))

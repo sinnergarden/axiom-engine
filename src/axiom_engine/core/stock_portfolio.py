@@ -136,6 +136,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None, ad
     modern=v2 or derived or wire['contract_version']=='stock_prediction_run_v3'
     full = "stock_execution_rules" in context
     strategy = full and context["portfolio_policy"].get("contract_version") == "stock_portfolio_policy_v4"
+    market_gate = strategy and "market_gate" in context["portfolio_policy"]["strategy_spec"]
     require(admitted_rules is None or (admitted is not None and full), "validated rules require private Runtime admission")
     if full and admitted is None and not modern:
         unsigned = dict(wire); reference = unsigned.pop("signal_run_ref")
@@ -149,6 +150,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None, ad
     fields(context, "trade_session feature_session decision_time knowledge_cutoff reference_prices commission_rate minimum_commission_minor slippage_bps account_state_version supported_security_ids supported_universe_ref" +
            (" portfolio_policy stock_execution_rules stock_execution_rules_ref stock_feature_lifecycle" if full else " lot_size") +
            (" strategy_state pending_share_quantities reserved_security_ids risk_observations" if strategy else "") +
+           (" market_observation risk_input_ref registered_stock_right_security_ids" if market_gate else "") +
            (" feature_knowledge_cutoff" if modern else ""))
     session(context["trade_session"]); session(context["feature_session"])
     cutoff, decision = instant(context["knowledge_cutoff"]), instant(context["decision_time"])
@@ -290,7 +292,9 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None, ad
             "cash_minor": account["cash_minor"], "reference_prices": context["reference_prices"],
             "risk_observations": context["risk_observations"], "constraints": {"max_positions": k,
                 "reserved_security_ids": context["reserved_security_ids"],
-                **({"eligible_security_ids": [row["security_id"] for row in eligible]} if lifecycle_excluded else {})}},
+                **({"registered_stock_right_security_ids":context["registered_stock_right_security_ids"]} if market_gate else {}),
+                **({"eligible_security_ids": [row["security_id"] for row in eligible]} if lifecycle_excluded else {})},
+            **({"market_observation":context["market_observation"], "risk_input_ref":context["risk_input_ref"]} if market_gate else {})},
             state=context["strategy_state"]).to_dict()
         selected = strategy_targets["selected_security_ids"]
         result.update(strategy_spec_ref=context["portfolio_policy"]["strategy_spec_ref"],
@@ -298,6 +302,9 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None, ad
                       strategy_state_before_ref=Document.from_dict(context["strategy_state"]).identity,
                       strategy_targets=strategy_targets, strategy_targets_ref=Document.from_dict(strategy_targets).identity,
                       strategy_state_after_ref=Document.from_dict(strategy_targets["next_state"]).identity)
+        if market_gate:
+            result.update(risk_input_ref=context["risk_input_ref"],
+                          market_observation_ref=context["market_observation"]["observation_ref"])
         result["trace"].extend(strategy_targets["trace"])
         result["selected_security_ids"] = selected
         if strategy_targets["status"] == "NO_DECISION":
