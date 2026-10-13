@@ -154,7 +154,7 @@ def _needed(p, outputs):
                     deps.add(previous)
                 if op == 'pct_change':
                     deps.add(r)
-            elif op == 'rolling' or op in WINDOW:
+            elif op in ('rolling', 'rolling_industry') or op in WINDOW:
                 end = r + int(q['inclusive_current'])
                 start = end - q['window']
                 require(start >= 0 or p['history_policy'] != 'full', 'INSUFFICIENT_HISTORY')
@@ -410,6 +410,37 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                     put(out, oi, s, value, 'WINDOW_MISSING' if blocked else 'MISSING')
                 del windows, columns, ix, rows
                 budget.drop(workspace)
+            elif op == 'rolling_industry':
+                # One value per industry/session, then broadcast at TODAY's
+                # membership. Never roll a stock's changing industry labels.
+                source = parents[0]
+                end = r + int(q['inclusive_current'])
+                window = range(max(0, end-q['window']), end)
+                groups = {g for g in industry[r] if g is not None}
+                representatives = {}
+                for d in window:
+                    per_day = {}
+                    for j, group in enumerate(industry[d]):
+                        if member[d,j] and group is not None:
+                            per_day.setdefault(group,j)
+                    representatives[d] = per_day
+                for group in groups:
+                    dependencies = [(source, source.at(d), representatives[d][group])
+                                    for d in window if group in representatives[d]]
+                    vals = [source.numeric(d,representatives[d][group]) if group in representatives[d] else None for d in window]
+                    present = [v for v in vals if v is not None]
+                    blocked = len(present)<q['min_periods'] or q['missing']=='propagate' and len(present)!=len(vals)
+                    value = None if blocked else kernel.statistics.fmean(present)
+                    for j,g in enumerate(industry[r]):
+                        if g != group: continue
+                        out.available[oi,j] = max([int(ref_available[r,j])] + [int(src.available[ix,k]) for src,ix,k in dependencies])
+                        for src,ix,k in dependencies:
+                            out.source[oi,j] |= src.source[ix,k]
+                            out.issue[oi,j] |= src.issue[ix,k]
+                        out.source[oi,j] |= masks[int(ref_codes[r,j])]
+                        put(out,oi,j,value if member[r,j] else None,'REFERENCE_MISSING' if not member[r,j] else 'WINDOW_MISSING')
+                for j,g in enumerate(industry[r]):
+                    if g is None: put(out,oi,j,None,'REFERENCE_MISSING')
             elif op == 'rolling':
                 end = r + int(q['inclusive_current'])
                 rows = tuple(range(max(0, end - q['window']), end))
@@ -495,7 +526,7 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
             if last_use[a] == node_index and a in env:
                 budget.drop(env[a].bytes)
                 del env[a]
-        if op in ('shift', 'pct_change', 'rolling') or op in CS:
+        if op in ('shift', 'pct_change', 'rolling', 'rolling_industry') or op in CS:
             del source
         del parents, out
     computed_ns = perf_counter_ns()

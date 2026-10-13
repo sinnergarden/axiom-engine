@@ -6,12 +6,13 @@ from .contracts import (ABI, SEMANTICS, ContractError, FeaturePlan, digest, fiel
 PARAMS = {
     'constant': 'value', 'identity': '', 'shift': 'periods',
     'rolling': 'window min_periods inclusive_current reduction missing ddof ties',
+    'rolling_industry': 'window min_periods inclusive_current reduction missing ddof ties',
     'rolling_corr': 'window min_periods inclusive_current missing zero',
     'rolling_regression': 'window min_periods inclusive_current missing output zero',
     'rolling_quantile': 'window min_periods inclusive_current missing quantile interpolation',
     'rolling_idx': 'window min_periods inclusive_current missing extreme ties index_base',
     'pct_change': 'periods fill_method zero',
-    'add': '', 'sub': '', 'mul': '', 'divide': 'zero', 'abs': '', 'log1p': 'domain',
+    'add': '', 'sub': '', 'mul': '', 'divide': 'zero', 'abs': '', 'sqrt': 'domain', 'log1p': 'domain',
     'gt': 'missing', 'lt': 'missing', 'eq': 'missing',
     'and': 'missing', 'or': 'missing', 'not': 'missing', 'where': 'missing',
     'to_float': '', 'is_missing': '', 'fill': 'value', 'clip': 'lower upper',
@@ -93,6 +94,7 @@ def validate_plan(plan, *, execution=False):
                 'Unknown source qualification')
         ids.append(s['id'])
     require(len(ids) == len(set(ids)), 'Duplicate source binding')
+    node_definitions = {n['name']:n for n in p['nodes']}
     columns = dict(zip(names, p['input_schema']))
     history = {n: 0 for n in names}
     for n in p['nodes']:
@@ -113,7 +115,10 @@ def validate_plan(plan, *, execution=False):
         depth = max((history[a] for a in args), default=0)
         if op in ('shift', 'pct_change'):
             integer(q['periods'], 1); depth += q['periods']
-        if op == 'rolling':
+        if op in ('rolling', 'rolling_industry'):
+            if op == 'rolling_industry':
+                parent=node_definitions.get(args[0],{})
+                require(parent.get('op')=='cs_mean' and parent['params']['group']=='industry' and q['reduction']=='mean' and q['inclusive_current'] is True, 'Industry rolling needs an inclusive daily industry cs_mean series')
             integer(q['window'], 1); integer(q['min_periods'], 1)
             require(q['min_periods'] <= q['window'], 'min_periods exceeds window')
             require(type(q['inclusive_current']) is bool, 'Inclusive endpoint must be bool')
@@ -145,7 +150,7 @@ def validate_plan(plan, *, execution=False):
             require(q['zero'] in ('missing', 'reject'), 'Zero denominator policy required')
         if op in ('gt', 'lt', 'eq', 'and', 'or', 'not', 'where'):
             require(q['missing'] in ('preserve', 'false', 'reject'), 'Boolean missing policy')
-        if op == 'log1p':
+        if op in ('log1p','sqrt'):
             require(q['domain'] in ('missing', 'reject'), 'log1p domain policy')
         if op in ('constant', 'fill'):
             from .contracts import check_value
@@ -188,6 +193,8 @@ def validate_plan(plan, *, execution=False):
             require(all(c['dtype'] == 'date' for c in parents) and col['unit'] == 'days', 'Date age inputs/unit')
         elif op not in ('asof', 'constant', 'identity', 'shift', 'fill', 'is_missing', 'to_float'):
             require(all(c['dtype'] == 'float64' for c in parents), 'Numeric inputs required')
+        if op == 'sqrt':
+            require(parents[0]['unit']=='dimensionless','sqrt currently requires dimensionless input')
         if op == 'to_float':
             require(parents[0]['dtype'] == 'bool', 'to_float requires bool')
         expected_dtype = 'bool' if op in ('gt', 'lt', 'eq', 'and', 'or', 'not', 'is_missing') else None
@@ -199,11 +206,11 @@ def validate_plan(plan, *, execution=False):
             require(all(col[k] == parents[0][k] for k in ('dtype', 'unit')), 'Preserving operator schema mismatch')
         if op in ('add', 'sub', 'gt', 'lt', 'eq'):
             require(parents[0]['unit'] == parents[1]['unit'], 'Mixed units')
-        preserve_unit = op in ('add', 'sub', 'abs', 'clip', 'cs_winsorize', 'cs_mean') or op == 'rolling' and q['reduction'] != 'rank'
+        preserve_unit = op == 'rolling_industry' or op in ('add', 'sub', 'abs', 'clip', 'cs_winsorize', 'cs_mean') or op == 'rolling' and q['reduction'] != 'rank'
         preserve_unit = preserve_unit or op == 'rolling_quantile' or op == 'rolling_regression' and q['output'] != 'rsquare'
         if preserve_unit:
             require(col['unit'] == parents[0]['unit'], 'Output unit mismatch')
-        dimensionless = op in ('pct_change', 'cs_rank', 'cs_zscore', 'to_float', 'log1p') or op == 'rolling' and q['reduction'] == 'rank'
+        dimensionless = op in ('pct_change', 'cs_rank', 'cs_zscore', 'to_float', 'log1p', 'sqrt') or op == 'rolling' and q['reduction'] == 'rank'
         dimensionless = dimensionless or op in ('rolling_corr', 'rolling_idx') or op == 'rolling_regression' and q['output'] == 'rsquare'
         if dimensionless:
             require(col['unit'] == 'dimensionless', 'Dimensionless output required')
@@ -227,6 +234,6 @@ def required_history(plan):
     for n in p['nodes']:
         d = max((depth[a] for a in n['inputs']), default=0)
         if n['op'] in ('shift', 'pct_change'): d += n['params']['periods']
-        if n['op'] == 'rolling' or n['op'] in WINDOW: d += n['params']['window'] - int(n['params']['inclusive_current'])
+        if n['op'] in ('rolling', 'rolling_industry') or n['op'] in WINDOW: d += n['params']['window'] - int(n['params']['inclusive_current'])
         depth[n['name']] = d
     return {o['column']['name']: depth[o['node']] for o in p['outputs']}

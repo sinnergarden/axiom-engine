@@ -211,6 +211,13 @@ def _required_cells(p, outputs, by_security, refs, reference_index):
                 require(p['history_policy'] == 'partial' or start >= 0,
                         'INSUFFICIENT_HISTORY: full rolling dependency')
                 dependencies = history[max(0, start):end]
+        elif op == 'rolling_industry':
+            i=positions[key]; history=by_security[key[0]]
+            end=i+int(q['inclusive_current']); start=end-q['window']
+            require(p['history_policy']=='partial' or start>=0,'INSUFFICIENT_HISTORY')
+            group=refs[key]['industry']
+            dependencies=[k for _,day in history[max(0,start):end]
+                          for k in by_industry.get((day,group),()) if refs[k]['member']] if group is not None else []
         elif op in CS:
             industry = refs[key]['industry']
             group = (name, key[1], industry if q['group'] == 'industry' else '')
@@ -296,6 +303,9 @@ def _element_numeric(op, vals, q):
     elif op == 'sub': value = vals[0] - vals[1]
     elif op == 'mul': value = vals[0] * vals[1]
     elif op == 'abs': value = abs(x)
+    elif op == 'sqrt':
+        require(x>=0 or q['domain']=='missing','SQRT_DOMAIN')
+        value=math.sqrt(x) if x>=0 else None
     elif op == 'to_float': value = float(x)
     elif op == 'calendar_age': value = max(0, (date.fromisoformat(vals[0]) - date.fromisoformat(vals[1])).days)
     elif op == 'clip':
@@ -494,6 +504,19 @@ def _execute_feature_plan(plan, facts, context, *, reuse=None, profile=None):
         if op in CS:
             out = _cross_section(op, env[args[0]], node_keys, refs, q, reference_index,
                                  reuse=reuse, node_index=node_index, source_name=args[0])
+        elif op == 'rolling_industry':
+            # Unknown industry rows have no parent cohort to evaluate. Keep
+            # their result explicitly missing without requiring an otherwise
+            # unused cross-sectional parent node in the execution environment.
+            out={}; source=env.get(args[0], {})
+            for key in node_keys:
+                i=positions[key]; history=by_security[key[0]]; group=refs[key]['industry']
+                end=i+int(q['inclusive_current']); cells=[]
+                for _,day in history[max(0,end-q['window']):end]:
+                    candidates=[k for k in reference_index[1].get((day,group),()) if refs[k]['member']] if group is not None else []
+                    cells.append(source[candidates[0]] if candidates else _Cell(None,None,(),(),'REFERENCE_MISSING'))
+                value=_rolling(cells,q) if group is not None and refs[key]['member'] else _Cell(None,None,(),(),'REFERENCE_MISSING')
+                out[key]=_merge(value.value,[value,_Cell(None,refs[key]['available_at'],(refs[key]['source'],))],value.reason)
         elif op in ('shift', 'pct_change', 'rolling') or op in WINDOW:
             out = {}
             source = env.get(args[0], {})
