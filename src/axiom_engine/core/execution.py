@@ -443,13 +443,14 @@ def _cross_section(op, source, keys, refs, q, reference_index, *, reuse=None, no
             std, undefined = None, True
         eligible = set(eligible)
         group_dependency = _merge(None, deps + refs_cells)
-        mean = None
+        mean = statistics.fmean(vals) if op == 'cs_mean' and vals and not blocked else None
         for key in group_keys:
             x = source[key].value
             if x is None and q['missing'] == 'fill_zero': x = 0.0
             value = None
-            if key in eligible and vals and not blocked and x is not None:
-                if op == 'cs_rank': value = _rank(x, vals)
+            if key in eligible and vals and not blocked and (x is not None or op == 'cs_mean'):
+                if op == 'cs_mean': value = mean
+                elif op == 'cs_rank': value = _rank(x, vals)
                 elif op == 'cs_winsorize': value = min(max(x, _quantile(vals, q['lower'])), _quantile(vals, q['upper']))
                 else: value, mean = _cs_zscore_value(x, vals, std, undefined, q, mean)
             elif op == 'cs_zscore' and key in eligible and not blocked and undefined:

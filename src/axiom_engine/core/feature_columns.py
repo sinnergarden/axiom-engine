@@ -450,7 +450,7 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                     for s in group_indices:
                         dep_source |= masks[int(ref_codes[r, s])]
                     dep_issue = any(source.issue[pi, s] for s in eligible)
-                    mean = None
+                    mean = kernel.statistics.fmean(vals) if op == 'cs_mean' and vals and not blocked else None
                     for s in group_indices:
                         out.available[oi, s] = max(dep_time, int(source.available[pi, s]))
                         out.source[oi, s] = dep_source | int(source.source[pi, s])
@@ -459,8 +459,9 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                         if x is None and q['missing'] == 'fill_zero':
                             x = 0.0
                         value = None
-                        if s in eligible_set and vals and not blocked and x is not None:
-                            if op == 'cs_rank': value = kernel._rank(x, vals)
+                        if s in eligible_set and vals and not blocked and (x is not None or op == 'cs_mean'):
+                            if op == 'cs_mean': value = mean
+                            elif op == 'cs_rank': value = kernel._rank(x, vals)
                             elif op == 'cs_winsorize': value = min(max(x, kernel._quantile(vals, q['lower'])), kernel._quantile(vals, q['upper']))
                             else: value, mean = kernel._cs_zscore_value(x, vals, std, undefined, q, mean)
                         elif op == 'cs_zscore' and s in eligible_set and not blocked and undefined:

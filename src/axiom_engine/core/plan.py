@@ -15,6 +15,7 @@ PARAMS = {
     'gt': 'missing', 'lt': 'missing', 'eq': 'missing',
     'and': 'missing', 'or': 'missing', 'not': 'missing', 'where': 'missing',
     'to_float': '', 'is_missing': '', 'fill': 'value', 'clip': 'lower upper',
+    'cs_mean': 'group unknown_group missing excluded',
     'cs_rank': 'group unknown_group missing ties excluded',
     'cs_zscore': 'group unknown_group missing ddof epsilon constant clip excluded',
     'cs_winsorize': 'group unknown_group missing lower upper interpolation excluded',
@@ -22,7 +23,7 @@ PARAMS = {
 }
 BINARY = {'add', 'sub', 'mul', 'divide', 'gt', 'lt', 'eq', 'and', 'or', 'calendar_age', 'rolling_corr'}
 WINDOW = {'rolling_corr', 'rolling_regression', 'rolling_quantile', 'rolling_idx'}
-CS = {'cs_rank', 'cs_zscore', 'cs_winsorize'}
+CS = {'cs_mean', 'cs_rank', 'cs_zscore', 'cs_winsorize'}
 
 
 def validate_cs_zscore_params(q):
@@ -164,7 +165,7 @@ def validate_plan(plan, *, execution=False):
                 require(q['ties'] == 'average', 'Rank ties must be average')
             elif op == 'cs_zscore':
                 validate_cs_zscore_params(q)
-            else:
+            elif op == 'cs_winsorize':
                 number(q['lower']); number(q['upper'])
                 require(0 <= q['lower'] <= q['upper'] <= 1 and q['interpolation'] == 'linear',
                         'Quantile bounds/interpolation unsupported')
@@ -198,7 +199,7 @@ def validate_plan(plan, *, execution=False):
             require(all(col[k] == parents[0][k] for k in ('dtype', 'unit')), 'Preserving operator schema mismatch')
         if op in ('add', 'sub', 'gt', 'lt', 'eq'):
             require(parents[0]['unit'] == parents[1]['unit'], 'Mixed units')
-        preserve_unit = op in ('add', 'sub', 'abs', 'clip', 'cs_winsorize') or op == 'rolling' and q['reduction'] != 'rank'
+        preserve_unit = op in ('add', 'sub', 'abs', 'clip', 'cs_winsorize', 'cs_mean') or op == 'rolling' and q['reduction'] != 'rank'
         preserve_unit = preserve_unit or op == 'rolling_quantile' or op == 'rolling_regression' and q['output'] != 'rsquare'
         if preserve_unit:
             require(col['unit'] == parents[0]['unit'], 'Output unit mismatch')
