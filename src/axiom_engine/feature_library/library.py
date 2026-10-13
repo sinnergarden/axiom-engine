@@ -16,10 +16,10 @@ from pathlib import Path
 
 from ..core import compile_feature_columns, execute_feature_columns
 from .codec import digest, seal, require, is_ref, file_digest
-from .identity import feature_definitions, select_feature_plan
+from .identity import feature_definitions, select_feature_plan, select_security_plan
 from .storage import write_buffer, write_part
 from .store import VerifiedMatrixStore
-from .coverage import (VIEW_V1, VIEW_VERSION, coverage_summary, partition_descriptor,
+from .coverage import (VIEW_V1, VIEW_V2, VIEW_VERSION, coverage_summary, partition_descriptor,
                        read_index, write_date, publish_index, compact_view)
 
 ARRAYS = {'values': 'float64_le', 'validity': 'bool_u8', 'reason_codes': 'int32_le',
@@ -253,14 +253,46 @@ class FeatureLibrary:
         require(set(dependencies) == set(days), 'complete daily dependency bindings required')
         parts = self._index()['partitions'] if _partitions is None else _partitions
         lookup=self._coverage_lookup(parts); hits, gaps = [], []
+        # Legacy immutable summaries have only an axis hash. Read the sealed
+        # parent to recover its axis; never rewrite a partition to add an index.
+        candidates={}; scoped={}; selected_axes={}
+        independent={c:d for c,d in definitions.items() if not d['reference_dependent']}
+        for candidate in parts:
+            for column in candidate['columns']:
+                candidates.setdefault((candidate['sessions'][0],column,candidate['semantic_refs'][column]),[]).append(candidate)
         for day in days:
-            require(set(dependencies[day]) == set(definitions) and
-                    all(is_ref(ref) for ref in dependencies[day].values()), 'exact column dependency bindings required')
-            for column, definition in definitions.items():
-                match=lookup.get((day,security_axis_ref,column,definition['semantic_ref'],dependencies[day][column]))
-                if match is not None:
-                    hits.append({'session':day, 'column':column, 'partition':match})
-                else: gaps.append({'session':day, 'column':column})
+            candidate_axes={}
+            with VerifiedMatrixStore(**self.limits) as store:
+                require(set(dependencies[day]) == set(definitions) and
+                        all(is_ref(ref) for ref in dependencies[day].values()), 'exact column dependency bindings required')
+                for column, definition in definitions.items():
+                    match=lookup.get((day,security_axis_ref,column,definition['semantic_ref'],dependencies[day][column]))
+                    if match is not None:
+                        hits.append({'session':day,'column':column,'partition':match,'security_ids':securities})
+                        continue
+                    remaining=set(securities)
+                    # Reference-dependent results use the complete physical grid.
+                    # Only independent columns can be assembled from older blocks.
+                    if not definition['reference_dependent']:
+                        for candidate in reversed(candidates.get((day,column,definition['semantic_ref']),[])):
+                            ref=candidate['partition_ref']
+                            if ref not in candidate_axes:
+                                desc=partition_descriptor(candidate)
+                                part=store.read_json(desc,'partition_ref')
+                                require(coverage_summary(desc,part)==candidate, 'coverage differs from admitted partition')
+                                candidate_axes[ref]=_ordered(part['security_ids'],'partition securities')
+                            axis=candidate_axes[ref]
+                            selected=sorted(remaining.intersection(axis))
+                            if not selected or not set(axis)<=set(securities): continue
+                            key=candidate['security_axis_ref']
+                            if key not in scoped:
+                                scoped[key]=source_adapter.dependency_refs(independent,days,axis)
+                            if scoped[key][day][column]!=candidate['dependency_refs'][column]: continue
+                            selected=selected_axes.setdefault(tuple(selected),selected)
+                            hits.append({'session':day,'column':column,'partition':candidate,'security_ids':selected})
+                            remaining.difference_update(selected)
+                            if not remaining: break
+                    if remaining: gaps.append({'session':day,'column':column,'security_ids':sorted(remaining)})
         return {'hits':hits, 'gaps':gaps, 'dependencies':dependencies, 'definitions':definitions,
             'sessions':days, 'security_ids':securities, 'sample_universe':sample}
 
@@ -292,35 +324,46 @@ class FeatureLibrary:
                         validated[part['partition_ref']]=_partition_arrays(admitted,part)
                 admitted.check()
                 admission_metrics={k:v-baseline[k] for k,v in admitted.metrics.items()}
-            stats = {'core_calls':0, 'computed_output_cells':0, 'hit_columns':len(coverage['hits']),
+            stats = {'core_calls':0, 'computed_output_cells':0, 'hit_columns':len({(h['session'],h['column']) for h in coverage['hits']}),
+                     'hit_security_blocks':len(coverage['hits']),
                      'gap_columns':len(coverage['gaps']), 'recovered_partitions':len(recovered),
                      'coverage_date_writes':0, 'coverage_root_writes':0,
                      'maximum_execution_source_ids':0,
                      'admission_file_hash_calls':admission_metrics['file_hash_calls'],
                      'admission_hash_bytes':admission_metrics['hash_bytes']}
-            compiled = {}; by_day={day:[] for day in coverage['sessions']}
+            compiled = {}; by_day={day:{} for day in coverage['sessions']}
             parts_by_day={}
             for part in partitions: parts_by_day.setdefault(part['sessions'][0],[]).append(part)
             dirty=set(recovered) | (set(parts_by_day)-set(shards))
             for day in sorted(dirty):
                 shards[day]=write_date(self.root,day,parts_by_day[day])
                 stats['coverage_date_writes']+=1
-            final_hits={(h['session'],h['column']):h for h in coverage['hits']}
-            for gap in coverage['gaps']: by_day[gap['session']].append(gap['column'])
-            for day in coverage['sessions']:
-                columns = by_day[day]
-                if not columns: continue
+            final_hits={}
+            for hit in coverage['hits']: final_hits.setdefault((hit['session'],hit['column']),[]).append(hit)
+            for gap in coverage['gaps']:
+                by_day[gap['session']].setdefault(tuple(gap['security_ids']),[]).append(gap['column'])
+            jobs=[(day,list(axis),columns) for day,groups in by_day.items() for axis,columns in groups.items()]
+            gap_scopes={}
+            for day,axis,columns in jobs:
+                scope=gap_scopes.setdefault(tuple(axis),{'days':set(),'columns':set()})
+                scope['days'].add(day); scope['columns'].update(columns)
+            gap_bindings={axis:source_adapter.dependency_refs(
+                {c:coverage['definitions'][c] for c in coverage['definitions'] if c in scope['columns']},
+                sorted(scope['days']),list(axis)) for axis,scope in gap_scopes.items()}
+            for day,securities,columns in jobs:
                 plan = select_feature_plan(request.plan, columns)
-                bindings = {c:coverage['dependencies'][day][c] for c in columns}
+                if securities!=coverage['security_ids']:
+                    plan=select_security_plan(plan,securities)
+                bindings = {c:gap_bindings[tuple(securities)][day][c] for c in columns}
                 if hasattr(source_adapter,'execution_plan'):
-                    actual=source_adapter.execution_plan(plan,day,coverage['security_ids'],bindings)
+                    actual=source_adapter.execution_plan(plan,day,securities,bindings)
                     before=plan.to_dict(); after=actual.to_dict()
                     require({k:v for k,v in before.items() if k!='sources'}==
                             {k:v for k,v in after.items() if k!='sources'},
                             'execution source projection changed Feature semantics')
                     plan=actual
                 stats['maximum_execution_source_ids']=max(stats['maximum_execution_source_ids'],len(plan.to_dict()['sources']))
-                inputs = source_adapter.prepare(plan, day, coverage['security_ids'], bindings)
+                inputs = source_adapter.prepare(plan, day, securities, bindings)
                 require(inputs['input_refs'].get('feature_dependency_ref') == digest(bindings),
                         'prepared inputs do not bind planned dependencies')
                 key = plan.identity
@@ -328,8 +371,8 @@ class FeatureLibrary:
                 result = execute_feature_columns(compiled[key], inputs=inputs, output_sessions=[day],
                     max_working_bytes=self.limits['maximum_matrix_bytes'])
                 arrays, header = _capture_result(result, day=day, columns=columns,
-                    securities=coverage['security_ids'], maximum_bytes=self.limits['maximum_matrix_bytes'])
-                stats['core_calls'] += 1; stats['computed_output_cells'] += len(coverage['security_ids'])*len(columns)
+                    securities=securities, maximum_bytes=self.limits['maximum_matrix_bytes'])
+                stats['core_calls'] += 1; stats['computed_output_cells'] += len(securities)*len(columns)
                 for start in range(0,len(columns),self.column_block):
                     stop=min(start+self.column_block,len(columns)); block_columns=columns[start:stop]
                     block={name:value[:,:,start:stop] for name,value in arrays.items()}; buffers={}; block_digests={}
@@ -345,7 +388,7 @@ class FeatureLibrary:
                         'original_result_ref':header['result_ref'],'column_indices':list(range(start,stop)),
                         'output_buffers':block_digests},'projection_ref')
                     part=seal({'contract_version':PARTITION_VERSION,'sessions':[day],
-                        'security_ids':coverage['security_ids'],'columns':block_columns,
+                        'security_ids':securities,'columns':block_columns,
                         'schema':[coverage['definitions'][c]['schema'] for c in block_columns],
                         'semantic_refs':{c:coverage['definitions'][c]['semantic_ref'] for c in block_columns},
                         'dependency_refs':{c:bindings[c] for c in block_columns},'buffers':buffers,
@@ -359,7 +402,8 @@ class FeatureLibrary:
                     descriptor['path']=str(record); summary=coverage_summary(descriptor,part); partitions.append(summary)
                     parts_by_day.setdefault(day,[]).append(summary)
                     for column in block_columns:
-                        final_hits[day,column]={'session':day,'column':column,'partition':summary}
+                        final_hits.setdefault((day,column),[]).append({'session':day,'column':column,
+                            'partition':summary,'security_ids':securities})
                     if progress is not None: progress({'stage':'partition_sealed','session':day,**deepcopy(stats)})
                 shards[day]=write_date(self.root,day,parts_by_day[day])
                 stats['coverage_date_writes']+=1
@@ -386,7 +430,7 @@ class FeatureView:
         self._own_store=_session is None
         self._store = VerifiedMatrixStore(**limits) if _session is None else _session['store']
         self._view = self._store.read_json(descriptor, 'view_ref')
-        require(self._view['contract_version'] in (VIEW_V1,VIEW_VERSION), 'unsupported Feature view')
+        require(self._view['contract_version'] in (VIEW_V1,VIEW_V2,VIEW_VERSION), 'unsupported Feature view')
         self.descriptor = deepcopy(descriptor)
         self._loaded = {} if _session is None else _session['arrays']
         self._parts={}; self._tiles={}; self._legacy=self._view['contract_version']==VIEW_V1
@@ -395,30 +439,51 @@ class FeatureView:
                         for t in self._view['tiles'])
         else:
             selections=self._view['blocks']
+        physical=_ordered(self._view['security_ids'],'view securities'); physical_set=frozenset(physical)
+        axes=self._view.get('security_axes',{})
+        require(self._view['contract_version']==VIEW_VERSION or not axes,'legacy view cannot declare security blocks')
+        require(all(digest(axis)==ref for ref,axis in axes.items()),'view security axis identity mismatch')
+        axis_sets={ref:frozenset(_ordered(axis,'view block securities')) for ref,axis in axes.items()}
         for block in selections:
+            axis_ref=block.get('security_axis_ref')
+            require(self._view['contract_version']==VIEW_VERSION or axis_ref is None,
+                    'legacy view cannot select security blocks')
+            require(axis_ref is None or axis_ref in axes,'unknown view security axis')
+            selected=physical if axis_ref is None else axes[axis_ref]
+            selected_set=physical_set if axis_ref is None else axis_sets[axis_ref]
+            require(selected_set<=physical_set,'Feature block outside view')
+            selection={'partition':block['partition'],'security_ids':selected,'security_set':selected_set}
             for column in block['columns']:
                 key=block['session'],column
-                require(key not in self._tiles, 'duplicate Feature view cell selection')
-                self._tiles[key]=block['partition']
+                previous=self._tiles.setdefault(key,[])
+                require(not any(selected_set & old['security_set'] for old in previous),
+                        'duplicate Feature view cell selection')
+                previous.append(selection)
         require(set(self._tiles)=={(d,c) for d in self._view['sessions'] for c in self._view['columns']} and
                 set(self._view['definitions'])==set(self._view['columns']), 'incomplete Feature view selection')
+        require(all(sum(len(b['security_ids']) for b in blocks)==len(physical)
+                    for blocks in self._tiles.values()), 'incomplete Feature security coverage')
 
-    def _partition(self, day, column, *, store=None, parts=None):
+    def _partition(self, day, column, *, block=None, store=None, parts=None):
         store=self._store if store is None else store
         parts=self._parts if parts is None else parts
-        desc=self._tiles[day,column]; ref=desc['partition_ref']
+        block=self._tiles[day,column][0] if block is None else block
+        desc=block['partition']; ref=desc['partition_ref']
         if ref not in parts:
             proof=partition_descriptor(desc)
             part=store.read_json(proof,'partition_ref')
             require(part['contract_version']==PARTITION_VERSION and part['sessions']==[day] and
-                    part['security_ids']==self._view['security_ids'] and
+                    set(block['security_ids'])<=set(part['security_ids']) and
                     set(part['semantic_refs'])==set(part['dependency_refs'])==set(part['columns']) and
                     all(is_ref(r) for r in part['semantic_refs'].values()) and
                     all(is_ref(r) for r in part['dependency_refs'].values()), 'view partition coverage mismatch')
             parts[ref]=part
         else: store.check_path(partition_descriptor(desc)['path'])
         part=parts[ref]
-        require(part['sessions']==[day] and column in part['columns'] and
+        require(self._view['contract_version']==VIEW_VERSION or part['security_ids']==self._view['security_ids'],
+                'legacy view partition coverage mismatch')
+        require(set(block['security_ids'])<=set(part['security_ids']) and
+                part['sessions']==[day] and column in part['columns'] and
                 part['semantic_refs'][column]==self._view['definitions'][column]['semantic_ref'],
                 'view Feature semantics mismatch')
         if self._legacy:
@@ -430,14 +495,18 @@ class FeatureView:
         """Read original per-column semantics, dependencies and sources, without Core.
 
         The compact selection only points to immutable partitions. Actual parent
-        bytes and content refs are admitted before returning their receipts;
-        source eligibility/PIT remains the source adapter's responsibility.
+        bytes and content refs are admitted before returning their receipts.
+        ``blocks`` carries each original dependency and its full/selected axes.
+        A single block retains the legacy ``partition`` and dependency ref; a
+        multi-block dependency ref binds the composition, so adapters must check
+        its block receipts against the source before deriving full-axis refs.
+        Source eligibility/PIT remains the source adapter's responsibility.
         """
         with self.operation():
             columns=list(self._view['columns'] if columns is None else columns)
             require(bool(columns) and len(columns)==len(set(columns)) and
                     all((session,c) in self._tiles for c in columns), 'Feature receipt selection outside view')
-            cached=all(self._tiles[session,c]['partition_ref'] in self._parts for c in columns)
+            cached=all(b['partition']['partition_ref'] in self._parts for c in columns for b in self._tiles[session,c])
             # Planning years of dependencies must not accumulate every date's
             # metadata in one owner and repeatedly stat all previous parents. Reuse
             # projected parents, otherwise admit this day's receipts in a bounded
@@ -450,11 +519,23 @@ class FeatureView:
             with owner as store, store.operation():
                 parts=self._parts if cached else {}
                 for column in columns:
-                    part=self._partition(session,column,store=store,parts=parts)
-                    result[column]={'semantic_ref':part['semantic_refs'][column],
-                        'dependency_ref':part['dependency_refs'][column],
-                        'source_bindings':deepcopy(part['column_source_bindings'][column]),
-                        'partition':partition_descriptor(self._tiles[session,column])}
+                    receipts=[]; bindings={}
+                    for block in self._tiles[session,column]:
+                        part=self._partition(session,column,block=block,store=store,parts=parts)
+                        receipts.append({'semantic_ref':part['semantic_refs'][column],
+                            'dependency_ref':part['dependency_refs'][column],
+                            'security_ids':deepcopy(part['security_ids']),
+                            'selected_security_ids':deepcopy(block['security_ids']),
+                            'partition':partition_descriptor(block['partition'])})
+                        for binding in part['column_source_bindings'][column]:
+                            require(binding['id'] not in bindings or bindings[binding['id']]==binding,
+                                    'conflicting source ID')
+                            bindings[binding['id']]=binding
+                    result[column]={'semantic_ref':receipts[0]['semantic_ref'],
+                        'dependency_ref':receipts[0]['dependency_ref'] if len(receipts)==1 else digest(receipts),
+                        'source_bindings':[bindings[k] for k in sorted(bindings)],
+                        'blocks':receipts}
+                    if len(receipts)==1: result[column]['partition']=receipts[0]['partition']
             return result
 
     @property
@@ -500,34 +581,37 @@ class FeatureView:
             tiles=self._tiles
             for day,target in targets.items():
                 for j, column in enumerate(columns):
-                    desc = tiles[day,column]; ref = desc['partition_ref']
-                    if ref not in used:
-                        part = self._partition(day,column)
-                        if ref not in self._loaded: self._loaded[ref] = _partition_arrays(self._store, part)
-                        for path in _partition_buffer_paths(part): self._store.check_path(path)
-                        arrays = self._loaded[ref]
-                        reason_map=[]; source_map=[]
-                        for reason in part['core_header']['reason_dictionary']:
-                            if reason not in reasons: reasons.append(reason)
-                            reason_map.append(reasons.index(reason))
-                        for sources in part['core_header']['source_sets']:
-                            if sources not in source_sets: source_sets.append(sources)
-                            source_map.append(source_sets.index(sources))
-                        for binding in part['core_header']['source_bindings']:
-                            require(binding['id'] not in bindings or bindings[binding['id']] == binding, 'conflicting source ID')
-                            bindings[binding['id']] = binding
-                        used[ref]=(part,arrays,np.asarray(reason_map),np.asarray(source_map),
-                            {s:i for i,s in enumerate(part['security_ids'])},
-                            {c:i for i,c in enumerate(part['columns'])})
-                    part,arrays,reason_map,source_map,axis,positions = used[ref]
-                    require(part['semantic_refs'][column] == view['definitions'][column]['semantic_ref'], 'view Feature semantics mismatch')
-                    col = positions[column]
-                    rows = [axis[keys[i][0]] for i in target]
-                    for name in ARRAYS:
-                        values = arrays[name][0,rows,col]
-                        if name == 'reason_codes': values = reason_map[values]
-                        if name == 'source_codes': values = source_map[values]
-                        out[name][target,j] = values
+                    for selection in tiles[day,column]:
+                        desc = selection['partition']; ref = desc['partition_ref']
+                        block_target=[i for i in target if keys[i][0] in selection['security_set']]
+                        if not block_target: continue
+                        part = self._partition(day,column,block=selection)
+                        if ref not in used:
+                            if ref not in self._loaded: self._loaded[ref] = _partition_arrays(self._store, part)
+                            for path in _partition_buffer_paths(part): self._store.check_path(path)
+                            arrays = self._loaded[ref]
+                            reason_map=[]; source_map=[]
+                            for reason in part['core_header']['reason_dictionary']:
+                                if reason not in reasons: reasons.append(reason)
+                                reason_map.append(reasons.index(reason))
+                            for sources in part['core_header']['source_sets']:
+                                if sources not in source_sets: source_sets.append(sources)
+                                source_map.append(source_sets.index(sources))
+                            for binding in part['core_header']['source_bindings']:
+                                require(binding['id'] not in bindings or bindings[binding['id']] == binding, 'conflicting source ID')
+                                bindings[binding['id']] = binding
+                            used[ref]=(part,arrays,np.asarray(reason_map),np.asarray(source_map),
+                                {s:i for i,s in enumerate(part['security_ids'])},
+                                {c:i for i,c in enumerate(part['columns'])})
+                        part,arrays,reason_map,source_map,axis,positions = used[ref]
+                        require(part['semantic_refs'][column] == view['definitions'][column]['semantic_ref'], 'view Feature semantics mismatch')
+                        col = positions[column]
+                        rows = [axis[keys[i][0]] for i in block_target]
+                        for name in ARRAYS:
+                            values = arrays[name][0,rows,col]
+                            if name == 'reason_codes': values = reason_map[values]
+                            if name == 'source_codes': values = source_map[values]
+                            out[name][block_target,j] = values
             selected=sorted(set(int(code) for code in np.unique(out['source_codes'])))
             remap=np.zeros(len(source_sets),dtype='int32')
             for code,old in enumerate(selected): remap[old]=code

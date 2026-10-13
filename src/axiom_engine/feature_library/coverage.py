@@ -12,7 +12,8 @@ INDEX_V1 = 'feature_library_coverage_v1'
 INDEX_VERSION = 'feature_library_coverage_v2'
 DATE_VERSION = 'feature_library_date_coverage_v2'
 VIEW_V1 = 'feature_library_view_v1'
-VIEW_VERSION = 'feature_library_view_v2'
+VIEW_V2 = 'feature_library_view_v2'
+VIEW_VERSION = 'feature_library_view_v3'
 PART_FIELDS = ('path', 'file_digest', 'partition_ref')
 
 
@@ -84,15 +85,25 @@ def publish_index(root, shards):
 
 def compact_view(coverage, hits):
     """One descriptor per selected block; no semantic or provenance copies."""
-    blocks = {}
+    blocks = {}; axes={}; axis_refs={}
     for day in coverage['sessions']:
         for column in coverage['definitions']:
-            descriptor = partition_descriptor(hits[day,column]['partition'])
-            key = day, descriptor['partition_ref']
-            if key not in blocks:
-                blocks[key] = {'session':day, 'columns':[], 'partition':descriptor}
-            require(blocks[key]['partition'] == descriptor, 'conflicting Feature block descriptor')
-            blocks[key]['columns'].append(column)
+            selections=hits[day,column]
+            if isinstance(selections,dict): selections=[selections]
+            for hit in sorted(selections,key=lambda h:tuple(h.get('security_ids',coverage['security_ids']))):
+                descriptor = partition_descriptor(hit['partition'])
+                securities=hit.get('security_ids',coverage['security_ids'])
+                axis_ref=None
+                if securities!=coverage['security_ids']:
+                    axis=tuple(securities)
+                    if axis not in axis_refs: axis_refs[axis]=digest(securities)
+                    axis_ref=axis_refs[axis]; axes[axis_ref]=securities
+                key = day, descriptor['partition_ref'], axis_ref
+                if key not in blocks:
+                    blocks[key] = {'session':day, 'columns':[], 'partition':descriptor}
+                    if axis_ref is not None: blocks[key]['security_axis_ref']=axis_ref
+                require(blocks[key]['partition'] == descriptor, 'conflicting Feature block descriptor')
+                blocks[key]['columns'].append(column)
     return seal({'contract_version': VIEW_VERSION,
         **{k:coverage[k] for k in ('sessions','security_ids','sample_universe','definitions')},
-        'columns':list(coverage['definitions']), 'blocks':list(blocks.values())}, 'view_ref')
+        'columns':list(coverage['definitions']), 'security_axes':axes, 'blocks':list(blocks.values())}, 'view_ref')
