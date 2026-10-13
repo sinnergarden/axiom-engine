@@ -194,7 +194,7 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     begin_ns = perf_counter_ns()
     require(type(compiled) is CompiledFeatureColumns, 'Expected compiled Feature columns')
     integer(max_working_bytes, 1)
-    fields(inputs, _FIELDS)
+    fields(inputs, _FIELDS + ' ' + ' '.join(k for k in ('reference_member_known', 'reference_pool_complete') if k in inputs))
     require(inputs['contract_version'] == 'feature_column_input_v1', 'Column input version')
     p = compiled._plan
     for name in ('calendar_ref', 'reference_ref'):
@@ -279,6 +279,12 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     cutoff = _time(np, cutoff_raw, cutoff=True)
     require(bool(np.all(cutoff[1:] >= cutoff[:-1])), 'Cutoffs must be monotonic')
     member = take('reference_member', 'bool')
+    member_known = (take('reference_member_known', 'bool') if 'reference_member_known' in inputs
+                    else np.ones(shape, dtype=bool))
+    pool_complete = (take('reference_pool_complete', 'bool') if 'reference_pool_complete' in inputs
+                     else np.ones(shape, dtype=bool))
+    require(bool(np.all(pool_complete == pool_complete[:, :1])), 'Reference pool completeness must be per session')
+    require(not bool(np.any(member & ~member_known)), 'Unknown member cannot be positive')
     ref_available_raw = take('reference_available_at_utc_us', 'int64')
     ref_available = _time(np, ref_available_raw)
     require(bool(np.all(ref_available <= cutoff[:, None])), 'Unavailable reference')
@@ -459,6 +465,19 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
             elif op in CS:
                 source = parents[0]
                 pi = source.at(r)
+                if not pool_complete[r, 0]:
+                    # Physical facts remain usable; only reference-dependent
+                    # nodes lack the proof of a complete cross section.
+                    merge(out, oi, [(source, pi)])
+                    ref_mask = 0
+                    for code in ref_codes[r]: ref_mask |= masks[int(code)]
+                    ref_time = int(np.max(ref_available[r]))
+                    for s in range(len(securities)):
+                        out.available[oi,s] = max(int(out.available[oi,s]), ref_time)
+                        out.source[oi,s] |= ref_mask
+                        put(out,oi,s,None,'REFERENCE_MISSING')
+                    require(n['column']['missing'] != 'reject', 'Missing rejected by node schema')
+                    continue
                 groups = {}
                 for s in range(len(securities)):
                     group = industry[r][s] if q['group'] == 'industry' else ''
@@ -501,7 +520,7 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                             value = 0.0
                         if op == 'cs_zscore' and value is not None and q['clip'] is not None:
                             value = min(max(value, q['clip'][0]), q['clip'][1])
-                        put(out, oi, s, value, 'REFERENCE_MISSING')
+                        put(out, oi, s, value if member_known[r,s] else None, 'REFERENCE_MISSING')
             else:
                 merge(out, oi, [(a, a.at(r)) for a in parents])
                 for s in range(len(securities)):
