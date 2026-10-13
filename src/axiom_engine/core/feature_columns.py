@@ -11,7 +11,7 @@ from time import perf_counter_ns
 from types import MappingProxyType
 
 from .contracts import FeaturePlan, digest, fields, integer, require, session, text
-from .plan import CS, required_history, validate_plan
+from .plan import CS, WINDOW, required_history, validate_plan
 from . import execution as kernel
 from .._implementation import IMPLEMENTATION_REF
 
@@ -154,11 +154,11 @@ def _needed(p, outputs):
                     deps.add(previous)
                 if op == 'pct_change':
                     deps.add(r)
-            elif op == 'rolling':
+            elif op == 'rolling' or op in WINDOW:
                 end = r + int(q['inclusive_current'])
                 start = end - q['window']
                 require(start >= 0 or p['history_policy'] != 'full', 'INSUFFICIENT_HISTORY')
-                require(end > 0, 'COLUMN_PROFILE: empty exclusive rolling window')
+                require(end > 0 or op in WINDOW, 'COLUMN_PROFILE: empty exclusive rolling window')
                 deps.update(range(max(0, start), end))
             else:
                 deps.add(r)
@@ -351,6 +351,7 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
         else:
             out.reason[oi, s] = reason_ids[reason]
 
+    regression = kernel._regression_cache()
     for node_index, n in enumerate(p['nodes']):
         name, op, q, args = n['name'], n['op'], n['params'], n['inputs']
         if not needed[name]:
@@ -375,6 +376,23 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                         value = kernel._divide(source.numeric(r, s),
                             source.numeric(previous, s) if previous >= 0 else None, q['zero'])
                         put(out, oi, s, None if value is None else value - 1)
+            elif op in WINDOW:
+                end = r + int(q['inclusive_current'])
+                rows = tuple(range(max(0, end - q['window']), end))
+                windows = []
+                for parent in parents:
+                    ix = [parent.at(d) for d in rows]
+                    if ix:
+                        out.available[oi] = np.maximum(out.available[oi], np.max(parent.available[ix], axis=0))
+                        out.source[oi] |= np.bitwise_or.reduce(parent.source[ix], axis=0)
+                        out.issue[oi] |= np.any(parent.issue[ix], axis=0)
+                    windows.append((parent.value[ix], parent.valid[ix]))
+                for s in range(len(securities)):
+                    columns = [[float(v) if valid else None for v,valid in zip(vals[:, s], valid[:, s])]
+                               for vals,valid in windows]
+                    value, blocked = kernel._window_value(op, columns, q, regression)
+                    put(out, oi, s, value, 'WINDOW_MISSING' if blocked else 'MISSING')
+                del windows
             elif op == 'rolling':
                 end = r + int(q['inclusive_current'])
                 rows = tuple(range(max(0, end - q['window']), end))

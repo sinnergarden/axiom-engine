@@ -6,4 +6,5 @@ commits remain execution provenance; they never replace these semantic tags.
 """
 from .plan import PARAMS
 
+# New rolling families are separate entries; the original rolling tag is stable.
 OPERATOR_SEMANTIC_REVISIONS = {name: 'r0_' + name + '_v1' for name in PARAMS}

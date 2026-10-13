@@ -7,7 +7,7 @@ import statistics
 from .contracts import (ABI, SEMANTICS, ContractError, ExecutionContext, FactBatch,
                         FeatureFrame, check_value, fields, require, session,
                         text, timestamp, unresolved)
-from .plan import CS, validate_plan
+from .plan import CS, WINDOW, validate_plan
 
 
 @dataclass(frozen=True)
@@ -199,7 +199,7 @@ def _required_cells(p, outputs, by_security, refs, reference_index):
         needed[name].add(key)
         n = nodes[name]; op = n['op']; q = n['params']
         dependencies = [key]
-        if op in ('shift', 'pct_change', 'rolling'):
+        if op in ('shift', 'pct_change', 'rolling') or op in WINDOW:
             i = positions[key]; history = by_security[key[0]]
             if op in ('shift', 'pct_change'):
                 require(p['history_policy'] == 'partial' or i >= q['periods'],
@@ -327,6 +327,77 @@ def _rolling_value(vals, last, q):
     return value
 
 
+def _regression_cache():
+    """Call-local shared outputs; bound retained input positions to 65,536."""
+    cache = {}
+    positions = 0
+    def evaluate(values):
+        nonlocal positions
+        if values in cache:
+            return cache[values]
+        result = _regression(values)
+        if len(values) <= 65536:
+            while cache and positions + len(values) > 65536:
+                oldest = next(iter(cache))
+                positions -= len(oldest)
+                del cache[oldest]
+            cache[values] = result
+            positions += len(values)
+        return result
+    return evaluate
+
+
+def _regression(values):
+    """Centered OLS on original 1-based positions; all three outputs share work."""
+    pairs = [(i + 1, v) for i, v in enumerate(values) if v is not None]
+    if len(pairs) < 2:
+        return None, None, None
+    xs, ys = zip(*pairs)
+    mx, my = math.fsum(xs) / len(xs), math.fsum(ys) / len(ys)
+    dx, dy = [x - mx for x in xs], [y - my for y in ys]
+    xx, yy = math.fsum(x*x for x in dx), math.fsum(y*y for y in dy)
+    xy = math.fsum(x*y for x, y in zip(dx, dy))
+    slope = xy / xx
+    rsquare = None if yy == 0 else min(1.0, max(0.0, (xy / xx) * (xy / yy)))
+    residual = None if values[-1] is None else values[-1] - (my + slope * (len(values) - mx))
+    return slope, rsquare, residual
+
+
+def _window_value(op, columns, q, regression):
+    """Return numeric value and window insufficiency, without provenance reads.
+
+    columns retain missing positions. Correlation uses pairwise deletion; all
+    other reductions use the single input's valid observations. Temporal gaps
+    are never compressed for regression or arg-extrema.
+    """
+    values = columns[0]
+    present = [(i, v) for i, v in enumerate(values) if v is not None and
+               (op != 'rolling_corr' or columns[1][i] is not None)]
+    blocked = len(present) < q['min_periods'] or q['missing'] == 'propagate' and len(present) != len(values)
+    if blocked:
+        return None, True
+    if op == 'rolling_regression':
+        result = regression(tuple(values))
+        value = result[('slope', 'rsquare', 'resi').index(q['output'])]
+        if value is None and (q['output'] == 'rsquare' or len(present) < 2):
+            require(q['zero'] == 'missing', 'ZERO_VARIANCE')
+    elif op == 'rolling_corr':
+        xs = [v for _, v in present]; ys = [columns[1][i] for i, _ in present]
+        mx, my = math.fsum(xs)/len(xs), math.fsum(ys)/len(ys)
+        dx, dy = [v-mx for v in xs], [v-my for v in ys]
+        xx, yy = math.fsum(v*v for v in dx), math.fsum(v*v for v in dy)
+        require(xx != 0 and yy != 0 or q['zero'] == 'missing', 'ZERO_VARIANCE')
+        value = None if xx == 0 or yy == 0 else max(-1.0, min(1.0,
+            (math.fsum(x*y for x,y in zip(dx,dy)) / math.sqrt(xx)) / math.sqrt(yy)))
+    elif op == 'rolling_quantile':
+        value = _quantile([v for _, v in present], q['quantile'])
+    else:
+        extreme = (max if q['extreme'] == 'max' else min)(v for _, v in present)
+        indices = [i+1 for i,v in present if v == extreme]
+        value = indices[0 if q['ties'] == 'first' else -1]
+    return value, False
+
+
 def _rolling(cells, q, *, reuse=None, scope=None, node_index=None, source_name=None):
     vals = [c.value for c in cells if c.value is not None]
     if len(vals) < q['min_periods'] or q['missing'] == 'propagate' and len(vals) != len(cells):
@@ -413,6 +484,7 @@ def _execute_feature_plan(plan, facts, context, *, reuse=None, profile=None):
     needed = _required_cells(p, outputs, by_security, refs, reference_index)
     positions = {k: i for security_keys in by_security.values() for i, k in enumerate(security_keys)}
     env = {col['name']: {k: rows[k][i] for k in keys} for i, col in enumerate(p['input_schema'])}
+    regression = _regression_cache()
     for node_index, n in enumerate(p['nodes']):
         op, q, args = n['op'], n['params'], n['inputs']
         node_keys = sorted(needed[n['name']])
@@ -421,7 +493,7 @@ def _execute_feature_plan(plan, facts, context, *, reuse=None, profile=None):
         if op in CS:
             out = _cross_section(op, env[args[0]], node_keys, refs, q, reference_index,
                                  reuse=reuse, node_index=node_index, source_name=args[0])
-        elif op in ('shift', 'pct_change', 'rolling'):
+        elif op in ('shift', 'pct_change', 'rolling') or op in WINDOW:
             out = {}
             source = env.get(args[0], {})
             for key in node_keys:
@@ -438,8 +510,13 @@ def _execute_feature_plan(plan, facts, context, *, reuse=None, profile=None):
                     end = i + int(q['inclusive_current'])
                     start = max(0, end - q['window'])
                     window = security_keys[start:end]
-                    out[key] = _rolling([source[k] for k in window], q, reuse=reuse,
-                                        scope=window, node_index=node_index, source_name=args[0])
+                    if op in WINDOW:
+                        cells = [[env[a][k] for k in window] for a in args]
+                        value, blocked = _window_value(op, [[c.value for c in cs] for cs in cells], q, regression)
+                        out[key] = _merge(value, [c for cs in cells for c in cs], 'WINDOW_MISSING' if blocked else None)
+                    else:
+                        out[key] = _rolling([source[k] for k in window], q, reuse=reuse,
+                                            scope=window, node_index=node_index, source_name=args[0])
         elif op == 'asof':
             columns = p['event_schema'][q['stream']]
             ix = next(i for i, col in enumerate(columns) if col['name'] == q['field'])

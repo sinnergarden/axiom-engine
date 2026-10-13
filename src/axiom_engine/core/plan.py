@@ -6,6 +6,10 @@ from .contracts import (ABI, SEMANTICS, ContractError, FeaturePlan, digest, fiel
 PARAMS = {
     'constant': 'value', 'identity': '', 'shift': 'periods',
     'rolling': 'window min_periods inclusive_current reduction missing ddof ties',
+    'rolling_corr': 'window min_periods inclusive_current missing zero',
+    'rolling_regression': 'window min_periods inclusive_current missing output zero',
+    'rolling_quantile': 'window min_periods inclusive_current missing quantile interpolation',
+    'rolling_idx': 'window min_periods inclusive_current missing extreme ties index_base',
     'pct_change': 'periods fill_method zero',
     'add': '', 'sub': '', 'mul': '', 'divide': 'zero', 'abs': '', 'log1p': 'domain',
     'gt': 'missing', 'lt': 'missing', 'eq': 'missing',
@@ -16,7 +20,8 @@ PARAMS = {
     'cs_winsorize': 'group unknown_group missing lower upper interpolation excluded',
     'asof': 'stream field match report_policy', 'calendar_age': '',
 }
-BINARY = {'add', 'sub', 'mul', 'divide', 'gt', 'lt', 'eq', 'and', 'or', 'calendar_age'}
+BINARY = {'add', 'sub', 'mul', 'divide', 'gt', 'lt', 'eq', 'and', 'or', 'calendar_age', 'rolling_corr'}
+WINDOW = {'rolling_corr', 'rolling_regression', 'rolling_quantile', 'rolling_idx'}
 CS = {'cs_rank', 'cs_zscore', 'cs_winsorize'}
 
 
@@ -117,6 +122,22 @@ def validate_plan(plan, *, execution=False):
             require(q['ties'] == 'average', 'Unsupported ties')
             require(q['reduction'] == 'std' or q['ddof'] == 0, 'ddof is 0 for non-std reductions')
             depth += q['window'] - int(q['inclusive_current'])
+        if op in WINDOW:
+            integer(q['window'], 1); integer(q['min_periods'], 1)
+            require(q['min_periods'] <= q['window'], 'min_periods exceeds window')
+            require(type(q['inclusive_current']) is bool, 'Inclusive endpoint must be bool')
+            require(q['missing'] in ('skip', 'propagate'), 'Rolling missing policy')
+            if op in ('rolling_corr', 'rolling_regression'):
+                require(q['zero'] in ('missing', 'reject'), 'Zero variance policy required')
+            if op == 'rolling_regression':
+                require(q['output'] in ('slope', 'rsquare', 'resi'), 'Regression output')
+            if op == 'rolling_quantile':
+                number(q['quantile'])
+                require(0 <= q['quantile'] <= 1 and q['interpolation'] == 'linear', 'Quantile policy')
+            if op == 'rolling_idx':
+                require(q['extreme'] in ('max', 'min') and q['ties'] in ('first', 'last'), 'Extremum policy')
+                require(type(q['index_base']) is int and q['index_base'] == 1, 'Index base must be 1')
+            depth += q['window'] - int(q['inclusive_current'])
         if op == 'pct_change':
             require(q['fill_method'] == 'none', 'Unresolved/unsupported pct_change fill method')
         if op in ('divide', 'pct_change'):
@@ -178,9 +199,11 @@ def validate_plan(plan, *, execution=False):
         if op in ('add', 'sub', 'gt', 'lt', 'eq'):
             require(parents[0]['unit'] == parents[1]['unit'], 'Mixed units')
         preserve_unit = op in ('add', 'sub', 'abs', 'clip', 'cs_winsorize') or op == 'rolling' and q['reduction'] != 'rank'
+        preserve_unit = preserve_unit or op == 'rolling_quantile' or op == 'rolling_regression' and q['output'] != 'rsquare'
         if preserve_unit:
             require(col['unit'] == parents[0]['unit'], 'Output unit mismatch')
         dimensionless = op in ('pct_change', 'cs_rank', 'cs_zscore', 'to_float', 'log1p') or op == 'rolling' and q['reduction'] == 'rank'
+        dimensionless = dimensionless or op in ('rolling_corr', 'rolling_idx') or op == 'rolling_regression' and q['output'] == 'rsquare'
         if dimensionless:
             require(col['unit'] == 'dimensionless', 'Dimensionless output required')
         columns[name] = col; history[name] = depth
@@ -203,6 +226,6 @@ def required_history(plan):
     for n in p['nodes']:
         d = max((depth[a] for a in n['inputs']), default=0)
         if n['op'] in ('shift', 'pct_change'): d += n['params']['periods']
-        if n['op'] == 'rolling': d += n['params']['window'] - int(n['params']['inclusive_current'])
+        if n['op'] == 'rolling' or n['op'] in WINDOW: d += n['params']['window'] - int(n['params']['inclusive_current'])
         depth[n['name']] = d
     return {o['column']['name']: depth[o['node']] for o in p['outputs']}
