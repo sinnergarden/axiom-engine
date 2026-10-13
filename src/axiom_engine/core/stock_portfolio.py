@@ -58,7 +58,7 @@ def validate_stock_predictions(frame):
     if wire.get('contract_version') == 'stock_prediction_run_v3':
         from .stock_signal import validate_prediction_v3
         return validate_prediction_v3(frame)
-    if wire.get('contract_version') == 'derived_signal_run_v1':
+    if wire.get('contract_version') in ('derived_signal_run_v1','derived_signal_run_v2'):
         from .stock_signal import validate_derived_signal
         return validate_derived_signal(frame)
     v2 = wire.get("contract_version") == "stock_prediction_run_v2"
@@ -132,7 +132,7 @@ def _plan_admitted_stock_portfolio(wire, rows, *, account, context, top_k, rules
 def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None, admitted_lifecycle=None):
     wire, rows = validate_stock_predictions(frame) if admitted is None else admitted
     v2 = wire['contract_version']=='stock_prediction_run_v2'
-    derived=wire['contract_version']=='derived_signal_run_v1'
+    derived=wire['contract_version'] in ('derived_signal_run_v1','derived_signal_run_v2')
     modern=v2 or derived or wire['contract_version']=='stock_prediction_run_v3'
     full = "stock_execution_rules" in context
     strategy = full and context["portfolio_policy"].get("contract_version") == "stock_portfolio_policy_v4"
@@ -255,6 +255,7 @@ def _plan(frame, account, context, top_k, admitted=None, admitted_rules=None, ad
         if derived:
             result['prediction_clock'].update(parent_signal_refs=wire['parent_signal_refs'],
                 signal_plan_ref=wire['signal_plan_ref'],score_ref=wire['score_ref'],implementation_ref=wire['implementation_ref'])
+            if 'signal_semantics_ref' in wire: result['prediction_clock']['signal_semantics_ref']=wire['signal_semantics_ref']
         else:
             result['prediction_clock'].update(model_ref=wire['model_ref'],fold_spec_ref=wire['fold_spec_ref'],
                 simulated_model_available_at=batch[0]['simulated_model_available_at'],label_spec_ref=wire['label_spec_ref'])

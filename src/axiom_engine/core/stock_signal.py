@@ -27,6 +27,28 @@ CONTEXT_FIELDS = 'calendar_ref reference_universe reference_universe_ref referen
 ROW_FIELDS = 'security_id session knowledge_cutoff available_at score valid invalid_reason source_refs member feature_knowledge_cutoff'
 
 
+def signal_semantics_ref(plan):
+    """Only used arithmetic revisions and the Signal row/clock ABI; not build provenance."""
+    from .operator_semantics import OPERATOR_SEMANTIC_REVISIONS
+    operators=set()
+    for node in plan['nodes']:
+        operators.update(('cs_zscore',) if node['op']=='daily_zscore' else ('mul','add'))
+    return _ref({'abi':'stock_signal_rows_clocks_members_missing_v1',
+                 'operators':{op:OPERATOR_SEMANTIC_REVISIONS[op] for op in sorted(operators)}})
+
+
+def derived_fields(wire):
+    require(wire.get('contract_version') in ('derived_signal_run_v1','derived_signal_run_v2'),
+            'Unsupported Derived Signal')
+    return DERIVED_FIELDS + (' signal_semantics_ref' if wire['contract_version']=='derived_signal_run_v2' else '')
+
+
+def validate_signal_semantics(wire):
+    if wire['contract_version']=='derived_signal_run_v2':
+        require(wire['signal_semantics_ref']==signal_semantics_ref(wire['signal_plan']),
+                'Derived Signal semantic revision differs; original artifact retained')
+
+
 def _ref(value):
     return 'sha256:'+sha256(canonical(value).encode()).hexdigest()
 
@@ -289,7 +311,7 @@ def _execute_signal_plan_admitted(plan, admitted, context):
     first=next(iter(admitted.values()))[0]
     admission=_SignalPlanAdmission(plan,{a:w for a,(w,_) in admitted.items()},context,first['universe'],days)
     rows,parents,stage,limitations=_signal_plan_rows(admission._plan,admitted,context,admission)
-    wire=dict(contract_version='derived_signal_run_v1',score_ref=_ref(rows),signal_plan=plan,signal_plan_ref=signal_plan_ref(plan),
+    wire=dict(contract_version='derived_signal_run_v2',signal_semantics_ref=signal_semantics_ref(plan),score_ref=_ref(rows),signal_plan=plan,signal_plan_ref=signal_plan_ref(plan),
         parent_signal_refs=parents,implementation_ref=IMPLEMENTATION_REF,signal_stage=stage,score_semantics=plan['score_semantics'],
         score_unit='dimensionless',universe=first['universe'],rows=rows,context=context,limitations=limitations)
     wire['signal_run_ref']=_ref(wire)
@@ -420,8 +442,9 @@ def _signal_plan_rows(plan, admitted, context, admission):
 
 def validate_derived_signal(frame):
     """Validate a complete Derived wire; the caller verifies original artifact hashes."""
-    wire=frame.to_dict(); fields(wire,DERIVED_FIELDS)
-    require(wire['contract_version']=='derived_signal_run_v1' and wire['score_unit']=='dimensionless', 'Unsupported Derived Signal')
+    wire=frame.to_dict(); fields(wire,derived_fields(wire))
+    require(wire['score_unit']=='dimensionless', 'Unsupported Derived Signal')
+    validate_signal_semantics(wire)
     plan=validate_signal_plan(wire['signal_plan'])
     require(wire['signal_plan_ref']==signal_plan_ref(plan) and wire['score_semantics']==plan['score_semantics'], 'Derived Signal plan identity/semantics mismatch')
     stage=next(n['output_stage'] for n in plan['nodes'] if n['name']==plan['output'])

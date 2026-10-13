@@ -303,6 +303,7 @@ def _saved_business(wire, rows, profile):
             require(clock.get('contract_version')=='stock_signal_clock_v2' and clock.get('kind')=='derived' and
                     clock.get('parent_signal_refs')=={a:p['signal_run_ref'] for a,p in frame['parent_inputs'].items()} and
                     all(clock.get(k)==frame[k] for k in ('signal_plan_ref','score_ref','implementation_ref','signal_stage')) and
+                    clock.get('signal_semantics_ref')==frame.get('signal_semantics_ref') and
                     'model_ref' not in clock and 'fold_spec_ref' not in clock,'Saved Derived parent metadata mismatch')
             for name in ('signal_plan_ref','score_ref','implementation_ref'): digest(clock.get(name))
         else:

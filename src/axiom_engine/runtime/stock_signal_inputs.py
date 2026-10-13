@@ -3,10 +3,9 @@
 Only original bounded source rows are read. Derived arithmetic uses the same
 Core entry as Research; this module does not train, predict or run an account.
 """
-from .._implementation import IMPLEMENTATION_REF
 from ..core.contracts import fields, require, digest
 from ..core.stock_portfolio import StockPredictionFrame, instant
-from ..core.stock_signal import (DERIVED_FIELDS, _context, validate_signal_plan,
+from ..core.stock_signal import (derived_fields, validate_signal_semantics, _context, validate_signal_plan,
     signal_plan_ref, _SignalPlanAdmission)
 
 
@@ -30,13 +29,17 @@ def frames(source, manifest, budget):
             days=sorted(frame['features'])
         else:
             index=source._index(binding['signal_artifact'],budget)
-            header=index.object_header(('rows',));fields(header,DERIVED_FIELDS.replace(' rows',''))
-            require(header['contract_version']=='derived_signal_run_v1' and
+            header=index.object_header(('rows',));fields(header,derived_fields(header).replace(' rows',''))
+            validate_signal_semantics(header)
+            require(header.get('signal_semantics_ref')==binding.get('signal_semantics_ref'), 'Derived semantic binding mismatch')
+            require(header['contract_version'] in ('derived_signal_run_v1','derived_signal_run_v2') and
                     header['signal_run_ref']==binding['signal_run_ref']==index.unsigned_digest('signal_run_ref') and
                     header['score_ref']==index.span_digest(('rows',)) and
                     all(header[k]==binding[k] for k in ('signal_plan_ref','score_ref','implementation_ref','signal_stage')),
                     'Original Derived Signal identity mismatch')
-            require(header['implementation_ref']==IMPLEMENTATION_REF and header['universe']==universe and
+            # Legacy cross-build input is admitted only by _DerivedAdmission.read's
+            # exact original-parent Core replay, once per day/source lifetime.
+            require(header['universe']==universe and
                     header['score_unit']=='dimensionless', 'Derived implementation/union/unit mismatch')
             plan=validate_signal_plan(header['signal_plan'])
             aliases={item['alias'] for item in plan['inputs']}

@@ -153,7 +153,9 @@ def validate_manifest(manifest):
     modern=predictions['contract_version']=='stock_prediction_input_refs_v2'
     for frame in predictions["frames"]:
         if modern and frame.get('kind')=='derived':
-            fields(frame,'kind signal_run_ref signal_plan_ref score_ref implementation_ref signal_stage signal_artifact parent_inputs')
+            fields(frame,'kind signal_run_ref signal_plan_ref score_ref implementation_ref signal_stage signal_artifact parent_inputs'+
+                   (' signal_semantics_ref' if 'signal_semantics_ref' in frame else ''))
+            if 'signal_semantics_ref' in frame: digest(frame['signal_semantics_ref'])
             for name in ('signal_run_ref','signal_plan_ref','score_ref','implementation_ref'):digest(frame[name])
             require(frame['signal_stage'] in ('daily_zscore','final'),'Derived output stage required')
             validate_artifact_ref(frame['signal_artifact'])

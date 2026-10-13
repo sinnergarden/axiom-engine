@@ -34,7 +34,8 @@ class StockMarketSpec(Document):
         super().__post_init__()
         value = self.to_dict()
         equity = value.get("stock_action_policy") == "registered_equity_v1"
-        fields(value, "scope profile_input market_input stock_action_policy clock_policy" + (" action_facts_artifact" if equity else ""))
+        fields(value, "scope profile_input market_input stock_action_policy clock_policy" + (" action_facts_artifact" if equity else "") + (" universe_id" if "universe_id" in value else ""))
+        if "universe_id" in value: text(value["universe_id"]); require(value["universe_id"] != "csi300", "CSI300 retains its original implicit market identity")
         if equity: validate_artifact_ref(value["action_facts_artifact"])
         scope = value["scope"]; _validate_scope(scope)
         require(scope["prediction_universe"] == scope["execution_universe"], "Full-stock prediction/execution union mismatch")
@@ -65,7 +66,7 @@ class StockMarketSpec(Document):
         require(isinstance(request, BacktestRequest), "BacktestRequest required")
         plan = validate_manifest(request)
         market = plan["market_input"]
-        return cls.from_dict({**({"action_facts_artifact": plan["action_facts_artifact"]} if "action_facts_artifact" in plan else {}), "scope": plan["scope"], "profile_input": plan["profile_input"],
+        return cls.from_dict({**({"universe_id":plan["portfolio_policy"]["universe_id"]} if plan["portfolio_policy"].get("universe_id", "csi300") != "csi300" else {}), **({"action_facts_artifact": plan["action_facts_artifact"]} if "action_facts_artifact" in plan else {}), "scope": plan["scope"], "profile_input": plan["profile_input"],
             "market_input": {**{name: market[name] for name in
                 ("contract_version", "execution_snapshot_id", "warmup_sessions", "price_basis", "projection_version")},
                 "native_inputs": [item for item in market["native_inputs"] if item["role"] == "execution"]},
@@ -272,8 +273,9 @@ def admit_stock_market_inputs(spec, *, source, block_sessions, limits, max_marke
                 descriptors.append({"entry": item, "kind": kind, "days": days, "context": context})
             for index in source._indexes.values():
                 index.unchanged()
-            policy = csi300_stock_portfolio_policy(top_k=1, execution_universe=plan["scope"]["execution_universe"],
+            policy = (csi300_stock_portfolio_policy(top_k=1, execution_universe=plan["scope"]["execution_universe"],
                                                   execution_rules=audit.globals["profile"]["stock_execution_rules"])
+                      if plan.get("universe_id","csi300")=="csi300" else None)
             meta = store.write({"globals": audit.globals, "lifecycle": audit.lifecycle, "policy": policy,
                 "counts": audit.receipt["counts"], "descriptors": descriptors,
                 "implementation_ref": IMPLEMENTATION_REF, "input_semantics":INPUT_SEMANTICS}, source._memory)
@@ -419,8 +421,9 @@ def _bind(market, plan, source, limits, maximum):
         validate_top_k(plan["portfolio_policy"]["top_k"], universe)
         if plan["portfolio_policy"].get("contract_version") == "stock_portfolio_policy_v4":
             from .stock_rules import _validate_admitted_account_policy
-            require(plan["portfolio_policy"]["universe_id"] == "csi300", "admitted CSI300 market cannot authorize another membership pool")
-            _validate_admitted_account_policy(plan["portfolio_policy"], universe=universe,
+            pool=json.loads(market._key).get("universe_id", "csi300")
+            require(plan["portfolio_policy"]["universe_id"] == pool, "admitted market cannot authorize another membership pool")
+            _validate_admitted_account_policy(plan["portfolio_policy"], universe=universe, universe_id=pool,
                 rules_ref=meta["globals"]["profile"]["stock_execution_rules_ref"])
         else:
             require(plan["portfolio_policy"] == {**meta["policy"], "top_k": plan["portfolio_policy"]["top_k"]},
@@ -584,7 +587,10 @@ def _bind(market, plan, source, limits, maximum):
         signal_orders.clear()
         packed_order = values = None
         source._memory.replace_global("original_signal_order",32*order_count)
-        number = store.write({"receipt": receipt, "input_semantics":INPUT_SEMANTICS,
+        from ..core.stock_signal import signal_semantics_ref
+        semantics={f["header"]["signal_run_ref"]:signal_semantics_ref(f["original_header"]["signal_plan"])
+                   for f in frames if f.get("kind")=="derived"}
+        number = store.write({"receipt": receipt, "input_semantics":INPUT_SEMANTICS, **({"signal_semantics":semantics} if semantics else {}),
             "raw_lineage":lineage, "signal_orders":orders,
             "signal_limitations": sorted({v for f in frames for v in f["header"]["limitations"]}),
             **({'signal_headers':headers,'signal_metadata_locations':metadata_locations} if modern else {})}, source._memory)
