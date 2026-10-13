@@ -98,3 +98,15 @@ def select_feature_plan(plan, columns):
     # Feature identity above never uses this experiment-wide recipe hash.
     p['recipe_ref'] = digest({'original_recipe_ref': p['recipe_ref'], 'outputs': columns})
     return FeaturePlan.from_dict(p)
+
+
+def select_security_plan(plan, securities):
+    """Project frozen reference metadata only for a reference-independent DAG."""
+    p=plan.to_dict()
+    require(not any(n['op'] in CS for n in p['nodes']),
+            'cannot project a cross-sectional Feature execution cohort')
+    selected=set(securities)
+    p['reference_members']={day:{s:group for s,group in members.items() if s in selected}
+                            for day,members in p['reference_members'].items()}
+    p['reference_ref']=digest({'reference_ref':p['reference_ref'],'security_ids':securities})
+    return FeaturePlan.from_dict(p)
