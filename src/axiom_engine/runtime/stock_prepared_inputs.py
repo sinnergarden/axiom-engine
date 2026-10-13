@@ -22,7 +22,8 @@ from .stock_stream_contracts import validate_artifact_ref, validate_limits, read
 from .stock_stream_inputs import _DecodedMemory, _path
 
 MARKET_VERSION = "stock_prepared_market_v1"
-PREDICTION_VERSION = "stock_prepared_predictions_v1"
+PREDICTION_VERSION = "stock_prepared_predictions_v2"
+LEGACY_PREDICTION_VERSION = "stock_prepared_predictions_v1"
 
 
 def _checked_load(function):
@@ -437,10 +438,18 @@ def save_stock_prediction_inputs(inputs, destination, *, limits):
         market = inputs._AdmittedStockInputs__market
         require(market is not None, "Prepared predictions need their admitted market owner")
         store = inputs._AdmittedStockInputs__projection_store
-        metadata = dict(contract_version=PREDICTION_VERSION,input_key=json.loads(inputs._AdmittedStockInputs__projection_key),
+        memory=_DecodedMemory(read_budget(limits)["max_decoded_bytes"])
+        saved_meta,stage=store._read_record(0,memory,read_budget(limits))
+        try:
+            semantics=saved_meta.get("signal_semantics",{})
+            frames=json.loads(inputs._AdmittedStockInputs__projection_key)["prediction_input"]["frames"]
+            require(set(semantics)=={f["signal_run_ref"] for f in frames if f.get("kind")=="derived"},
+                    "Re-admit original Derived inputs before saving a semantic snapshot")
+        finally: stage.close()
+        metadata = dict(contract_version=PREDICTION_VERSION if semantics else LEGACY_PREDICTION_VERSION,input_key=json.loads(inputs._AdmittedStockInputs__projection_key),
             block_sessions=inputs._AdmittedStockInputs__block_sessions,calendar=list(market._calendar),
             inventory=json.loads(inputs._AdmittedStockInputs__inventory),
-            owner=dict(market_key=json.loads(market._key)))
+            owner=dict(market_key=json.loads(market._key),**({"signal_semantics":semantics} if semantics else {})))
         return _save(store,destination,metadata,limits)
 
 
@@ -451,9 +460,15 @@ def load_stock_prediction_inputs(market, ref, request, *, limits, max_signal_byt
     from .stock_stream_contracts import validate_manifest
     require(isinstance(market,AdmittedStockMarket), "AdmittedStockMarket required")
     plan = validate_manifest(request); market._matches(request)
-    manifest,store = _load(ref,version=PREDICTION_VERSION,limits=limits,maximum=max_signal_bytes)
+    version=ref.get("contract_version")
+    require(version in (PREDICTION_VERSION,LEGACY_PREDICTION_VERSION), "Unsupported prepared prediction version")
+    manifest,store = _load(ref,version=version,limits=limits,maximum=max_signal_bytes)
     try:
-        key = canonical(manifest["input_key"]).encode(); fields(manifest["owner"],"market_key")
+        key = canonical(manifest["input_key"]).encode()
+        fields(manifest["owner"],"market_key signal_semantics" if version==PREDICTION_VERSION else "market_key")
+        if version==LEGACY_PREDICTION_VERSION and any(f.get("kind")=="derived" for f in plan["prediction_input"]["frames"]):
+            require(manifest["producer_implementation_ref"]==IMPLEMENTATION_REF,
+                    "Legacy cross-build prediction snapshot needs original-parent re-admission; no automatic trust upgrade")
         require(key == _projection_key(plan) and canonical(manifest["owner"]["market_key"]).encode() == market._key and
                 manifest["block_sessions"] == market._block_sessions and manifest["calendar"] == list(market._calendar),
                 "Prepared prediction scope/dependency mismatch")
@@ -467,7 +482,7 @@ def load_stock_prediction_inputs(market, ref, request, *, limits, max_signal_byt
                 canonical(manifest["inventory"]).encode(),stats,market=market,projection_store=store,projection_key=key)
         # Existing audit checks per-account policy, target refs and globals;
         # the entire saved prediction grid is checked before ledger allocation.
-        _validate_prediction_snapshot(result,request,limits)
+        _validate_prediction_snapshot(result,request,limits,signal_semantics=manifest["owner"].get("signal_semantics"))
         with market._scope():
             if market._cache_prediction(key,store,canonical(manifest["inventory"]).encode(),stats,max_signal_bytes):
                 result._AdmittedStockInputs__cache_key = key
@@ -478,7 +493,7 @@ def load_stock_prediction_inputs(market, ref, request, *, limits, max_signal_byt
         raise
 
 
-def _validate_prediction_snapshot(inputs, request, limits):
+def _validate_prediction_snapshot(inputs, request, limits, *, signal_semantics=None):
     from ..core.stock_portfolio import StockPredictionFrame, validate_stock_predictions
     from .stock_stream_contracts import validate_manifest, validate_source_audit
     from .stock_stream import _admit
@@ -524,6 +539,16 @@ def _validate_prediction_snapshot(inputs, request, limits):
             full_headers[location["signal_ref"]] = value["header"]
             charge = metadata_stage.used; metadata_stage.close()
             inputs._memory.reserve_global(("prepared_derived_header",location["signal_ref"]),charge)
+        if signal_semantics is not None:
+            from ..core.stock_signal import signal_semantics_ref, validate_signal_semantics
+            require(set(signal_semantics)==set(full_headers), "Prepared signal semantic coverage mismatch")
+            for reference,header in full_headers.items():
+                validate_signal_semantics(header)
+                require(signal_semantics[reference]==signal_semantics_ref(header['signal_plan']) and
+                        header.get('signal_semantics_ref')==output_bindings[reference].get('signal_semantics_ref'),
+                        "Prepared Derived semantic revision/source binding differs")
+            require(inputs._prepared.get('signal_semantics')==signal_semantics,
+                    "Prepared semantic manifest differs from admitted source metadata")
         market = inputs._AdmittedStockInputs__market
         member_cache = member_stage = member_key = None
         def members_for(feature):

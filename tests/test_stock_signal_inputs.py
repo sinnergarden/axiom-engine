@@ -65,7 +65,8 @@ def derived_request(root, original):
             clock_basis='declared_simulation')
         signal=execute_signal_plan(plan_for({'prediction':wire}),{'prediction':StockPredictionFrame.from_dict(wire)},context).to_dict()
         frames.append(dict(kind='derived',**{k:signal[k] for k in ('signal_run_ref','signal_plan_ref','score_ref','implementation_ref','signal_stage')},
-            signal_artifact=artifact_file(root,'derived-'+str(i),signal),parent_inputs={'prediction':deepcopy(parent)}))
+            signal_artifact=artifact_file(root,'derived-'+str(i),signal),parent_inputs={'prediction':deepcopy(parent)},
+            **({'signal_semantics_ref':signal['signal_semantics_ref']} if 'signal_semantics_ref' in signal else {})))
     plan['prediction_input']['frames']=frames
     return seal_request(plan)
 

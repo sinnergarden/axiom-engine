@@ -1163,7 +1163,7 @@ def _native_header(index, entry, manifest):
         if kind == "membership":
             require(query.get("fields") == ["is_member"] and query.get("symbols") == manifest["scope"]["prediction_universe"] and
                     query.get("purpose") == "decision_facts" and query.get("universe_id") ==
-                    manifest.get("portfolio_policy", {}).get("universe_id", "csi300") and
+                    manifest.get("universe_id", manifest.get("portfolio_policy", {}).get("universe_id", "csi300")) and
                     query.get("pit_policy") == "best_effort_vendor_v1" and days == calendar and
                     set(query.get("cutoff_by_session", {})) == set(days), "Original PIT stock membership query required")
             from ..core.stock_portfolio import instant
@@ -1410,7 +1410,8 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
     expected_profile = validate_equity_profile(profile) if equity else stock_daily_open_profile_v2(
         execution_rules=rules, fee_schedule=profile["stock_fee_schedule"], unknown_status_policy=profile.get("unknown_status_policy"))
     require(profile == expected_profile and rules["calendar"] == calendar and
-        rules["universe"] == universe and scope["supported_universe_ref"] == portfolio_support_ref(manifest.get("portfolio_policy", {}), universe), "Stock profile/rules scope mismatch")
+        rules["universe"] == universe and scope["supported_universe_ref"] == portfolio_support_ref(manifest.get("portfolio_policy",
+            {"contract_version":"stock_portfolio_policy_v4", "universe_id":manifest["universe_id"]} if "universe_id" in manifest else {}), universe), "Stock profile/rules scope mismatch")
     for name in ("stock_execution_rules_ref", "stock_fee_schedule_ref"):
         require(manifest["profile_input"][name] == profile[name], "Stock profile nested reference mismatch")
     if not market_only:

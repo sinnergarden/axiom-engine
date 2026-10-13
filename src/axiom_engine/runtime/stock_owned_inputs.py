@@ -99,10 +99,10 @@ class AdmittedStockInputs(StockInputSource):
         require(_input_key(plan) == self.__key, "Stock inputs differ from the complete admitted capability")
         from .stock_rules import _validate_admitted_account_policy
         _validate_admitted_account_policy(plan["portfolio_policy"], universe=plan["scope"]["execution_universe"],
-            rules_ref=plan["profile_input"]["stock_execution_rules_ref"])
-        from .._implementation import IMPLEMENTATION_REF
-        require(all(frame.get("kind") != "derived" or frame["implementation_ref"] == IMPLEMENTATION_REF
-                    for frame in plan["prediction_input"]["frames"]), "Derived input implementation differs")
+            rules_ref=plan["profile_input"]["stock_execution_rules_ref"],
+            universe_id=json.loads(self.__market._key).get("universe_id","csi300") if self.__market is not None else "csi300")
+        # This owner exists only after complete source replay or checked saved
+        # snapshot admission. Build provenance is not a signal semantic gate.
         return plan
 
     def __owner(self):
@@ -182,7 +182,8 @@ class AdmittedStockInputs(StockInputSource):
         receipt["implementation_ref"] = implementation_ref
         self._prepared = {'request_ref':plan['request_ref'],'signal_headers':meta.get('signal_headers',{}),
             'raw_lineage':meta.get('raw_lineage',{}), 'signal_orders':meta.get('signal_orders',{}),
-            'signal_metadata_locations':meta.get('signal_metadata_locations',[])}
+            'signal_metadata_locations':meta.get('signal_metadata_locations',[]),
+            'signal_semantics':meta.get('signal_semantics')}
         self.__statistics["account_bindings"] += 1
         if self.__market is None:
             globals_value, lifecycle = meta["globals"], meta["lifecycle"]
