@@ -167,6 +167,19 @@ def _needed(p, outputs):
     return needed
 
 
+def _window_workspace_bytes(rows, securities, parents):
+    """Conservative temporary reservation for the new window families only.
+
+    Retained value/validity gathers use 9 bytes per parent cell, while the
+    largest transient provenance gather uses 8 bytes per cell. Per row, 1 KiB
+    covers indices and the one-security Python vectors, tuples, sorting and
+    centered regression/correlation intermediates (including list replacement).
+    Array/list headers and reduction vectors have separate fixed/width margins.
+    This is an allocation bound, not a process RSS measurement.
+    """
+    return rows * ((9 * parents + 8) * securities + 1024) + 128 * securities + 4096
+
+
 def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_bytes):
     """One admitted view, many output sessions; result has packed identity.
 
@@ -174,7 +187,8 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     Missing values use validity=False and canonical value=0. Time null uses
     int64 minimum; all other output times are UTC microseconds on whole seconds.
     Source/reason code zero is respectively the empty set/no missing reason.
-    max_working_bytes bounds owned numeric arrays, not interpreter/RSS overhead.
+    max_working_bytes bounds owned numeric arrays and reserves the new window
+    families' temporary workspace; it does not bound interpreter/process RSS.
     """
     import numpy as np
     begin_ns = perf_counter_ns()
@@ -351,7 +365,6 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
         else:
             out.reason[oi, s] = reason_ids[reason]
 
-    regression = kernel._regression_cache()
     for node_index, n in enumerate(p['nodes']):
         name, op, q, args = n['name'], n['op'], n['params'], n['inputs']
         if not needed[name]:
@@ -378,7 +391,10 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                         put(out, oi, s, None if value is None else value - 1)
             elif op in WINDOW:
                 end = r + int(q['inclusive_current'])
-                rows = tuple(range(max(0, end - q['window']), end))
+                start = max(0, end - q['window'])
+                workspace = _window_workspace_bytes(end - start, len(securities), len(parents))
+                budget.add(workspace)  # fail before allocating any new window workspace
+                rows = tuple(range(start, end))
                 windows = []
                 for parent in parents:
                     ix = [parent.at(d) for d in rows]
@@ -390,9 +406,10 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                 for s in range(len(securities)):
                     columns = [[float(v) if valid else None for v,valid in zip(vals[:, s], valid[:, s])]
                                for vals,valid in windows]
-                    value, blocked = kernel._window_value(op, columns, q, regression)
+                    value, blocked = kernel._window_value(op, columns, q, kernel._regression)
                     put(out, oi, s, value, 'WINDOW_MISSING' if blocked else 'MISSING')
-                del windows
+                del windows, columns, ix, rows
+                budget.drop(workspace)
             elif op == 'rolling':
                 end = r + int(q['inclusive_current'])
                 rows = tuple(range(max(0, end - q['window']), end))

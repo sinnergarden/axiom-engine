@@ -59,7 +59,7 @@ class QsysRolling(unittest.TestCase):
         # ss(x)=10; slope=7/5, R²=49/50, residual=5-5.1.
         with patch.object(execution, '_regression', wraps=execution._regression) as regression:
             rows = self.compare(p,f,c)
-            self.assertEqual(regression.call_count, 2)  # once in each execution transport
+            self.assertEqual(regression.call_count, 4)  # scalar shares; packed uses no unbudgeted tuple cache
         for actual, expected in zip(rows[0]['values'], [1.4,.98,-.1,1.75,4,1,-1]):
             self.assertAlmostEqual(actual, expected)
         self.assertEqual(required_history(FeaturePlan.from_dict(p)), {n['name']:3 for n in nodes})
@@ -136,6 +136,27 @@ class QsysRolling(unittest.TestCase):
         expected = tuple(execute_feature_plan(*r) for r in requests)
         self.assertEqual(tuple(f.payload for f in actual),tuple(f.payload for f in expected))
         self.assertNotEqual(actual[0].to_dict()['rows'][0]['sources'],actual[1].to_dict()['rows'][0]['sources'])
+
+    def test_packed_window_workspace_rejected_before_numeric_execution(self):
+        nodes = [window('slope','rolling_regression',output='slope',window=256,min_periods=256)]
+        p,f,c = setup({'A':list(range(256))},nodes)
+        c['output_keys'] = [c['history_keys'][-1]]
+        plan = FeaturePlan.from_dict(p); compiled = compile_feature_columns(plan)
+        def run(limit):
+            return execute_feature_columns(compiled,inputs=packed(p,f,c),
+                output_sessions=[c['sessions'][-1]],max_working_bytes=limit)
+        with patch.object(execution,'_regression_cache',side_effect=AssertionError('packed cache forbidden')):
+            result = run(2**22)
+        self.assertAlmostEqual(float(result['values'][0,0,0]),1.)
+        peak = result['stats']['peak_working_bytes']
+        self.assertGreater(peak,256*1024)  # Python and gather workspace is actually charged.
+        with patch.object(execution,'_window_value',side_effect=AssertionError('numeric execution before budget admission')):
+            with self.assertRaisesRegex(ContractError,'COLUMN_WORKING_BYTES_EXCEEDED'):
+                run(peak-1)
+        accepted = run(peak)
+        self.assertEqual(accepted['values'].tobytes(),result['values'].tobytes())
+        self.assertEqual(accepted['validity'].tobytes(),result['validity'].tobytes())
+        self.compare(p,f,c)
 
     def test_admission_rejects_implicit_policies(self):
         n = window('q','rolling_quantile',quantile=.5)
