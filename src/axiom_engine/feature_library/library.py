@@ -12,6 +12,7 @@ import fcntl
 import json
 import math
 import os
+import time
 from pathlib import Path
 
 from ..core import compile_feature_columns, execute_feature_columns
@@ -197,6 +198,8 @@ class FeatureLibrary:
         require(type(column_block) is int and 0<column_block<=128, 'bounded positive column block required')
         self.column_block=column_block
         self._session=None
+        self._coverage_cache=None;self._recovered_directory_mark=None
+        self.coverage_metrics={'index_loads':0,'recovery_scans':0}
 
     @contextmanager
     def execution_session(self):
@@ -208,23 +211,40 @@ class FeatureLibrary:
             finally:
                 self._session['arrays'].clear(); self._session=None
 
+    @staticmethod
+    def _epoch(path):
+        if not path.exists():return None
+        st=path.stat()
+        return st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns
+
     def _index(self):
-        partitions, shards = read_index(self.root, min(64*1024**2,self.limits['maximum_matrix_bytes']//8))
-        return {'partitions':partitions, 'shards':shards}
+        mark=self._epoch(self.root/'index.json')
+        if self._coverage_cache is None or self._coverage_cache[0]!=mark:
+            partitions,shards=read_index(self.root,min(64*1024**2,self.limits['maximum_matrix_bytes']//8))
+            require(self._epoch(self.root/'index.json')==mark,'coverage changed during read')
+            self._coverage_cache=(mark,{'partitions':partitions,'shards':shards})
+            self._recovered_directory_mark=None
+            self.coverage_metrics['index_loads']+=1
+        value=self._coverage_cache[1]
+        # A failed publication cannot mutate the last admitted coverage state.
+        return {'partitions':list(value['partitions']),'shards':dict(value['shards'])}
 
     def _publish_index(self, shards):
         publish_index(self.root, shards)
 
     def _recover(self, partitions, store, validated):
-        known = {p['partition_ref'] for p in partitions}; recovered = []
-        for path in sorted((self.root/'partitions').glob('*.json')):
-            if not is_ref('sha256:' + path.stem): continue
-            if 'sha256:' + path.stem in known: continue
-            require(path.stat().st_size<=store.maximum_parent_bytes, 'matrix parent byte budget exceeded')
-            descriptor = {'path': str(path), 'file_digest': file_digest(path), 'partition_ref': 'sha256:' + path.stem}
-            part = store.read_json(descriptor, 'partition_ref')
-            validated[part['partition_ref']]=_partition_arrays(store, part)
-            partitions.append(coverage_summary(descriptor, part)); known.add(descriptor['partition_ref'])
+        directory=self.root/'partitions';mark=self._epoch(directory)
+        if self._recovered_directory_mark==mark and self._coverage_cache is not None:return []
+        self.coverage_metrics['recovery_scans']+=1
+        known={p['partition_ref'] for p in partitions};recovered=[]
+        for path in sorted(directory.glob('*.json')):
+            if not is_ref('sha256:' + path.stem):continue
+            if 'sha256:' + path.stem in known:continue
+            require(path.stat().st_size<=store.maximum_parent_bytes,'matrix parent byte budget exceeded')
+            descriptor={'path':str(path),'file_digest':file_digest(path),'partition_ref':'sha256:'+path.stem}
+            part=store.read_json(descriptor,'partition_ref')
+            validated[part['partition_ref']]=_partition_arrays(store,part)
+            partitions.append(coverage_summary(descriptor,part));known.add(descriptor['partition_ref'])
             recovered.extend(part['sessions'])
         return recovered
 
@@ -324,7 +344,7 @@ class FeatureLibrary:
                         validated[part['partition_ref']]=_partition_arrays(admitted,part)
                 admitted.check()
                 admission_metrics={k:v-baseline[k] for k,v in admitted.metrics.items()}
-            stats = {'core_calls':0, 'computed_output_cells':0, 'hit_columns':len({(h['session'],h['column']) for h in coverage['hits']}),
+            stats = {'core_calls':0,'core_seconds':0.0, 'computed_output_cells':0, 'hit_columns':len({(h['session'],h['column']) for h in coverage['hits']}),
                      'hit_security_blocks':len(coverage['hits']),
                      'gap_columns':len(coverage['gaps']), 'recovered_partitions':len(recovered),
                      'coverage_date_writes':0, 'coverage_root_writes':0,
@@ -368,8 +388,10 @@ class FeatureLibrary:
                         'prepared inputs do not bind planned dependencies')
                 key = plan.identity
                 if key not in compiled: compiled[key] = compile_feature_columns(plan)
+                core_started=time.monotonic()
                 result = execute_feature_columns(compiled[key], inputs=inputs, output_sessions=[day],
                     max_working_bytes=self.limits['maximum_matrix_bytes'])
+                stats['core_seconds']+=time.monotonic()-core_started
                 arrays, header = _capture_result(result, day=day, columns=columns,
                     securities=securities, maximum_bytes=self.limits['maximum_matrix_bytes'])
                 stats['core_calls'] += 1; stats['computed_output_cells'] += len(securities)*len(columns)
@@ -414,6 +436,10 @@ class FeatureLibrary:
             view = compact_view(coverage, final_hits)
             descriptor = write_part(self.root, view, 'view_ref')
             self._publish_index(shards)
+            self._coverage_cache=(self._epoch(self.root/'index.json'),
+                {'partitions':list(partitions),'shards':dict(shards)})
+            self._recovered_directory_mark=self._epoch(self.root/'partitions')
+            stats.update(self.coverage_metrics)
             stats['coverage_root_writes']=1
             if self._session is not None:
                 stats['admission_file_hash_calls']=admitted.metrics['file_hash_calls']-baseline['file_hash_calls']
