@@ -1,7 +1,7 @@
 """Feature semantic identity excludes deployment and unrelated catalog contents."""
 from copy import deepcopy
 from ..core import FeaturePlan, required_history, validate_plan
-from ..core.plan import CS
+from ..core.plan import CS, _required_history, _validate_plan
 from ..core.operator_semantics import OPERATOR_SEMANTIC_REVISIONS
 from .codec import digest, require
 
@@ -20,7 +20,7 @@ def feature_definitions(plan, *, input_semantics):
     # Raw output closures have the same depth as their nodes in the admitted
     # DAG. Compute all depths once instead of copying/validating the complete
     # frozen reference cohort once per output. Derived facts still expand below.
-    history = required_history(plan)
+    history = _required_history(p)
     result = {}
     for output in p['outputs']:
         used, leaves = set(), set()
@@ -69,10 +69,11 @@ def feature_definitions(plan, *, input_semantics):
             'inputs': fact_inputs, 'output': semantic_output}
         name = output['column']['name']
         if aliases:
-            expanded_plan = deepcopy(p)
+            expanded_plan = dict(p)
             expanded_plan.update(nodes=closure, input_schema=[v['schema'] for v in fact_inputs.values()],
                                  outputs=[semantic_output])
-            depth = required_history(FeaturePlan.from_dict(expanded_plan))[name]
+            # The original plan and expanded semantic inputs were admitted above.
+            depth = _required_history(_validate_plan(expanded_plan,execution=True,_reference_validated=True))[name]
         else:
             depth = history[name]
         result[name] = {'semantic_ref': digest(semantic), 'semantic': semantic,

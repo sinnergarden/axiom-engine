@@ -49,12 +49,12 @@ class FeatureRequest:
     input_semantics: dict
     sample_universe: tuple | None = None
 
-    def admitted(self):
+    def admitted(self, definitions=None):
         days = _ordered(self.output_sessions, 'output sessions')
         securities = _ordered(self.security_ids, 'physical securities')
         sample = securities if self.sample_universe is None else _ordered(self.sample_universe, 'sample securities')
         require(set(sample) <= set(securities), 'sample must project physical securities')
-        definitions = feature_definitions(self.plan, input_semantics=self.input_semantics)
+        definitions = feature_definitions(self.plan, input_semantics=self.input_semantics) if definitions is None else definitions
         p = self.plan.to_dict()
         require(set(days) <= set(p['reference_members']), 'output dates absent from frozen calendar')
         if any(d['reference_dependent'] for d in definitions.values()):
@@ -82,12 +82,12 @@ def _capture_result(result, *, day, columns, securities, maximum_bytes):
             'Feature output capture exceeds working budget')
     for name in ARRAYS:
         array = result[name]
-        raw = array.tobytes(order='C')
-        descriptor = {'shape': list(shape), 'dtype': array.dtype.str,
-                      'sha256': sha256(raw).hexdigest()}
-        require(array.shape == shape and header['output_buffers'][name] == descriptor,
-                'Core output buffer differs from exact receipt')
-        captured[name] = np.frombuffer(raw, dtype=array.dtype).reshape(shape)
+        owner=array
+        while isinstance(owner,np.ndarray) and owner.base is not None:owner=owner.base
+        require(isinstance(owner,bytes) and not array.flags.writeable and array.shape==shape and
+                header['output_buffers'][name]['shape']==list(shape) and
+                header['output_buffers'][name]['dtype']==array.dtype.str,'immutable Core buffer required')
+        captured[name]=array
     require(np.isfinite(captured['values']).all(), 'finite Core values required')
     require(np.all((captured['reason_codes'] >= 0) &
                    (captured['reason_codes'] < len(header['reason_dictionary']))), 'Core reason code range')
@@ -105,8 +105,9 @@ def _write_codes(root, array):
         return {'encoding': 'constant', 'value': int(flat[0]), 'shape': list(array.shape)}
     code_dtype = 'uint8' if int(flat.max()) <= 255 else 'int32_le'
     value = flat.astype('u1' if code_dtype == 'uint8' else '<i4', copy=False)
-    indices = np.flatnonzero(flat).astype('<u8')
-    if indices.nbytes + indices.size * value.dtype.itemsize < value.nbytes:
+    nonzero=int(np.count_nonzero(flat))
+    if nonzero*(8+value.dtype.itemsize)<value.nbytes:
+        indices = np.flatnonzero(flat).astype('<u8')
         return {'encoding': 'sparse_zero', 'shape': list(array.shape),
             'indices': write_buffer(root, indices, dtype='uint64_le', shape=[indices.size]),
             'values': write_buffer(root, value[indices], dtype=code_dtype, shape=[indices.size])}
@@ -153,7 +154,9 @@ def _partition_arrays(store, part):
         arrays[name] = (_read_codes(store, part['buffers'][name], shape) if name in ('reason_codes', 'source_codes')
                         else store.buffer(part['buffers'][name]))
         require(arrays[name].shape == shape, 'Feature partition buffer shape mismatch')
-    header = part['core_header']; binding = {k:v for k,v in header.items() if k != 'result_ref'}
+    header = part['core_header']
+    if 'path' in header:header=store.read_json(header,'header_ref')['core_header']
+    binding = {k:v for k,v in header.items() if k != 'result_ref'}
     projection=part.get('core_output_projection')
     output_buffers=header['output_buffers'] if projection is None else projection['output_buffers']
     indices=list(range(len(part['columns']))) if projection is None else projection['column_indices']
@@ -176,8 +179,10 @@ def _partition_arrays(store, part):
              'reason_codes':'int32', 'source_codes':'int32'}
     for name, array in arrays.items():
         original = array.astype(types[name], copy=False)
+        checksum=(part['buffers'][name]['file_digest'][7:] if name not in ('reason_codes','source_codes') else
+                  sha256(original.tobytes(order='C')).hexdigest())
         require(output_buffers[name] == {'shape':list(shape), 'dtype':original.dtype.str,
-            'sha256':sha256(original.tobytes(order='C')).hexdigest()}, 'saved Feature bytes differ from Core receipt')
+            'sha256':checksum}, 'saved Feature bytes differ from Core receipt')
     return arrays
 
 
@@ -192,12 +197,13 @@ def _partition_buffer_paths(part):
 class FeatureLibrary:
     """One local cache root; immutable records are authoritative, index rebuildable."""
     def __init__(self, root, *, maximum_source_bytes=8*1024**3, maximum_working_bytes=512*1024**2,
-                 column_block=16):
+                 column_block=None, recover=False):
         self.root = Path(root).resolve()
         self.limits = {'maximum_source_bytes': maximum_source_bytes, 'maximum_matrix_bytes': maximum_working_bytes}
-        require(type(column_block) is int and 0<column_block<=128, 'bounded positive column block required')
-        self.column_block=column_block
+        require(column_block is None or type(column_block) is int and column_block>0, 'positive optional column block required')
+        self.column_block=column_block;self.recover=recover
         self._session=None
+        self._definitions={};self._compiled={}
         self._coverage_cache=None;self._recovered_directory_mark=None
         self.coverage_metrics={'index_loads':0,'recovery_scans':0}
 
@@ -217,22 +223,29 @@ class FeatureLibrary:
         st=path.stat()
         return st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns
 
-    def _index(self):
+    def _index(self, sessions=None):
+        wanted=None if sessions is None else set(sessions)
         mark=self._epoch(self.root/'index.json')
         if self._coverage_cache is None or self._coverage_cache[0]!=mark:
-            partitions,shards=read_index(self.root,min(64*1024**2,self.limits['maximum_matrix_bytes']//8))
-            require(self._epoch(self.root/'index.json')==mark,'coverage changed during read')
-            self._coverage_cache=(mark,{'partitions':partitions,'shards':shards})
+            self._coverage_cache=(mark,{'partitions':[],'shards':{},'loaded_days':set()})
             self._recovered_directory_mark=None
-            self.coverage_metrics['index_loads']+=1
         value=self._coverage_cache[1]
-        # A failed publication cannot mutate the last admitted coverage state.
-        return {'partitions':list(value['partitions']),'shards':dict(value['shards'])}
+        missing=None if wanted is None else wanted-value['loaded_days']
+        if missing is None or missing:
+            parts,shards=read_index(self.root,min(64*1024**2,self.limits['maximum_matrix_bytes']//8),missing)
+            require(self._epoch(self.root/'index.json')==mark,'coverage changed during read')
+            known={p['partition_ref'] for p in value['partitions']}
+            value['partitions'].extend(p for p in parts if p['partition_ref'] not in known)
+            value['shards']=shards;value['loaded_days'].update(shards if wanted is None else wanted)
+            self.coverage_metrics['index_loads']+=1
+        return {'partitions':[p for p in value['partitions'] if wanted is None or p['sessions'][0] in wanted],
+                'shards':dict(value['shards'])}
 
     def _publish_index(self, shards):
         publish_index(self.root, shards)
 
     def _recover(self, partitions, store, validated):
+        if not self.recover:return []
         directory=self.root/'partitions';mark=self._epoch(directory)
         if self._recovered_directory_mark==mark and self._coverage_cache is not None:return []
         self.coverage_metrics['recovery_scans']+=1
@@ -267,11 +280,13 @@ class FeatureLibrary:
 
     def plan_coverage(self, request, source_adapter, *, _partitions=None):
         """Read metadata and source dependency receipts; never run Core or write."""
-        days, securities, sample, definitions = request.admitted()
+        key=(request.plan.identity,digest(request.input_semantics))
+        if key not in self._definitions:self._definitions[key]=feature_definitions(request.plan,input_semantics=request.input_semantics)
+        days, securities, sample, definitions = request.admitted(self._definitions[key])
         security_axis_ref=digest(securities)
         dependencies = source_adapter.dependency_refs(definitions, days, securities)
         require(set(dependencies) == set(days), 'complete daily dependency bindings required')
-        parts = self._index()['partitions'] if _partitions is None else _partitions
+        parts = self._index(days)['partitions'] if _partitions is None else _partitions
         lookup=self._coverage_lookup(parts); hits, gaps = [], []
         # Legacy immutable summaries have only an axis hash. Read the sealed
         # parent to recover its axis; never rewrite a partition to add an index.
@@ -326,7 +341,8 @@ class FeatureLibrary:
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root/'.write.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            index = self._index(); partitions = index['partitions']; shards = index['shards']
+            planning_started=time.monotonic()
+            index = self._index(None if self.recover else request.output_sessions); partitions = index['partitions']; shards = index['shards']
             # An index is a hint, never admission of its existing bytes.
             owner=VerifiedMatrixStore(**self.limits) if self._session is None else self._session['store']
             with (owner if self._session is None else nullcontext(owner)) as admitted:
@@ -344,14 +360,16 @@ class FeatureLibrary:
                         validated[part['partition_ref']]=_partition_arrays(admitted,part)
                 admitted.check()
                 admission_metrics={k:v-baseline[k] for k,v in admitted.metrics.items()}
-            stats = {'core_calls':0,'core_seconds':0.0, 'computed_output_cells':0, 'hit_columns':len({(h['session'],h['column']) for h in coverage['hits']}),
+            stats = {'planning_seconds':time.monotonic()-planning_started,'prepare_seconds':0.0,'compile_seconds':0.0,'publication_seconds':0.0,
+                     'prepared_array_bytes':0,'output_array_bytes':0,'core_peak_working_bytes':0,
+                     'core_calls':0,'core_seconds':0.0, 'computed_output_cells':0, 'hit_columns':len({(h['session'],h['column']) for h in coverage['hits']}),
                      'hit_security_blocks':len(coverage['hits']),
                      'gap_columns':len(coverage['gaps']), 'recovered_partitions':len(recovered),
                      'coverage_date_writes':0, 'coverage_root_writes':0,
                      'maximum_execution_source_ids':0,
                      'admission_file_hash_calls':admission_metrics['file_hash_calls'],
                      'admission_hash_bytes':admission_metrics['hash_bytes']}
-            compiled = {}; by_day={day:{} for day in coverage['sessions']}
+            compiled = self._compiled; by_day={day:{} for day in coverage['sessions']}
             parts_by_day={}
             for part in partitions: parts_by_day.setdefault(part['sessions'][0],[]).append(part)
             dirty=set(recovered) | (set(parts_by_day)-set(shards))
@@ -367,9 +385,9 @@ class FeatureLibrary:
             for day,axis,columns in jobs:
                 scope=gap_scopes.setdefault(tuple(axis),{'days':set(),'columns':set()})
                 scope['days'].add(day); scope['columns'].update(columns)
-            gap_bindings={axis:source_adapter.dependency_refs(
+            gap_bindings={axis:(coverage['dependencies'] if list(axis)==coverage['security_ids'] else source_adapter.dependency_refs(
                 {c:coverage['definitions'][c] for c in coverage['definitions'] if c in scope['columns']},
-                sorted(scope['days']),list(axis)) for axis,scope in gap_scopes.items()}
+                sorted(scope['days']),list(axis))) for axis,scope in gap_scopes.items()}
             for day,securities,columns in jobs:
                 plan = select_feature_plan(request.plan, columns)
                 if securities!=coverage['security_ids']:
@@ -383,25 +401,35 @@ class FeatureLibrary:
                             'execution source projection changed Feature semantics')
                     plan=actual
                 stats['maximum_execution_source_ids']=max(stats['maximum_execution_source_ids'],len(plan.to_dict()['sources']))
+                prepare_started=time.monotonic()
                 inputs = source_adapter.prepare(plan, day, securities, bindings)
+                stats['prepare_seconds']+=time.monotonic()-prepare_started
+                stats['prepared_array_bytes']+=sum(a.nbytes for name in ('values','validity','reason_codes','available_at_utc_us','source_codes') for a in inputs[name].values())
                 require(inputs['input_refs'].get('feature_dependency_ref') == digest(bindings),
                         'prepared inputs do not bind planned dependencies')
                 key = plan.identity
+                compile_started=time.monotonic()
                 if key not in compiled: compiled[key] = compile_feature_columns(plan)
+                stats['compile_seconds']+=time.monotonic()-compile_started
                 core_started=time.monotonic()
                 result = execute_feature_columns(compiled[key], inputs=inputs, output_sessions=[day],
                     max_working_bytes=self.limits['maximum_matrix_bytes'])
                 stats['core_seconds']+=time.monotonic()-core_started
+                stats['core_peak_working_bytes']=max(stats['core_peak_working_bytes'],result['stats']['peak_working_bytes'])
+                publication_started=time.monotonic()
                 arrays, header = _capture_result(result, day=day, columns=columns,
                     securities=securities, maximum_bytes=self.limits['maximum_matrix_bytes'])
+                stats['output_array_bytes']+=sum(a.nbytes for a in arrays.values())
                 stats['core_calls'] += 1; stats['computed_output_cells'] += len(securities)*len(columns)
-                for start in range(0,len(columns),self.column_block):
-                    stop=min(start+self.column_block,len(columns)); block_columns=columns[start:stop]
+                header_descriptor=write_part(self.root,seal({'core_header':header},'header_ref'),'header_ref')
+                width=self.column_block or len(columns)
+                for start in range(0,len(columns),width):
+                    stop=min(start+width,len(columns)); block_columns=columns[start:stop]
                     block={name:value[:,:,start:stop] for name,value in arrays.items()}; buffers={}; block_digests={}
                     for name,dtype in ARRAYS.items():
                         array=block[name]
-                        block_digests[name]={'shape':list(array.shape),'dtype':array.dtype.str,
-                            'sha256':sha256(array.tobytes(order='C')).hexdigest()}
+                        block_digests[name]=(header['output_buffers'][name] if start==0 and stop==len(columns) else
+                            {'shape':list(array.shape),'dtype':array.dtype.str,'sha256':sha256(array.tobytes(order='C')).hexdigest()})
                         if name in ('reason_codes','source_codes'): buffers[name]=_write_codes(self.root,array)
                         else:
                             value=array.view('u1') if dtype=='bool_u8' else array
@@ -415,7 +443,7 @@ class FeatureLibrary:
                         'semantic_refs':{c:coverage['definitions'][c]['semantic_ref'] for c in block_columns},
                         'dependency_refs':{c:bindings[c] for c in block_columns},'buffers':buffers,
                         'column_source_bindings':_column_sources(header,block['source_codes'],block_columns),
-                        'core_header':header,'core_output_projection':projection},'partition_ref')
+                        'core_header':header_descriptor,'core_output_projection':projection},'partition_ref')
                     descriptor=write_part(self.root,part,'partition_ref')
                     records=self.root/'partitions'; records.mkdir(exist_ok=True)
                     record=records/(part['partition_ref'][7:]+'.json')
@@ -429,6 +457,7 @@ class FeatureLibrary:
                     if progress is not None: progress({'stage':'partition_sealed','session':day,**deepcopy(stats)})
                 shards[day]=write_date(self.root,day,parts_by_day[day])
                 stats['coverage_date_writes']+=1
+                stats['publication_seconds']+=time.monotonic()-publication_started
                 del result, arrays, inputs
             require(len(final_hits)==len(coverage['sessions'])*len(coverage['definitions']),
                     'Feature coverage remains incomplete')
@@ -436,8 +465,11 @@ class FeatureLibrary:
             view = compact_view(coverage, final_hits)
             descriptor = write_part(self.root, view, 'view_ref')
             self._publish_index(shards)
+            cached=self._coverage_cache[1]
+            changed=set(coverage['sessions'])|set(recovered)
+            retained=[p for p in cached['partitions'] if p['sessions'][0] not in changed]
             self._coverage_cache=(self._epoch(self.root/'index.json'),
-                {'partitions':list(partitions),'shards':dict(shards)})
+                {'partitions':retained+list(partitions),'shards':dict(shards),'loaded_days':cached['loaded_days']|changed})
             self._recovered_directory_mark=self._epoch(self.root/'partitions')
             stats.update(self.coverage_metrics)
             stats['coverage_root_writes']=1
@@ -466,6 +498,7 @@ class FeatureView:
         else:
             selections=self._view['blocks']
         physical=_ordered(self._view['security_ids'],'view securities'); physical_set=frozenset(physical)
+        self._security_set=physical_set;self._day_set=frozenset(self._view['sessions'])
         axes=self._view.get('security_axes',{})
         require(self._view['contract_version']==VIEW_VERSION or not axes,'legacy view cannot declare security blocks')
         require(all(digest(axis)==ref for ref,axis in axes.items()),'view security axis identity mismatch')
@@ -503,6 +536,8 @@ class FeatureView:
                     set(part['semantic_refs'])==set(part['dependency_refs'])==set(part['columns']) and
                     all(is_ref(r) for r in part['semantic_refs'].values()) and
                     all(is_ref(r) for r in part['dependency_refs'].values()), 'view partition coverage mismatch')
+            if 'path' in part['core_header']:
+                part={**part,'core_header':store.read_json(part['core_header'],'header_ref')['core_header']}
             parts[ref]=part
         else: store.check_path(partition_descriptor(desc)['path'])
         part=parts[ref]
@@ -595,7 +630,7 @@ class FeatureView:
             require(bool(columns) and len(columns) == len(set(columns)) and set(columns) <= set(view['columns']),
                     'ordered unique Feature columns required')
             keys = ([(s,d) for d in view['sessions'] for s in view['sample_universe']] if keys is None else list(keys))
-            require(bool(keys) and len(set(keys)) == len(keys) and all(s in view['security_ids'] and d in view['sessions'] for s,d in keys),
+            require(bool(keys) and len(set(keys)) == len(keys) and all(s in self._security_set and d in self._day_set for s,d in keys),
                     'unique keys inside fixed Feature view required')
             shape = len(keys), len(columns)
             require(len(keys)*len(columns)*50 <= self._store.maximum_matrix_bytes, 'Feature projection budget exceeded')
@@ -604,7 +639,7 @@ class FeatureView:
             reasons = [None]; source_sets = [[]]; bindings = {}; used = {}
             targets={}
             for i,(_,day) in enumerate(keys): targets.setdefault(day,[]).append(i)
-            tiles=self._tiles
+            tiles=self._tiles;row_selections={}
             for day,target in targets.items():
                 for j, column in enumerate(columns):
                     for selection in tiles[day,column]:
@@ -632,7 +667,9 @@ class FeatureView:
                         part,arrays,reason_map,source_map,axis,positions = used[ref]
                         require(part['semantic_refs'][column] == view['definitions'][column]['semantic_ref'], 'view Feature semantics mismatch')
                         col = positions[column]
-                        rows = [axis[keys[i][0]] for i in block_target]
+                        row_key=(day,ref,tuple(block_target))
+                        if row_key not in row_selections:row_selections[row_key]=[axis[keys[i][0]] for i in block_target]
+                        rows = row_selections[row_key]
                         for name in ARRAYS:
                             values = arrays[name][0,rows,col]
                             if name == 'reason_codes': values = reason_map[values]

@@ -176,7 +176,7 @@ class IncrementalFeatureLibraryTests(unittest.TestCase):
             library.ensure_features(source.request(['raw_x','mean_x','raw_y','z_x']),source)
             source.change_reference(days[3]); request=source.request(['raw_x','mean_x','raw_y','z_x'])
             coverage=library.plan_coverage(request,source)
-            self.assertEqual(coverage['gaps'],[{'session':days[3],'column':'z_x'}])
+            self.assertEqual(coverage['gaps'],[{'session':days[3],'column':'z_x','security_ids':['A','B','C']}])
             library.ensure_features(request,source)
             # Revising x at day 3 propagates only to x/mean/CS dependencies.
             next(r for r in source.f['rows'] if r['session']==days[3] and r['security_id']=='A')['values'][0]=100
@@ -190,6 +190,7 @@ class IncrementalFeatureLibraryTests(unittest.TestCase):
                 interrupted.ensure_features(source.request(['raw_y'],days[2:4]),source,progress=stop)
             self.assertFalse((interrupted.root/'index.json').exists())
             (interrupted.root/'partitions'/'.partial.json').write_text('{unfinished')
+            interrupted=FeatureLibrary(interrupted.root,maximum_working_bytes=2**20,recover=True)
             restored,stats=interrupted.ensure_features(source.request(['raw_y'],days[2:4]),source)
             self.assertEqual((stats['recovered_partitions'],stats['core_calls']),(1,1))
             self.assertEqual((stats['coverage_date_writes'],stats['coverage_root_writes']),(2,1))

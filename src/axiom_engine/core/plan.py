@@ -46,7 +46,11 @@ def validate_cs_zscore_params(q):
 
 def validate_plan(plan, *, execution=False):
     require(type(plan) is FeaturePlan, 'Expected FeaturePlan')
-    p = plan.to_dict()
+    return _validate_plan(plan.to_dict(),execution=execution)
+
+
+def _validate_plan(p, *, execution=False, _reference_validated=False):
+    """Internal DAG admission; a derived closure may reuse its admitted reference."""
     fields(p, 'abi semantics recipe_ref calendar_ref reference_ref reference_members input_schema event_schema sources observation_domain history_policy nodes outputs obligations')
     require(type(p['nodes']) is list and type(p['outputs']) is list and bool(p['outputs']),
             'Plan nodes/outputs must be arrays; outputs nonempty')
@@ -59,7 +63,7 @@ def validate_plan(plan, *, execution=False):
         fields(o, 'node column')
         fields(o['column'], 'name dtype unit stage missing')
     # Draft retains wire objects in place. Executable plans cannot contain any.
-    missing = unresolved(p)
+    missing = unresolved({k:v for k,v in p.items() if k!='reference_members'}) if _reference_validated else unresolved(p)
     if missing:
         require(not execution, 'UNRESOLVED: ' + ','.join(x['unknown_id'] for x in missing))
         return p
@@ -71,12 +75,13 @@ def validate_plan(plan, *, execution=False):
     require(p['history_policy'] in ('full', 'partial'), 'History policy required')
     require(type(p['reference_members']) is dict and bool(p['reference_members']), 'Frozen reference members required')
     from .contracts import session
-    for day, members in p['reference_members'].items():
-        session(day)
-        require(type(members) is dict, 'Reference members must map securities to industry')
-        for security, industry in members.items():
-            text(security)
-            require(industry is None or type(industry) is str and bool(industry.strip()), 'Invalid frozen industry')
+    if not _reference_validated:
+        for day, members in p['reference_members'].items():
+            session(day)
+            require(type(members) is dict, 'Reference members must map securities to industry')
+            for security, industry in members.items():
+                text(security)
+                require(industry is None or type(industry) is str and bool(industry.strip()), 'Invalid frozen industry')
     names = schema(p['input_schema'])
     require(all(c['stage'] == 'fact' for c in p['input_schema']), 'Input stage must be fact')
     require(type(p['event_schema']) is dict, 'Event schema must be an object')
@@ -229,7 +234,11 @@ def validate_plan(plan, *, execution=False):
 
 def required_history(plan):
     """Full finite dependency closure in the plan's declared observation domain."""
-    p = validate_plan(plan, execution=True)
+    return _required_history(validate_plan(plan, execution=True))
+
+
+def _required_history(p):
+    """History of an already admitted DAG; no reference-grid traversal."""
     depth = {c['name']: 0 for c in p['input_schema']}
     for n in p['nodes']:
         d = max((depth[a] for a in n['inputs']), default=0)

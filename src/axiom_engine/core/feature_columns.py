@@ -11,7 +11,7 @@ from time import perf_counter_ns
 from types import MappingProxyType
 
 from .contracts import FeaturePlan, digest, fields, integer, require, session, text
-from .plan import CS, WINDOW, required_history, validate_plan
+from .plan import CS, WINDOW, required_history, validate_plan, _required_history
 from . import execution as kernel
 from .._implementation import IMPLEMENTATION_REF
 
@@ -75,7 +75,7 @@ def compile_feature_columns(plan: FeaturePlan):
                      'plan_ref': plan.identity, 'implementation_ref': IMPLEMENTATION_REF,
                      'profile': 'sessions_float64_bool_sources64_v1'})
     return CompiledFeatureColumns(plan.identity, identity, _freeze(p),
-                                  _freeze(required_history(plan)), _freeze(last),
+                                  _freeze(_required_history(p)), _freeze(last),
                                   tuple(sorted(p['reference_members'])))
 
 
@@ -194,7 +194,7 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     begin_ns = perf_counter_ns()
     require(type(compiled) is CompiledFeatureColumns, 'Expected compiled Feature columns')
     integer(max_working_bytes, 1)
-    fields(inputs, _FIELDS + ' ' + ' '.join(k for k in ('reference_member_known', 'reference_pool_complete') if k in inputs))
+    fields(inputs, _FIELDS + ' ' + ' '.join(k for k in ('reference_member_known', 'reference_pool_complete', 'field_rows') if k in inputs))
     require(inputs['contract_version'] == 'feature_column_input_v1', 'Column input version')
     p = compiled._plan
     for name in ('calendar_ref', 'reference_ref'):
@@ -269,8 +269,12 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     mask_table = np.array(masks, dtype='uint64')
     budget, descriptors = _Budget(max_working_bytes), {}
     shape = len(days), len(securities)
+    caller_arrays=[value for field in ('values','validity','reason_codes','available_at_utc_us','source_codes') for value in inputs[field].values()]
+    caller_arrays.extend(value for value in inputs.values() if isinstance(value,np.ndarray))
+    caller_bytes=sum(value.nbytes for value in {id(a):a for a in caller_arrays}.values())
+    budget.add(caller_bytes)
     # Reserve worst-case sequential vector/serialization scratch before allocation.
-    # Caller-owned buffers and Python object overhead are outside this array bound.
+    # Caller arrays are charged above; Python object overhead is outside this array bound.
     output_cells = len(out_days) * len(securities) * len(p['outputs'])
     budget.add(max(math.prod(shape) * 96, output_cells * 64))
     def take(name, dtype, grid=shape):
@@ -308,15 +312,24 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     names = {c['name'] for c in p['input_schema']}
     for field in ('values', 'validity', 'reason_codes', 'available_at_utc_us', 'source_codes'):
         require(type(inputs[field]) is dict and set(inputs[field]) == names, 'Input columns mismatch: ' + field)
+    field_rows=inputs.get('field_rows')
+    if field_rows is not None:
+        require(type(field_rows) is dict and set(field_rows)==names,'exact sparse field axes required')
     env = {}
     # Admission snapshots each source column once. Intermediates only cover closure rows.
     for schema in p['input_schema']:
         name = schema['name']
+        selected=list(range(len(days))) if field_rows is None else field_rows[name]
+        require(type(selected) is list and selected==sorted(set(selected)) and
+                all(type(i) is int and 0<=i<len(days) for i in selected) and needed[name]<=set(selected),'sparse field rows omit dependencies')
+        field_shape=(len(selected),len(securities))
+        row_positions={r:i for i,r in enumerate(selected)}
+        if field_rows is not None:descriptors['rows/'+name]=selected
         arrays = {}
         for field, dtype in (('values', schema['dtype']), ('validity', 'bool'),
                               ('reason_codes', 'int32'), ('available_at_utc_us', 'int64'),
                               ('source_codes', 'int32')):
-            arrays[field] = _snapshot(np, inputs[field][name], dtype, shape,
+            arrays[field] = _snapshot(np, inputs[field][name], dtype, field_shape,
                                       field + '/' + name, budget, descriptors)
         value, valid, reason, available, codes = (arrays[k] for k in
             ('values', 'validity', 'reason_codes', 'available_at_utc_us', 'source_codes'))
@@ -329,9 +342,9 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
         available_seconds = _time(np, available)
         col = _Column(np, needed[name], len(securities), schema['dtype'], budget)
         if col.rows:
-            ix = list(col.rows)
+            ix = [row_positions[r] for r in col.rows]
             col.value[:] = value[ix]
-            col.issue[:] = available_seconds[ix] > cutoff[ix, None]
+            col.issue[:] = available_seconds[ix] > cutoff[list(col.rows), None]
             col.valid[:] = valid[ix] & ~col.issue
             col.available[:] = available_seconds[ix]
             col.source[:] = mask_table[codes[ix]]
@@ -371,6 +384,7 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
         else:
             out.reason[oi, s] = reason_ids[reason]
 
+    reference_groups={}
     for node_index, n in enumerate(p['nodes']):
         name, op, q, args = n['name'], n['op'], n['params'], n['inputs']
         if not needed[name]:
@@ -478,11 +492,15 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                         put(out,oi,s,None,'REFERENCE_MISSING')
                     require(n['column']['missing'] != 'reject', 'Missing rejected by node schema')
                     continue
-                groups = {}
-                for s in range(len(securities)):
-                    group = industry[r][s] if q['group'] == 'industry' else ''
-                    require(group is not None or q['unknown_group'] != 'reject', 'UNKNOWN_INDUSTRY')
-                    groups.setdefault(group, []).append(s)
+                group_key=(r,q['group'])
+                if group_key not in reference_groups:
+                    groups={}
+                    for s in range(len(securities)):
+                        group=industry[r][s] if q['group']=='industry' else ''
+                        groups.setdefault(group,[]).append(s)
+                    reference_groups[group_key]=groups
+                groups=reference_groups[group_key]
+                require(None not in groups or q['unknown_group']!='reject','UNKNOWN_INDUSTRY')
                 for group, group_indices in groups.items():
                     eligible = [s for s in group_indices if member[r, s] and group is not None]
                     eligible_set = frozenset(eligible)  # one compact cohort set, never per cell
@@ -501,6 +519,8 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                         dep_source |= masks[int(ref_codes[r, s])]
                     dep_issue = any(source.issue[pi, s] for s in eligible)
                     mean = kernel.statistics.fmean(vals) if op == 'cs_mean' and vals and not blocked else None
+                    ranks = kernel._group_ranks(vals) if op == 'cs_rank' and vals and not blocked else {}
+                    bounds = (kernel._quantile(vals,q['lower']),kernel._quantile(vals,q['upper'])) if op == 'cs_winsorize' and vals and not blocked else None
                     for s in group_indices:
                         out.available[oi, s] = max(dep_time, int(source.available[pi, s]))
                         out.source[oi, s] = dep_source | int(source.source[pi, s])
@@ -511,8 +531,8 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                         value = None
                         if s in eligible_set and vals and not blocked and (x is not None or op == 'cs_mean'):
                             if op == 'cs_mean': value = mean
-                            elif op == 'cs_rank': value = kernel._rank(x, vals)
-                            elif op == 'cs_winsorize': value = min(max(x, kernel._quantile(vals, q['lower'])), kernel._quantile(vals, q['upper']))
+                            elif op == 'cs_rank': value = ranks[x]
+                            elif op == 'cs_winsorize': value = min(max(x, bounds[0]), bounds[1])
                             else: value, mean = kernel._cs_zscore_value(x, vals, std, undefined, q, mean)
                         elif op == 'cs_zscore' and s in eligible_set and not blocked and undefined:
                             value, mean = kernel._cs_zscore_value(x, vals, std, undefined, q, mean)
@@ -577,7 +597,7 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     result_ref = _ref(binding)
     return {**binding, **output_arrays, 'result_ref': result_ref,
             'stats': {'peak_working_bytes': budget.peak, 'output_cells': math.prod(output_shape),
-                      'input_snapshots': len(descriptors), 'view_count': 1,
+                      'input_snapshots': len(descriptors), 'view_count': 1,'caller_array_bytes':caller_bytes,
                       'admission_ns': admitted_ns - begin_ns,
                       'numeric_and_metadata_ns': computed_ns - admitted_ns,
                       'output_ns': perf_counter_ns() - computed_ns}}

@@ -245,6 +245,17 @@ def _rank(x, vals):
     return (sum(v < x for v in vals) + (sum(v == x for v in vals) + 1) / 2) / len(vals)
 
 
+def _group_ranks(vals):
+    """One sort, preserving the exact average-rank arithmetic of _rank."""
+    ordered = sorted(vals); result = {}; start = 0
+    while start < len(ordered):
+        end = start + 1
+        while end < len(ordered) and ordered[end] == ordered[start]: end += 1
+        result[ordered[start]] = (start + (end-start+1)/2) / len(ordered)
+        start = end
+    return result
+
+
 def _std(vals, ddof):
     if len(vals) <= ddof: return None
     # statistics retains exact ratios until its scaled square root: no float
@@ -454,14 +465,16 @@ def _cross_section(op, source, keys, refs, q, reference_index, *, reuse=None, no
         eligible = set(eligible)
         group_dependency = _merge(None, deps + refs_cells)
         mean = statistics.fmean(vals) if op == 'cs_mean' and vals and not blocked else None
+        ranks = _group_ranks(vals) if op == 'cs_rank' and vals and not blocked else {}
+        bounds = (_quantile(vals,q['lower']),_quantile(vals,q['upper'])) if op == 'cs_winsorize' and vals and not blocked else None
         for key in group_keys:
             x = source[key].value
             if x is None and q['missing'] == 'fill_zero': x = 0.0
             value = None
             if key in eligible and vals and not blocked and (x is not None or op == 'cs_mean'):
                 if op == 'cs_mean': value = mean
-                elif op == 'cs_rank': value = _rank(x, vals)
-                elif op == 'cs_winsorize': value = min(max(x, _quantile(vals, q['lower'])), _quantile(vals, q['upper']))
+                elif op == 'cs_rank': value = ranks[x]
+                elif op == 'cs_winsorize': value = min(max(x, bounds[0]), bounds[1])
                 else: value, mean = _cs_zscore_value(x, vals, std, undefined, q, mean)
             elif op == 'cs_zscore' and key in eligible and not blocked and undefined:
                 value, mean = _cs_zscore_value(x, vals, std, undefined, q, mean)
