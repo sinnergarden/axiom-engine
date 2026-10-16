@@ -345,14 +345,17 @@ def _element_row(np, op, q, parents, row, out, oi, reason_ids):
     values=[parent.value[parent.at(row)] for parent in parents]
     known=[parent.valid[parent.at(row)] for parent in parents]
     target=out.value[oi];valid=out.valid[oi]
-    if op=='constant':target.fill(q['value']);valid.fill(True)
+    if op=='constant':
+        if q['value'] is not None:target.fill(q['value']);valid.fill(True)
     elif op=='identity':
         target[:]=values[0];valid[:]=known[0]
         out.reason[oi]=parents[0].reason[parents[0].at(row)]
         return
     elif op=='is_missing':target[:]=~known[0];valid.fill(True)
     elif op=='fill':
-        target[:]=values[0];np.copyto(target,q['value'],where=~known[0]);valid.fill(True)
+        target[:]=values[0];valid[:]=known[0]
+        if q['value'] is not None:
+            np.copyto(target,q['value'],where=~known[0]);valid.fill(True)
     elif op=='where':
         require(q['missing']!='reject' or bool(np.all(known[0])),'MISSING_BOOLEAN')
         chosen=(values[0]!=0)&known[0]
