@@ -17,6 +17,10 @@ def feature_definitions(plan, *, input_semantics):
     require(type(input_semantics) is dict, 'explicit input semantics required')
     nodes = {n['name']: n for n in p['nodes']}
     schema = {c['name']: c for c in p['input_schema']}
+    # Raw output closures have the same depth as their nodes in the admitted
+    # DAG. Compute all depths once instead of copying/validating the complete
+    # frozen reference cohort once per output. Derived facts still expand below.
+    history = required_history(plan)
     result = {}
     for output in p['outputs']:
         used, leaves = set(), set()
@@ -63,11 +67,14 @@ def feature_definitions(plan, *, input_semantics):
             'history_policy': p['history_policy'], 'nodes': closure,
             'operator_semantics':{n['op']:OPERATOR_SEMANTIC_REVISIONS[n['op']] for n in closure},
             'inputs': fact_inputs, 'output': semantic_output}
-        expanded_plan = deepcopy(p)
-        expanded_plan.update(nodes=closure, input_schema=[v['schema'] for v in fact_inputs.values()],
-                             outputs=[semantic_output])
-        depth = required_history(FeaturePlan.from_dict(expanded_plan))[output['column']['name']]
         name = output['column']['name']
+        if aliases:
+            expanded_plan = deepcopy(p)
+            expanded_plan.update(nodes=closure, input_schema=[v['schema'] for v in fact_inputs.values()],
+                                 outputs=[semantic_output])
+            depth = required_history(FeaturePlan.from_dict(expanded_plan))[name]
+        else:
+            depth = history[name]
         result[name] = {'semantic_ref': digest(semantic), 'semantic': semantic,
             'schema': deepcopy(output['column']), 'inputs': sorted(leaves),
             'reference_dependent': any(n['op'] in CS for n in closure),
