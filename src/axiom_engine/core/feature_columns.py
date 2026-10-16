@@ -186,7 +186,7 @@ def _sorted_quantile(values, fraction):
     return values[lo] + (values[hi]-values[lo])*(position-lo)
 
 
-def _sliding_extrema(source, rows, window, inclusive, maximum, width):
+def _sliding_extrema(np, source, rows, window, inclusive, maximum, width):
     """One anchored input; strict eviction preserves first ties/signed zero."""
     from collections import deque
     result = {}
@@ -203,91 +203,195 @@ def _sliding_extrema(source, rows, window, inclusive, maximum, width):
                         queue.pop()
                     queue.append((day,value))
         cursor = end
-        values = []
-        for queue in queues:
+        values = np.zeros(width,dtype='float64'); valid = np.zeros(width,dtype='bool')
+        for security,queue in enumerate(queues):
             while queue and queue[0][0] < start: queue.popleft()
-            values.append(queue[0][1] if queue else None)
-        result[row] = values
+            if queue:values[security]=queue[0][1];valid[security]=True
+        result[row] = values,valid
     return result
 
 
 def _window_family(np, nodes, parents, needed, width, budget, reason_ids, counters):
-    """Consume a shared window once, retaining only compact consumer outputs."""
-    results = {n['name']:_Column(np,needed[n['name']],width,n['column']['dtype'],budget) for n in nodes}
-    rows = sorted(set().union(*(needed[n['name']] for n in nodes)))
-    q0 = nodes[0]['params']; window=q0['window']; inclusive=q0['inclusive_current']
-    # Nested extrema scan each input position once; metadata still uses its exact window.
-    extremes={}; extreme_bytes=0
+    """Share array windows; convert only exact ordered scalar reductions to lists."""
+    results={n['name']:_Column(np,needed[n['name']],width,n['column']['dtype'],budget) for n in nodes}
+    rows=sorted(set().union(*(needed[n['name']] for n in nodes)))
+    q0=nodes[0]['params'];window=q0['window'];inclusive=q0['inclusive_current']
+    extremes={};extreme_bytes=0;counts_prefix=None
     for maximum in (False,True):
         targets=[n for n in nodes if n['op']=='rolling' and n['params']['reduction']==('max' if maximum else 'min') and len(needed[n['name']])>1]
         if targets:
             target_rows=sorted(set().union(*(needed[n['name']] for n in targets)))
             charge=(len(target_rows)+window)*width*96
-            budget.add(charge); extreme_bytes+=charge
-            extremes[maximum]=_sliding_extrema(parents[0],target_rows,window,inclusive,maximum,width)
+            budget.add(charge);extreme_bytes+=charge
+            extremes[maximum]=_sliding_extrema(np,parents[0],target_rows,window,inclusive,maximum,width)
+    if extremes:
+        prefix_bytes=(len(parents[0].rows)+1)*width*4
+        budget.add(prefix_bytes);extreme_bytes+=prefix_bytes
+        counts_prefix=np.zeros((len(parents[0].rows)+1,width),dtype='int32')
+        np.cumsum(parents[0].valid,axis=0,dtype='int32',out=counts_prefix[1:])
+    security_indices=np.arange(width)
     for r in rows:
-        counters['window_gathers']+=1
         active=[n for n in nodes if r in needed[n['name']]]
-        start=max(0,r+int(inclusive)-window); end=r+int(inclusive)
-        workspace=_window_workspace_bytes(end-start,width,len(parents))
-        budget.add(workspace)
-        windows=[]; available=np.full(width,_NONE_TIME,dtype='int64'); sources=np.zeros(width,dtype='uint64'); issues=np.zeros(width,dtype='bool')
+        start=max(0,r+int(inclusive)-window);end=r+int(inclusive)
+        workspace=_window_workspace_bytes(end-start,width,len(parents));budget.add(workspace)
+        counters['window_gathers']+=1
+        owner=results[active[0]['name']];owner_i=owner.at(r)
+        indices=[]
         for parent in parents:
-            ix=[parent.at(d) for d in range(start,end)]
-            windows.append((parent.value[ix],parent.valid[ix]))
+            ix=[parent.at(d) for d in range(start,end)];indices.append(ix)
             if ix:
-                available=np.maximum(available,np.max(parent.available[ix],axis=0))
-                sources|=np.bitwise_or.reduce(parent.source[ix],axis=0)
-                issues|=np.any(parent.issue[ix],axis=0)
+                owner.available[owner_i]=np.maximum(owner.available[owner_i],np.max(parent.available[ix],axis=0))
+                owner.source[owner_i]|=np.bitwise_or.reduce(parent.source[ix],axis=0)
+                owner.issue[owner_i]|=np.any(parent.issue[ix],axis=0)
+        # Extrema-only dates do not gather/box numeric windows at all.
+        numeric=[n for n in active if not (n['op']=='rolling' and n['params']['reduction'] in ('min','max') and r in extremes.get(n['params']['reduction']=='max',{}))]
+        windows=[]
+        if numeric:
+            counters['numeric_window_gathers']=counters.get('numeric_window_gathers',0)+1
+            windows=[(parent.value[ix],parent.valid[ix]) for parent,ix in zip(parents,indices)]
+            counts=np.count_nonzero(windows[0][1],axis=0)
+        else:
+            ix=indices[0]
+            counts=counts_prefix[ix[-1]+1]-counts_prefix[ix[0]] if ix else np.zeros(width,dtype='int32')
+        tasks={}
         for n in active:
-            out=results[n['name']]; oi=out.at(r)
-            out.available[oi]=available; out.source[oi]=sources; out.issue[oi]=issues
-        for security in range(width):
-            columns=[[float(v) if valid else None for v,valid in zip(values[:,security],validity[:,security])] for values,validity in windows]
-            present=[v for v in columns[0] if v is not None]
-            stats={}
-            for n in active:
-                op=n['op']; q=n['params']; value=None
-                blocked=len(present)<q['min_periods'] or q['missing']=='propagate' and len(present)!=end-start
-                if op=='rolling_corr':
-                    value,blocked=kernel._window_value(op,columns,q,kernel._regression)
-                elif not blocked:
-                    if op=='rolling_regression':
-                        if 'regression' not in stats:
-                            stats['regression']=kernel._regression(tuple(columns[0]));counters['regression_solves']+=1
-                        value=stats['regression'][('slope','rsquare','resi').index(q['output'])]
-                        if value is None and (q['output']=='rsquare' or len(present)<2):require(q['zero']=='missing','ZERO_VARIANCE')
-                    elif op=='rolling_quantile' or op=='rolling' and q['reduction']=='median':
-                        if 'sorted' not in stats:
-                            stats['sorted']=sorted(present);counters['window_sorts']+=1
-                        ordered=stats['sorted']
-                        if op=='rolling_quantile':value=_sorted_quantile(ordered,q['quantile'])
-                        else:
-                            mid=len(ordered)//2
-                            value=ordered[mid] if len(ordered)%2 else (ordered[mid-1]+ordered[mid])/2
-                    elif op=='rolling':
-                        reduction=q['reduction']
-                        if reduction in ('sum','mean'):
-                            if 'sum' not in stats:
-                                stats['sum']=math.fsum(present);counters['window_fsums']+=1
-                            value=stats['sum'] if reduction=='sum' else stats['sum']/len(present)
-                        elif reduction in ('min','max') and r in extremes.get(reduction=='max',{}):
-                            value=extremes[reduction=='max'][r][security]
-                        else:
-                            key=(reduction,q.get('ddof'))
-                            if key not in stats:stats[key]=kernel._rolling_value(present,columns[0][-1],q)
-                            value=stats[key]
-                    else:value,_=kernel._window_value(op,columns,q,kernel._regression)
-                out=results[n['name']]; oi=out.at(r)
-                if value is None:out.reason[oi,security]=reason_ids['WINDOW_MISSING' if blocked else 'MISSING']
-                else:
-                    require(type(value) in (int,float,bool) and math.isfinite(value),'NONFINITE_RESULT')
-                    require(out.dtype!='bool' or type(value) is bool,'Boolean result dtype mismatch')
-                    out.value[oi,security]=value;out.valid[oi,security]=True
-        del windows,columns,present,stats,available,sources,issues,ix
+            out=results[n['name']];oi=out.at(r);q=n['params'];op=n['op']
+            if out is not owner:
+                out.available[oi]=owner.available[owner_i];out.source[oi]=owner.source[owner_i];out.issue[oi]=owner.issue[owner_i]
+            actual_counts=(np.count_nonzero(windows[0][1]&windows[1][1],axis=0) if op=='rolling_corr' else counts)
+            ok=(actual_counts>=q['min_periods'])
+            if q['missing']=='propagate':ok&=actual_counts==end-start
+            out.reason[oi]=np.where(ok,reason_ids['MISSING'],reason_ids['WINDOW_MISSING'])
+            if not np.any(ok):continue
+            reduction=q.get('reduction')
+            if op=='rolling' and reduction in ('min','max') and r in extremes.get(reduction=='max',{}):
+                values,valid=extremes[reduction=='max'][r]
+                out.value[oi]=values;out.valid[oi]=ok&valid
+                continue
+            if op=='rolling' and reduction in ('sum','mean'):kind='sum'
+            elif op=='rolling_quantile' or op=='rolling' and reduction=='median':kind='sorted'
+            elif op=='rolling_regression':kind='regression'
+            elif op=='rolling_idx':kind=('extreme',q['extreme'])
+            elif op=='rolling' and reduction in ('min','max'):kind=('extreme',reduction)
+            elif op=='rolling':kind=(reduction,q.get('ddof'))
+            else:kind='corr'
+            tasks.setdefault(kind,[]).append((n,out,oi,ok))
+        for kind,targets in tasks.items():
+            values,valid=windows[0]
+            eligible=np.logical_or.reduce([t[3] for t in targets])
+            if isinstance(kind,tuple) and kind[0]=='extreme':
+                maximum=kind[1]=='max'
+                masked=np.where(valid,values,-np.inf if maximum else np.inf)
+                arg=(np.argmax if maximum else np.argmin)(masked,axis=0)
+                extreme=values[arg,security_indices]
+                last=None
+                for n,out,oi,ok in targets:
+                    if n['op']=='rolling_idx':
+                        chosen=arg
+                        if n['params']['ties']=='last':
+                            if last is None:last=len(masked)-1-(np.argmax if maximum else np.argmin)(masked[::-1],axis=0)
+                            chosen=last
+                        out.value[oi]=chosen+1
+                    else:out.value[oi]=extreme
+                    out.valid[oi]=ok
+                del masked,arg,extreme,last
+            elif isinstance(kind,tuple) and kind[0]=='rank':
+                last=values[-1]
+                less=np.count_nonzero((values<last)&valid,axis=0)
+                equal=np.count_nonzero((values==last)&valid,axis=0)
+                ranked=np.divide(less+(equal+1)/2,counts,out=np.zeros(width),where=counts!=0)
+                for n,out,oi,ok in targets:out.value[oi]=ranked;out.valid[oi]=ok&valid[-1]
+            else:
+                for security in np.flatnonzero(eligible):
+                    # Ordered fsum/statistics retain their original numerical algorithms.
+                    present=values[:,security][valid[:,security]].tolist()
+                    if kind=='sum':number=math.fsum(present);counters['window_fsums']+=1
+                    elif kind=='sorted':ordered=sorted(present);counters['window_sorts']+=1
+                    elif kind=='regression' or kind=='corr':
+                        columns=[]
+                        for vals,known in windows:
+                            column=vals[:,security].tolist()
+                            for missing in np.flatnonzero(~known[:,security]):column[missing]=None
+                            columns.append(column)
+                        if kind=='regression':regression=kernel._regression(tuple(columns[0]));counters['regression_solves']+=1
+                    else:number=kernel._std(present,kind[1])
+                    for n,out,oi,ok in targets:
+                        if not ok[security]:continue
+                        q=n['params'];value=None
+                        if kind=='sum':value=number/int(counts[security]) if q['reduction']=='mean' else number
+                        elif kind=='sorted':
+                            if n['op']=='rolling_quantile':value=_sorted_quantile(ordered,q['quantile'])
+                            else:
+                                mid=len(ordered)//2;value=ordered[mid] if len(ordered)%2 else (ordered[mid-1]+ordered[mid])/2
+                        elif kind=='regression':
+                            value=regression[('slope','rsquare','resi').index(q['output'])]
+                            if value is None and (q['output']=='rsquare' or len(present)<2):require(q['zero']=='missing','ZERO_VARIANCE')
+                        elif kind=='corr':value,_=kernel._window_value('rolling_corr',columns,q,kernel._regression)
+                        else:value=number
+                        if value is not None:out.value[oi,security]=value;out.valid[oi,security]=True
+        windows.clear();values=valid=None
+        del windows,indices,tasks
         budget.drop(workspace)
-    extremes.clear();budget.drop(extreme_bytes)
+    extremes.clear();counts_prefix=None;budget.drop(extreme_bytes)
     return results
+
+
+_BATCH_ELEMENT={'constant','identity','is_missing','fill','gt','lt','eq','and','or','not',
+                'divide','add','sub','mul','abs','to_float','clip','where'}
+
+
+def _element_row(np, op, q, parents, row, out, oi, reason_ids):
+    """Original scalar order over one security row; parent metadata is merged once."""
+    values=[parent.value[parent.at(row)] for parent in parents]
+    known=[parent.valid[parent.at(row)] for parent in parents]
+    target=out.value[oi];valid=out.valid[oi]
+    if op=='constant':target.fill(q['value']);valid.fill(True)
+    elif op=='identity':
+        target[:]=values[0];valid[:]=known[0]
+        out.reason[oi]=parents[0].reason[parents[0].at(row)]
+        return
+    elif op=='is_missing':target[:]=~known[0];valid.fill(True)
+    elif op=='fill':
+        target[:]=values[0];np.copyto(target,q['value'],where=~known[0]);valid.fill(True)
+    elif op=='where':
+        require(q['missing']!='reject' or bool(np.all(known[0])),'MISSING_BOOLEAN')
+        chosen=(values[0]!=0)&known[0]
+        # Both branches already exist in the original DAG; select without arithmetic.
+        target[:]=values[2];np.copyto(target,values[1],where=chosen)
+        valid[:]=np.where(chosen,known[1],known[2])
+        if q['missing']=='preserve':valid&=known[0]
+    elif op in ('gt','lt','eq','and','or','not'):
+        present=known[0].copy()
+        for mask in known[1:]:present&=mask
+        require(q['missing']!='reject' or bool(np.all(present)),'MISSING_BOOLEAN')
+        if op in ('gt','lt','eq'):
+            compare=np.greater if op=='gt' else np.less if op=='lt' else np.equal
+            target[:]=compare(values[0],values[1])&present
+        else:
+            left=(values[0]!=0)&known[0]
+            if op=='not':target[:]=~left
+            elif op=='and':target[:]=left&((values[1]!=0)&known[1])
+            else:target[:]=left|((values[1]!=0)&known[1])
+        valid[:]=present if q['missing']=='preserve' else True
+    else:
+        valid[:]=known[0]
+        for mask in known[1:]:valid&=mask
+        with np.errstate(over='ignore',invalid='ignore',divide='ignore'):
+            if op=='divide':
+                zero=valid&(values[1]==0)
+                require(q['zero']=='missing' or not bool(np.any(zero)),'ZERO_DENOMINATOR')
+                valid&=~zero;np.divide(values[0],values[1],out=target,where=valid)
+            elif op in ('add','sub','mul'):
+                operation=np.add if op=='add' else np.subtract if op=='sub' else np.multiply
+                operation(values[0],values[1],out=target,where=valid)
+            elif op=='abs':np.absolute(values[0],out=target,where=valid)
+            elif op=='to_float':np.copyto(target,values[0],where=valid)
+            elif op=='clip':
+                np.copyto(target,values[0],where=valid)
+                # Python max/min keep their first argument on equal signed zeros.
+                if q['lower'] is not None:np.copyto(target,q['lower'],where=valid&(target<q['lower']))
+                if q['upper'] is not None:np.copyto(target,q['upper'],where=valid&(target>q['upper']))
+    out.reason[oi]=np.where(valid,0,reason_ids['MISSING'])
 
 
 def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_bytes):
@@ -494,9 +598,10 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
         else:
             out.reason[oi, s] = reason_ids[reason]
 
+    vector_workspace=len(securities)*128;budget.add(vector_workspace)
     reference_groups={}; industry_representatives={}; cohort_cache={}; cohort_charges={}; reference_charge=0
     families={}; family_keys={}; pending_windows={}; node_timings=[]
-    counters=dict(window_gathers=0,regression_solves=0,window_sorts=0,window_fsums=0)
+    counters=dict(window_gathers=0,regression_solves=0,window_sorts=0,window_fsums=0,batch_element_cells=0,scalar_element_cells=0)
     for node in p['nodes']:
         if needed[node['name']] and (node['op']=='rolling' or node['op'] in WINDOW):
             q=node['params'];key=(tuple(node['inputs']),q['window'],q['inclusive_current'])
@@ -527,10 +632,15 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                         out.value[oi], out.valid[oi], out.reason[oi] = source.value[pi], source.valid[pi], source.reason[pi]
                 else:
                     merge(out, oi, [(source, source.at(r))])
-                    for s in range(len(securities)):
-                        value = kernel._divide(source.numeric(r, s),
-                            source.numeric(previous, s) if previous >= 0 else None, q['zero'])
-                        put(out, oi, s, None if value is None else value - 1)
+                    out.reason[oi]=reason_ids['MISSING']
+                    if previous>=0:
+                        current=source.at(r);valid=source.valid[current]&source.valid[pi]
+                        zero=valid&(source.value[pi]==0)
+                        require(q['zero']=='missing' or not bool(np.any(zero)),'ZERO_DENOMINATOR')
+                        valid&=~zero;out.valid[oi]=valid
+                        with np.errstate(over='ignore',invalid='ignore',divide='ignore'):
+                            np.divide(source.value[current],source.value[pi],out=out.value[oi],where=valid)
+                            np.subtract(out.value[oi],1,out=out.value[oi],where=valid)
             elif name in family_keys:
                 pass  # Family outputs already computed from one anchored window traversal.
             elif op == 'rolling_industry':
@@ -642,10 +752,16 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                         put(out, oi, s, value if member_known[r,s] else None, 'REFERENCE_MISSING')
             else:
                 merge(out, oi, [(a, a.at(r)) for a in parents])
-                for s in range(len(securities)):
-                    value = kernel._element_numeric(op, [a.numeric(r, s) for a in parents], q)
-                    reason = reasons[int(parents[0].reason[parents[0].at(r), s])] if op == 'identity' and value is None else 'MISSING'
-                    put(out, oi, s, value, reason)
+                if op in _BATCH_ELEMENT:
+                    counters['batch_element_cells']+=len(securities)
+                    _element_row(np,op,q,parents,r,out,oi,reason_ids)
+                else:
+                    # Transcendentals retain Python math's exact scalar rounding.
+                    counters['scalar_element_cells']+=len(securities)
+                    for security in range(len(securities)):
+                        value=kernel._element_numeric(op,[a.numeric(r,security) for a in parents],q)
+                        put(out,oi,security,value)
+            require(bool(np.all(np.isfinite(out.value[oi,out.valid[oi]]))),'NONFINITE_RESULT')
             out.valid[oi, out.issue[oi]] = False
             out.reason[oi, out.issue[oi]] = reason_ids['UNAVAILABLE_AT_SESSION_CUTOFF']
             out.value[oi, ~out.valid[oi]] = 0
@@ -670,7 +786,7 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
             del source
         node_timings.append(dict(node=name,op=op,elapsed_ns=perf_counter_ns()-node_started,needed_rows=len(out.rows),window=q.get('window'),securities=len(securities),family=family_names))
         del parents, out
-    reference_groups.clear();industry_representatives.clear();budget.drop(reference_charge)
+    reference_groups.clear();industry_representatives.clear();budget.drop(reference_charge+vector_workspace)
     computed_ns = perf_counter_ns()
     unique, inverse = np.unique(source_masks, return_inverse=True)
     if unique[0] != 0:
