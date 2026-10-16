@@ -388,19 +388,27 @@ class FeatureLibrary:
             gap_bindings={axis:(coverage['dependencies'] if list(axis)==coverage['security_ids'] else source_adapter.dependency_refs(
                 {c:coverage['definitions'][c] for c in coverage['definitions'] if c in scope['columns']},
                 sorted(scope['days']),list(axis))) for axis,scope in gap_scopes.items()}
+            selected_plans={}; admitted_plans={}
             for day,securities,columns in jobs:
-                plan = select_feature_plan(request.plan, columns)
-                if securities!=coverage['security_ids']:
-                    plan=select_security_plan(plan,securities)
+                selection_key=(tuple(columns),tuple(securities))
+                if selection_key not in selected_plans:
+                    selected=select_feature_plan(request.plan,columns)
+                    if securities!=coverage['security_ids']:selected=select_security_plan(selected,securities)
+                    selected_plans[selection_key]=(selected,selected.to_dict())
+                plan,before=selected_plans[selection_key]
                 bindings = {c:gap_bindings[tuple(securities)][day][c] for c in columns}
                 if hasattr(source_adapter,'execution_plan'):
                     actual=source_adapter.execution_plan(plan,day,securities,bindings)
-                    before=plan.to_dict(); after=actual.to_dict()
-                    require({k:v for k,v in before.items() if k!='sources'}==
-                            {k:v for k,v in after.items() if k!='sources'},
-                            'execution source projection changed Feature semantics')
-                    plan=actual
-                stats['maximum_execution_source_ids']=max(stats['maximum_execution_source_ids'],len(plan.to_dict()['sources']))
+                    key=(selection_key,actual.identity)
+                    if key not in admitted_plans:
+                        after=actual.to_dict()
+                        require({k:v for k,v in before.items() if k!='sources'}==
+                                {k:v for k,v in after.items() if k!='sources'},
+                                'execution source projection changed Feature semantics')
+                        admitted_plans[key]=(actual,len(after['sources']))
+                    plan,source_count=admitted_plans[key]
+                else:source_count=len(before['sources'])
+                stats['maximum_execution_source_ids']=max(stats['maximum_execution_source_ids'],source_count)
                 prepare_started=time.monotonic()
                 inputs = source_adapter.prepare(plan, day, securities, bindings)
                 stats['prepare_seconds']+=time.monotonic()-prepare_started
@@ -415,6 +423,7 @@ class FeatureLibrary:
                 result = execute_feature_columns(compiled[key], inputs=inputs, output_sessions=[day],
                     max_working_bytes=self.limits['maximum_matrix_bytes'])
                 stats['core_seconds']+=time.monotonic()-core_started
+                stats.setdefault('core_work',[]).append({'session':day,**{k:result['stats'][k] for k in ('shared_work','top_nodes')}})
                 stats['core_peak_working_bytes']=max(stats['core_peak_working_bytes'],result['stats']['peak_working_bytes'])
                 publication_started=time.monotonic()
                 arrays, header = _capture_result(result, day=day, columns=columns,
@@ -458,7 +467,7 @@ class FeatureLibrary:
                 shards[day]=write_date(self.root,day,parts_by_day[day])
                 stats['coverage_date_writes']+=1
                 stats['publication_seconds']+=time.monotonic()-publication_started
-                del result, arrays, inputs
+                del result, arrays, inputs, block, array, value
             require(len(final_hits)==len(coverage['sessions'])*len(coverage['definitions']),
                     'Feature coverage remains incomplete')
             if self._session is not None: self._session['store'].validate_boundary()
