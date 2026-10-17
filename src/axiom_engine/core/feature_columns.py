@@ -480,7 +480,7 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     require(type(sets) is list and bool(sets), 'Source sets required')
     masks = []
     for sources in sets:
-        require(type(sources) is list and bool(sources) and len(sources) == len(set(sources)) and
+        require(type(sources) is list and len(sources) == len(set(sources)) and
                 all(type(s) is str and s in source_ids for s in sources), 'Unbound/duplicate source set')
         masks.append(sum(1 << source_ids[s] for s in sources))
     mask_table = np.array(masks, dtype='uint64')
@@ -556,7 +556,14 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                 'Present/missing reason mismatch')
         require(schema['missing'] != 'reject' or bool(np.all(valid)), 'Missing rejected by input schema')
         require(bool(np.all((codes >= 0) & (codes < len(sets)))), 'Input source code range')
-        available_seconds = _time(np, available)
+        # Packed Core outputs may have no source or clock (constants and
+        # reference-excluded missing cells). Preserve that state when reused
+        # as facts; a sourced fact still needs a real availability clock.
+        clockless = available == _NONE_TIME
+        require(bool(np.all(~clockless | (mask_table[codes] == 0))),
+                'Clockless input carries source lineage')
+        available_seconds = np.where(clockless, _NONE_TIME,
+            _time(np, np.where(clockless, 0, available)))
         col = _Column(np, needed[name], len(securities), schema['dtype'], budget)
         if col.rows:
             ix = [row_positions[r] for r in col.rows]
