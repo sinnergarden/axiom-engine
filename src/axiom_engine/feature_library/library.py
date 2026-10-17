@@ -495,8 +495,8 @@ class FeatureLibrary:
         """Save an exact, metadata-only selection of admitted saved views.
 
         Intersect each parent with the requested grid; overlapping parents or
-        gaps fail, rather than choosing a source implicitly. Dates and columns
-        may come from different libraries. Original partition receipts remain
+        gaps fail, rather than choosing a source implicitly. Columns may come
+        from different libraries; every parent must cover all requested dates. Original partition receipts remain
         unchanged. Only reference-independent columns may change security axes.
         No coverage index, array buffer or Core computation is written here.
         Source/PIT admission remains the consuming adapter's responsibility.
@@ -510,8 +510,9 @@ class FeatureLibrary:
         definitions={};hits={};parents=list(views)
         for view in parents:
             cap=view.describe()
+            require(set(days)<=set(cap['sessions']),
+                    'date stitching is not supported; each parent must cover all requested sessions')
             for day in days:
-                if day not in cap['sessions']:continue
                 names=[n for n in columns if n in cap['columns']]
                 if not names:continue
                 receipts=view.column_receipts(day,names)
