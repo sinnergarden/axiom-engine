@@ -491,13 +491,16 @@ class FeatureLibrary:
         """Open a fixed saved view. Reading never calls Data/Core or modifies index."""
         return FeatureView(descriptor,_session=self._session, **self.limits)
 
-    def compose_views(self, views, *, output_sessions, security_ids, columns, sample_universe=None):
+    def compose_views(self, views, *, output_sessions, security_ids, columns, sample_universe=None,
+                      preserve_reference=False):
         """Save an exact, metadata-only selection of admitted saved views.
 
         Intersect each parent with the requested grid; overlapping parents or
         gaps fail, rather than choosing a source implicitly. Columns may come
         from different libraries; every parent must cover all requested dates. Original partition receipts remain
-        unchanged. Only reference-independent columns may change security axes.
+        unchanged. preserve_reference explicitly permits reading a subset of a
+        frozen reference-dependent result, retaining its original full partition
+        and definition. It never recomputes or relabels the original cohort.
         No coverage index, array buffer or Core computation is written here.
         Source/PIT admission remains the consuming adapter's responsibility.
         """
@@ -524,7 +527,8 @@ class FeatureLibrary:
                     for block in receipts[name]['blocks']:
                         selected=sorted(set(securities)&set(block['selected_security_ids']))
                         if not selected:continue
-                        require(not definition['reference_dependent'] or selected==block['security_ids']==securities,
+                        require(not definition['reference_dependent'] or preserve_reference is True or
+                                selected==block['security_ids']==securities,
                                 'reference-dependent Feature cannot change physical cohort')
                         previous=hits.setdefault((day,name),[])
                         require(not any(set(selected)&set(p['security_ids']) for p in previous),
