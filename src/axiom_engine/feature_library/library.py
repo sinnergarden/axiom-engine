@@ -491,6 +491,53 @@ class FeatureLibrary:
         """Open a fixed saved view. Reading never calls Data/Core or modifies index."""
         return FeatureView(descriptor,_session=self._session, **self.limits)
 
+    def compose_views(self, views, *, output_sessions, security_ids, columns, sample_universe=None):
+        """Save an exact, metadata-only selection of admitted saved views.
+
+        Intersect each parent with the requested grid; overlapping parents or
+        gaps fail, rather than choosing a source implicitly. Dates and columns
+        may come from different libraries. Original partition receipts remain
+        unchanged. Only reference-independent columns may change security axes.
+        No coverage index, array buffer or Core computation is written here.
+        Source/PIT admission remains the consuming adapter's responsibility.
+        """
+        days=_ordered(output_sessions,'output sessions')
+        securities=_ordered(security_ids,'physical securities')
+        sample=securities if sample_universe is None else _ordered(sample_universe,'sample securities')
+        columns=list(columns)
+        require(columns and len(columns)==len(set(columns)) and set(sample)<=set(securities),
+                'unique columns and sample subset required')
+        definitions={};hits={};parents=list(views)
+        for view in parents:
+            cap=view.describe()
+            for day in days:
+                if day not in cap['sessions']:continue
+                names=[n for n in columns if n in cap['columns']]
+                if not names:continue
+                receipts=view.column_receipts(day,names)
+                for name in names:
+                    definition=cap['definitions'][name]
+                    require(name not in definitions or definitions[name]==definition,
+                            'composed Feature definitions differ')
+                    definitions[name]=definition
+                    for block in receipts[name]['blocks']:
+                        selected=sorted(set(securities)&set(block['selected_security_ids']))
+                        if not selected:continue
+                        require(not definition['reference_dependent'] or selected==block['security_ids']==securities,
+                                'reference-dependent Feature cannot change physical cohort')
+                        previous=hits.setdefault((day,name),[])
+                        require(not any(set(selected)&set(p['security_ids']) for p in previous),
+                                'overlapping composed Feature cells')
+                        previous.append({'partition':block['partition'],'security_ids':selected})
+        require(set(definitions)==set(columns) and all(
+            sum(len(b['security_ids']) for b in hits.get((day,name),[]))==len(securities)
+            for day in days for name in columns),'incomplete composed Feature coverage')
+        coverage={'sessions':days,'security_ids':securities,'sample_universe':sample,
+                  'definitions':{n:definitions[n] for n in columns}}
+        wire=compact_view(coverage,hits)
+        for view in parents:view.validate_boundary()
+        return write_part(self.root,wire,'view_ref')
+
 
 class FeatureView:
     def __init__(self, descriptor, _session=None, **limits):
