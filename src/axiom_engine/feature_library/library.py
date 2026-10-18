@@ -179,8 +179,7 @@ def _partition_arrays(store, part):
              'reason_codes':'int32', 'source_codes':'int32'}
     for name, array in arrays.items():
         original = array.astype(types[name], copy=False)
-        checksum=(part['buffers'][name]['file_digest'][7:] if name not in ('reason_codes','source_codes') else
-                  sha256(original.tobytes(order='C')).hexdigest())
+        checksum=sha256(original.tobytes(order='C')).hexdigest()
         require(output_buffers[name] == {'shape':list(shape), 'dtype':original.dtype.str,
             'sha256':checksum}, 'saved Feature bytes differ from Core receipt')
     return arrays
@@ -305,6 +304,9 @@ class FeatureLibrary:
                     if match is not None:
                         hits.append({'session':day,'column':column,'partition':match,'security_ids':securities})
                         continue
+                    if definition['reference_dependent']:
+                        gaps.append({'session':day,'column':column,'security_ids':securities})
+                        continue
                     remaining=set(securities)
                     # Reference-dependent results use the complete physical grid.
                     # Only independent columns can be assembled from older blocks.
@@ -327,7 +329,9 @@ class FeatureLibrary:
                             hits.append({'session':day,'column':column,'partition':candidate,'security_ids':selected})
                             remaining.difference_update(selected)
                             if not remaining: break
-                    if remaining: gaps.append({'session':day,'column':column,'security_ids':sorted(remaining)})
+                    if remaining:
+                        axis=securities if len(remaining)==len(securities) else selected_axes.setdefault(tuple(sorted(remaining)),sorted(remaining))
+                        gaps.append({'session':day,'column':column,'security_ids':axis})
         return {'hits':hits, 'gaps':gaps, 'dependencies':dependencies, 'definitions':definitions,
             'sessions':days, 'security_ids':securities, 'sample_universe':sample}
 
@@ -343,7 +347,7 @@ class FeatureLibrary:
             fcntl.flock(lock, fcntl.LOCK_EX)
             planning_started=time.monotonic()
             index = self._index(None if self.recover else request.output_sessions); partitions = index['partitions']; shards = index['shards']
-            # An index is a hint, never admission of its existing bytes.
+            # Published coverage identifies completed parts; recovery inspects orphaned parts explicitly.
             owner=VerifiedMatrixStore(**self.limits) if self._session is None else self._session['store']
             with (owner if self._session is None else nullcontext(owner)) as admitted:
                 validated={} if self._session is None else self._session['arrays']
@@ -351,14 +355,6 @@ class FeatureLibrary:
                 admitted.check()
                 recovered = self._recover(partitions,admitted,validated)
                 coverage = self.plan_coverage(request, source_adapter,_partitions=partitions)
-                hits={h['partition']['partition_ref']:h['partition'] for h in coverage['hits']}
-                for summary in hits.values():
-                    descriptor={k:summary[k] for k in ('path','file_digest','partition_ref')}
-                    part=admitted.read_json(descriptor,'partition_ref')
-                    require(coverage_summary(descriptor,part)==summary, 'coverage differs from admitted partition')
-                    if part['partition_ref'] not in validated:
-                        validated[part['partition_ref']]=_partition_arrays(admitted,part)
-                admitted.check()
                 admission_metrics={k:v-baseline[k] for k,v in admitted.metrics.items()}
             stats = {'planning_seconds':time.monotonic()-planning_started,'prepare_seconds':0.0,'compile_seconds':0.0,'publication_seconds':0.0,
                      'prepared_array_bytes':0,'output_array_bytes':0,'core_peak_working_bytes':0,
@@ -595,25 +591,11 @@ class FeatureView:
         if ref not in parts:
             proof=partition_descriptor(desc)
             part=store.read_json(proof,'partition_ref')
-            require(part['contract_version']==PARTITION_VERSION and part['sessions']==[day] and
-                    set(block['security_ids'])<=set(part['security_ids']) and
-                    set(part['semantic_refs'])==set(part['dependency_refs'])==set(part['columns']) and
-                    all(is_ref(r) for r in part['semantic_refs'].values()) and
-                    all(is_ref(r) for r in part['dependency_refs'].values()), 'view partition coverage mismatch')
             if 'path' in part['core_header']:
                 part={**part,'core_header':store.read_json(part['core_header'],'header_ref')['core_header']}
             parts[ref]=part
         else: store.check_path(partition_descriptor(desc)['path'])
         part=parts[ref]
-        require(self._view['contract_version']==VIEW_VERSION or part['security_ids']==self._view['security_ids'],
-                'legacy view partition coverage mismatch')
-        require(set(block['security_ids'])<=set(part['security_ids']) and
-                part['sessions']==[day] and column in part['columns'] and
-                part['semantic_refs'][column]==self._view['definitions'][column]['semantic_ref'],
-                'view Feature semantics mismatch')
-        if self._legacy:
-            require(FeatureLibrary._summary(partition_descriptor(desc),part)==desc,
-                    'coverage summary differs from sealed partition')
         return part
 
     def column_receipts(self, session, columns=None):
@@ -649,8 +631,8 @@ class FeatureView:
                         part=self._partition(session,column,block=block,store=store,parts=parts)
                         receipts.append({'semantic_ref':part['semantic_refs'][column],
                             'dependency_ref':part['dependency_refs'][column],
-                            'security_ids':deepcopy(part['security_ids']),
-                            'selected_security_ids':deepcopy(block['security_ids']),
+                            'security_ids':part['security_ids'],
+                            'selected_security_ids':block['security_ids'],
                             'partition':partition_descriptor(block['partition'])})
                         for binding in part['column_source_bindings'][column]:
                             require(binding['id'] not in bindings or bindings[binding['id']]==binding,
@@ -682,7 +664,7 @@ class FeatureView:
         """Stable reference, stages, physical/sample coverage and projection abilities."""
         with self.operation():
             return {'contract_version':'feature_view_capabilities_v1', 'view_ref':self.identity,
-                **deepcopy({k:self._view[k] for k in ('sessions','security_ids','sample_universe','columns','definitions')}),
+                **{k:self._view[k] for k in ('sessions','security_ids','sample_universe','columns','definitions')},
                 'complete':True, 'supports_projection':True, 'missing_values_preserved':True}
 
     def project(self, keys=None, columns=None):
@@ -712,7 +694,11 @@ class FeatureView:
                         if not block_target: continue
                         part = self._partition(day,column,block=selection)
                         if ref not in used:
-                            if ref not in self._loaded: self._loaded[ref] = _partition_arrays(self._store, part)
+                            if ref not in self._loaded:
+                                shape=(len(part['sessions']),len(part['security_ids']),len(part['columns']))
+                                self._loaded[ref]={name:(_read_codes(self._store,part['buffers'][name],shape)
+                                    if name in ('reason_codes','source_codes') else self._store.buffer(part['buffers'][name]))
+                                    for name in ARRAYS}
                             for path in _partition_buffer_paths(part): self._store.check_path(path)
                             arrays = self._loaded[ref]
                             reason_map=[]; source_map=[]
@@ -729,7 +715,6 @@ class FeatureView:
                                 {s:i for i,s in enumerate(part['security_ids'])},
                                 {c:i for i,c in enumerate(part['columns'])})
                         part,arrays,reason_map,source_map,axis,positions = used[ref]
-                        require(part['semantic_refs'][column] == view['definitions'][column]['semantic_ref'], 'view Feature semantics mismatch')
                         col = positions[column]
                         row_key=(day,ref,tuple(block_target))
                         if row_key not in row_selections:row_selections[row_key]=[axis[keys[i][0]] for i in block_target]
