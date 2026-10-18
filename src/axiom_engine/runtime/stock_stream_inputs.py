@@ -1131,6 +1131,7 @@ _KINDS = {"market_state_diagnostics": "states", "market_daily": "market", "price
 
 def _native_header(index, entry, manifest):
     from .stock_market import _native_query, STOCK_EVENT_FIELDS
+    from ..core.stock_rules import covers_calendar_window
     context = index.header(); query = context.get("query", {})
     role = entry["role"]
     require(role in ("execution", "prediction_basis"), "Unsupported stock native input role")
@@ -1153,7 +1154,7 @@ def _native_header(index, entry, manifest):
         days = [None]
         _native_query({"context": context}, domain=domain, names=STOCK_EVENT_FIELDS,
             universe=manifest["scope"]["execution_universe"], calendar=manifest["scope"]["calendar"],
-            time_field=query["time_field"])
+            time_field=query["time_field"], window=True)
     else:
         require(domain in _KINDS, "Unsupported fixed stock native domain")
         kind = _KINDS[domain]; days = query.get("sessions", [])
@@ -1164,7 +1165,7 @@ def _native_header(index, entry, manifest):
             require(query.get("fields") == ["is_member"] and query.get("symbols") == manifest["scope"]["prediction_universe"] and
                     query.get("purpose") == "decision_facts" and query.get("universe_id") ==
                     manifest.get("universe_id", manifest.get("portfolio_policy", {}).get("universe_id", "csi300")) and
-                    query.get("pit_policy") == "best_effort_vendor_v1" and days == calendar and
+                    query.get("pit_policy") == "best_effort_vendor_v1" and covers_calendar_window(days, calendar) and
                     set(query.get("cutoff_by_session", {})) == set(days), "Original PIT stock membership query required")
             from ..core.stock_portfolio import instant
             require(all(instant(query["cutoff_by_session"][d]) == instant(d + "T20:30:00+08:00") for d in days),
@@ -1173,13 +1174,20 @@ def _native_header(index, entry, manifest):
             require(query.get("purpose") == "market_replay", "Stock native purpose mismatch")
             names = {"states": ("close",), "market": ("open", "close", "volume_shares"),
                      "limits": ("up_limit", "down_limit"), "factor": ("factor",)}[kind]
+            # Admit the original query unchanged, then select only consumed
+            # dates below. An original pre-calendar warmup may become unused.
             requested = calendar if kind == "states" else days
-            require(kind == "states" or days in (calendar, warmup), "Unexpected stock native query interval")
+            require(kind == "states" or covers_calendar_window(days, calendar) or
+                    days == warmup or all(d < calendar[0] for d in days),
+                    "Unexpected stock native query interval")
             _native_query({"context": context}, domain="market_daily" if kind == "states" else domain,
-                names=names, universe=manifest["scope"]["execution_universe"], calendar=requested, states=kind == "states")
+                names=names, universe=manifest["scope"]["execution_universe"], calendar=requested, states=kind == "states", window=True)
     expected_days = set(days)
     require(all(day in expected_days for path, day in index.groups if path in (("records",),) or
                 (len(path) == 3 and path[0] == "field_meta")), "Native stock row/metadata lies outside its original query")
+    if domain != "corporate_actions":
+        consumed=set(manifest["scope"]["calendar"]+manifest["market_input"]["warmup_sessions"])
+        days=[day for day in days if day in consumed]
     return kind, days, context
 
 
@@ -1409,7 +1417,8 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
     rules = profile["stock_execution_rules"]; rules_index = validate_execution_rules(rules)
     expected_profile = validate_equity_profile(profile) if equity else stock_daily_open_profile_v2(
         execution_rules=rules, fee_schedule=profile["stock_fee_schedule"], unknown_status_policy=profile.get("unknown_status_policy"))
-    require(profile == expected_profile and rules["calendar"] == calendar and
+    from ..core.stock_rules import covers_calendar_window
+    require(profile == expected_profile and covers_calendar_window(rules["calendar"], calendar) and
         rules["universe"] == universe and scope["supported_universe_ref"] == portfolio_support_ref(manifest.get("portfolio_policy",
             {"contract_version":"stock_portfolio_policy_v4", "universe_id":manifest["universe_id"]} if "universe_id" in manifest else {}), universe), "Stock profile/rules scope mismatch")
     for name in ("stock_execution_rules_ref", "stock_fee_schedule_ref"):
@@ -1446,7 +1455,8 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
             del actions, view, action_bindings
         for action in cash:
             validate_cash_action(action, universe, source_refs)
-            require(action["record_session"] in calendar or action["record_session"] < calendar[0], "Missing stock record calendar")
+            require(action["record_session"] in calendar or action["record_session"] < calendar[0] or
+                    action["record_session"] > calendar[-1], "Missing stock record calendar")
             for name in ("ex_session", "pay_session"):
                 require(action[name] is None or action[name] > scope["end_session"] or action[name] < calendar[0] or action[name] in calendar,
                         "Stock cash phase calendar mismatch")

@@ -16,6 +16,18 @@ RULE_LIMITATIONS = ["Frozen source-backed board classification is derived, not n
     "The smaller limit/market maximum is a conservative daily-open research assumption, not a real market order."]
 
 
+def covers_calendar_window(source, requested):
+    """A contiguous exchange-calendar window; never silently omit sessions."""
+    if not (type(source) is list and type(requested) is list and source and requested
+            and source == sorted(set(source)) and requested == sorted(set(requested))):
+        return False
+    try:
+        first=source.index(requested[0])
+    except ValueError:
+        return False
+    return source[first:first+len(requested)] == requested
+
+
 def _period(start, through):
     session(start); session(through)
     require(start <= through, "invalid verified stock interval")

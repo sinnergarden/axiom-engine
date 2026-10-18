@@ -268,7 +268,7 @@ def _validate_market_snapshot(market, spec, limits):
     from .stock_inputs import _validate_stock_market_row
     from .stock_market import _stock_lifecycle_active, _membership_rows, _visible
     from .stock_rules import validate_fee_schedule
-    from ..core.stock_rules import validate_execution_rules
+    from ..core.stock_rules import validate_execution_rules, covers_calendar_window
     from ..core.portfolio import decimal
     wire = spec.to_dict(); scope = wire["scope"]; universe = scope["execution_universe"]
     calendar = scope["calendar"]; memory = _DecodedMemory(limits["max_block_bytes"]); budget = read_budget(limits)
@@ -282,7 +282,7 @@ def _validate_market_snapshot(market, spec, limits):
             require(Document.from_dict(profile).identity == wire["profile_input"]["profile_ref"] and
                     Document.from_dict(rules).identity == wire["profile_input"]["stock_execution_rules_ref"] and
                     Document.from_dict(profile["stock_fee_schedule"]).identity == wire["profile_input"]["stock_fee_schedule_ref"] and
-                    rules["calendar"] == calendar and rules["universe"] == universe, "Prepared profile/rules identity mismatch")
+                    covers_calendar_window(rules["calendar"], calendar) and rules["universe"] == universe, "Prepared profile/rules identity mismatch")
             validated_rules = validate_execution_rules(rules)
             identities,_ = validated_rules; validate_fee_schedule(profile["stock_fee_schedule"])
             require(globals_value["rules_index"] == list(validated_rules), "Prepared rule index differs from original rules")
