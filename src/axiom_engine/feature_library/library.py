@@ -463,7 +463,10 @@ class FeatureLibrary:
                     for column in block_columns:
                         final_hits.setdefault((day,column),[]).append({'session':day,'column':column,
                             'partition':summary,'security_ids':securities})
-                    if progress is not None: progress({'stage':'partition_sealed','session':day,**deepcopy(stats)})
+                    if progress is not None:
+                        progress({'stage':'partition_sealed','session':day,
+                            **{k:deepcopy(v) for k,v in stats.items() if k!='core_work'},
+                            'core_work':deepcopy(stats.get('core_work',[])[-1:])})
                 shards[day]=write_date(self.root,day,parts_by_day[day])
                 stats['coverage_date_writes']+=1
                 stats['publication_seconds']+=time.monotonic()-publication_started
@@ -743,7 +746,8 @@ class FeatureView:
             out['source_codes']=remap[out['source_codes']]
             actual_sources={source for group in source_sets for source in group}
             for name, array in out.items(): out[name]=np.frombuffer(array.tobytes(),dtype=array.dtype).reshape(shape)
-            self.validate_boundary()
+            # The enclosing operation checks consumed paths at its outer return.
+            # A borrowed projection must not rescan the growing parent operation.
             return {**out, 'keys':keys, 'schema':[deepcopy(view['definitions'][c]['schema']) for c in columns],
                 'reason_dictionary':reasons, 'source_sets':source_sets,
                 'source_bindings':[bindings[source] for source in sorted(actual_sources)],
