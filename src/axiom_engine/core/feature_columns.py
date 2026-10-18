@@ -11,7 +11,7 @@ from time import perf_counter_ns
 from types import MappingProxyType
 
 from .contracts import FeaturePlan, digest, fields, integer, require, session, text
-from .plan import CS, required_history, validate_plan
+from .plan import CS, WINDOW, required_history, validate_plan, _required_history
 from . import execution as kernel
 from .._implementation import IMPLEMENTATION_REF
 
@@ -75,7 +75,7 @@ def compile_feature_columns(plan: FeaturePlan):
                      'plan_ref': plan.identity, 'implementation_ref': IMPLEMENTATION_REF,
                      'profile': 'sessions_float64_bool_sources64_v1'})
     return CompiledFeatureColumns(plan.identity, identity, _freeze(p),
-                                  _freeze(required_history(plan)), _freeze(last),
+                                  _freeze(_required_history(p)), _freeze(last),
                                   tuple(sorted(p['reference_members'])))
 
 
@@ -154,17 +154,247 @@ def _needed(p, outputs):
                     deps.add(previous)
                 if op == 'pct_change':
                     deps.add(r)
-            elif op == 'rolling':
+            elif op in ('rolling', 'rolling_industry') or op in WINDOW:
                 end = r + int(q['inclusive_current'])
                 start = end - q['window']
                 require(start >= 0 or p['history_policy'] != 'full', 'INSUFFICIENT_HISTORY')
-                require(end > 0, 'COLUMN_PROFILE: empty exclusive rolling window')
+                require(end > 0 or op in WINDOW, 'COLUMN_PROFILE: empty exclusive rolling window')
                 deps.update(range(max(0, start), end))
             else:
                 deps.add(r)
         for a in n['inputs']:
             needed[a].update(deps)
     return needed
+
+
+def _window_workspace_bytes(rows, securities, parents):
+    """Conservative temporary reservation for the new window families only.
+
+    Retained value/validity gathers use 9 bytes per parent cell, while the
+    largest transient provenance gather uses 8 bytes per cell. Per row, 1 KiB
+    covers indices and the one-security Python vectors, tuples, sorting and
+    centered regression/correlation intermediates (including list replacement).
+    Array/list headers and reduction vectors have separate fixed/width margins.
+    This is an allocation bound, not a process RSS measurement.
+    """
+    return rows * ((9 * parents + 8) * securities + 1024) + 128 * securities + 4096
+
+
+def _sorted_quantile(values, fraction):
+    position = (len(values)-1)*fraction
+    lo, hi = math.floor(position), math.ceil(position)
+    return values[lo] + (values[hi]-values[lo])*(position-lo)
+
+
+def _sliding_extrema(np, source, rows, window, inclusive, maximum, width):
+    """One anchored input; strict eviction preserves first ties/signed zero."""
+    from collections import deque
+    result = {}
+    queues = [deque() for _ in range(width)]
+    cursor = max(0, rows[0]+int(inclusive)-window)
+    for row in rows:
+        end = row+int(inclusive); start = max(0,end-window)
+        for day in range(max(cursor,start),end):
+            pi = source.at(day)
+            for security, queue in enumerate(queues):
+                if source.valid[pi,security]:
+                    value = float(source.value[pi,security])
+                    while queue and (queue[-1][1] < value if maximum else queue[-1][1] > value):
+                        queue.pop()
+                    queue.append((day,value))
+        cursor = end
+        values = np.zeros(width,dtype='float64'); valid = np.zeros(width,dtype='bool')
+        for security,queue in enumerate(queues):
+            while queue and queue[0][0] < start: queue.popleft()
+            if queue:values[security]=queue[0][1];valid[security]=True
+        result[row] = values,valid
+    return result
+
+
+def _window_family(np, nodes, parents, needed, width, budget, reason_ids, counters):
+    """Share array windows; convert only exact ordered scalar reductions to lists."""
+    results={n['name']:_Column(np,needed[n['name']],width,n['column']['dtype'],budget) for n in nodes}
+    rows=sorted(set().union(*(needed[n['name']] for n in nodes)))
+    q0=nodes[0]['params'];window=q0['window'];inclusive=q0['inclusive_current']
+    extremes={};extreme_bytes=0;counts_prefix=None
+    for maximum in (False,True):
+        targets=[n for n in nodes if n['op']=='rolling' and n['params']['reduction']==('max' if maximum else 'min') and len(needed[n['name']])>1]
+        if targets:
+            target_rows=sorted(set().union(*(needed[n['name']] for n in targets)))
+            charge=(len(target_rows)+window)*width*96
+            budget.add(charge);extreme_bytes+=charge
+            extremes[maximum]=_sliding_extrema(np,parents[0],target_rows,window,inclusive,maximum,width)
+    if extremes:
+        prefix_bytes=(len(parents[0].rows)+1)*width*4
+        budget.add(prefix_bytes);extreme_bytes+=prefix_bytes
+        counts_prefix=np.zeros((len(parents[0].rows)+1,width),dtype='int32')
+        np.cumsum(parents[0].valid,axis=0,dtype='int32',out=counts_prefix[1:])
+    security_indices=np.arange(width)
+    for r in rows:
+        active=[n for n in nodes if r in needed[n['name']]]
+        start=max(0,r+int(inclusive)-window);end=r+int(inclusive)
+        workspace=_window_workspace_bytes(end-start,width,len(parents));budget.add(workspace)
+        counters['window_gathers']+=1
+        owner=results[active[0]['name']];owner_i=owner.at(r)
+        indices=[]
+        for parent in parents:
+            ix=[parent.at(d) for d in range(start,end)];indices.append(ix)
+            if ix:
+                owner.available[owner_i]=np.maximum(owner.available[owner_i],np.max(parent.available[ix],axis=0))
+                owner.source[owner_i]|=np.bitwise_or.reduce(parent.source[ix],axis=0)
+                owner.issue[owner_i]|=np.any(parent.issue[ix],axis=0)
+        # Extrema-only dates do not gather/box numeric windows at all.
+        numeric=[n for n in active if not (n['op']=='rolling' and n['params']['reduction'] in ('min','max') and r in extremes.get(n['params']['reduction']=='max',{}))]
+        windows=[]
+        if numeric:
+            counters['numeric_window_gathers']=counters.get('numeric_window_gathers',0)+1
+            windows=[(parent.value[ix],parent.valid[ix]) for parent,ix in zip(parents,indices)]
+            counts=np.count_nonzero(windows[0][1],axis=0)
+        else:
+            ix=indices[0]
+            counts=counts_prefix[ix[-1]+1]-counts_prefix[ix[0]] if ix else np.zeros(width,dtype='int32')
+        tasks={}
+        for n in active:
+            out=results[n['name']];oi=out.at(r);q=n['params'];op=n['op']
+            if out is not owner:
+                out.available[oi]=owner.available[owner_i];out.source[oi]=owner.source[owner_i];out.issue[oi]=owner.issue[owner_i]
+            actual_counts=(np.count_nonzero(windows[0][1]&windows[1][1],axis=0) if op=='rolling_corr' else counts)
+            ok=(actual_counts>=q['min_periods'])
+            if q['missing']=='propagate':ok&=actual_counts==end-start
+            out.reason[oi]=np.where(ok,reason_ids['MISSING'],reason_ids['WINDOW_MISSING'])
+            if not np.any(ok):continue
+            reduction=q.get('reduction')
+            if op=='rolling' and reduction in ('min','max') and r in extremes.get(reduction=='max',{}):
+                values,valid=extremes[reduction=='max'][r]
+                out.value[oi]=values;out.valid[oi]=ok&valid
+                continue
+            if op=='rolling' and reduction in ('sum','mean'):kind='sum'
+            elif op=='rolling_quantile' or op=='rolling' and reduction=='median':kind='sorted'
+            elif op=='rolling_regression':kind='regression'
+            elif op=='rolling_idx':kind=('extreme',q['extreme'])
+            elif op=='rolling' and reduction in ('min','max'):kind=('extreme',reduction)
+            elif op=='rolling':kind=(reduction,q.get('ddof'))
+            else:kind='corr'
+            tasks.setdefault(kind,[]).append((n,out,oi,ok))
+        for kind,targets in tasks.items():
+            values,valid=windows[0]
+            eligible=np.logical_or.reduce([t[3] for t in targets])
+            if isinstance(kind,tuple) and kind[0]=='extreme':
+                maximum=kind[1]=='max'
+                masked=np.where(valid,values,-np.inf if maximum else np.inf)
+                arg=(np.argmax if maximum else np.argmin)(masked,axis=0)
+                extreme=values[arg,security_indices]
+                last=None
+                for n,out,oi,ok in targets:
+                    if n['op']=='rolling_idx':
+                        chosen=arg
+                        if n['params']['ties']=='last':
+                            if last is None:last=len(masked)-1-(np.argmax if maximum else np.argmin)(masked[::-1],axis=0)
+                            chosen=last
+                        out.value[oi]=chosen+1
+                    else:out.value[oi]=extreme
+                    out.valid[oi]=ok
+                del masked,arg,extreme,last
+            elif isinstance(kind,tuple) and kind[0]=='rank':
+                last=values[-1]
+                less=np.count_nonzero((values<last)&valid,axis=0)
+                equal=np.count_nonzero((values==last)&valid,axis=0)
+                ranked=np.divide(less+(equal+1)/2,counts,out=np.zeros(width),where=counts!=0)
+                for n,out,oi,ok in targets:out.value[oi]=ranked;out.valid[oi]=ok&valid[-1]
+            else:
+                for security in np.flatnonzero(eligible):
+                    # Ordered fsum/statistics retain their original numerical algorithms.
+                    present=values[:,security][valid[:,security]].tolist()
+                    if kind=='sum':number=math.fsum(present);counters['window_fsums']+=1
+                    elif kind=='sorted':ordered=sorted(present);counters['window_sorts']+=1
+                    elif kind=='regression' or kind=='corr':
+                        columns=[]
+                        for vals,known in windows:
+                            column=vals[:,security].tolist()
+                            for missing in np.flatnonzero(~known[:,security]):column[missing]=None
+                            columns.append(column)
+                        if kind=='regression':regression=kernel._regression(tuple(columns[0]));counters['regression_solves']+=1
+                    else:number=kernel._std(present,kind[1])
+                    for n,out,oi,ok in targets:
+                        if not ok[security]:continue
+                        q=n['params'];value=None
+                        if kind=='sum':value=number/int(counts[security]) if q['reduction']=='mean' else number
+                        elif kind=='sorted':
+                            if n['op']=='rolling_quantile':value=_sorted_quantile(ordered,q['quantile'])
+                            else:
+                                mid=len(ordered)//2;value=ordered[mid] if len(ordered)%2 else (ordered[mid-1]+ordered[mid])/2
+                        elif kind=='regression':
+                            value=regression[('slope','rsquare','resi').index(q['output'])]
+                            if value is None and (q['output']=='rsquare' or len(present)<2):require(q['zero']=='missing','ZERO_VARIANCE')
+                        elif kind=='corr':value,_=kernel._window_value('rolling_corr',columns,q,kernel._regression)
+                        else:value=number
+                        if value is not None:out.value[oi,security]=value;out.valid[oi,security]=True
+        windows.clear();values=valid=None
+        del windows,indices,tasks
+        budget.drop(workspace)
+    extremes.clear();counts_prefix=None;budget.drop(extreme_bytes)
+    return results
+
+
+_BATCH_ELEMENT={'constant','identity','is_missing','fill','gt','lt','eq','and','or','not',
+                'divide','add','sub','mul','abs','to_float','clip','where'}
+
+
+def _element_row(np, op, q, parents, row, out, oi, reason_ids):
+    """Original scalar order over one security row; parent metadata is merged once."""
+    values=[parent.value[parent.at(row)] for parent in parents]
+    known=[parent.valid[parent.at(row)] for parent in parents]
+    target=out.value[oi];valid=out.valid[oi]
+    if op=='constant':
+        if q['value'] is not None:target.fill(q['value']);valid.fill(True)
+    elif op=='identity':
+        target[:]=values[0];valid[:]=known[0]
+        out.reason[oi]=parents[0].reason[parents[0].at(row)]
+        return
+    elif op=='is_missing':target[:]=~known[0];valid.fill(True)
+    elif op=='fill':
+        target[:]=values[0];valid[:]=known[0]
+        if q['value'] is not None:
+            np.copyto(target,q['value'],where=~known[0]);valid.fill(True)
+    elif op=='where':
+        require(q['missing']!='reject' or bool(np.all(known[0])),'MISSING_BOOLEAN')
+        chosen=(values[0]!=0)&known[0]
+        # Both branches already exist in the original DAG; select without arithmetic.
+        target[:]=values[2];np.copyto(target,values[1],where=chosen)
+        valid[:]=np.where(chosen,known[1],known[2])
+        if q['missing']=='preserve':valid&=known[0]
+    elif op in ('gt','lt','eq','and','or','not'):
+        present=known[0].copy()
+        for mask in known[1:]:present&=mask
+        require(q['missing']!='reject' or bool(np.all(present)),'MISSING_BOOLEAN')
+        if op in ('gt','lt','eq'):
+            compare=np.greater if op=='gt' else np.less if op=='lt' else np.equal
+            target[:]=compare(values[0],values[1])&present
+        else:
+            left=(values[0]!=0)&known[0]
+            if op=='not':target[:]=~left
+            elif op=='and':target[:]=left&((values[1]!=0)&known[1])
+            else:target[:]=left|((values[1]!=0)&known[1])
+        valid[:]=present if q['missing']=='preserve' else True
+    else:
+        valid[:]=known[0]
+        for mask in known[1:]:valid&=mask
+        with np.errstate(over='ignore',invalid='ignore',divide='ignore'):
+            if op=='divide':
+                zero=valid&(values[1]==0)
+                require(q['zero']=='missing' or not bool(np.any(zero)),'ZERO_DENOMINATOR')
+                valid&=~zero;np.divide(values[0],values[1],out=target,where=valid)
+            elif op in ('add','sub','mul'):
+                operation=np.add if op=='add' else np.subtract if op=='sub' else np.multiply
+                operation(values[0],values[1],out=target,where=valid)
+            elif op=='abs':np.absolute(values[0],out=target,where=valid)
+            elif op=='to_float':np.copyto(target,values[0],where=valid)
+            elif op=='clip':
+                np.copyto(target,values[0],where=valid)
+                # Python max/min keep their first argument on equal signed zeros.
+                if q['lower'] is not None:np.copyto(target,q['lower'],where=valid&(target<q['lower']))
+                if q['upper'] is not None:np.copyto(target,q['upper'],where=valid&(target>q['upper']))
+    out.reason[oi]=np.where(valid,0,reason_ids['MISSING'])
 
 
 def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_bytes):
@@ -174,13 +404,14 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     Missing values use validity=False and canonical value=0. Time null uses
     int64 minimum; all other output times are UTC microseconds on whole seconds.
     Source/reason code zero is respectively the empty set/no missing reason.
-    max_working_bytes bounds owned numeric arrays, not interpreter/RSS overhead.
+    max_working_bytes bounds owned numeric arrays and reserves the new window
+    families' temporary workspace; it does not bound interpreter/process RSS.
     """
     import numpy as np
     begin_ns = perf_counter_ns()
     require(type(compiled) is CompiledFeatureColumns, 'Expected compiled Feature columns')
     integer(max_working_bytes, 1)
-    fields(inputs, _FIELDS)
+    fields(inputs, _FIELDS + ' ' + ' '.join(k for k in ('reference_member_known', 'reference_pool_complete', 'field_rows') if k in inputs))
     require(inputs['contract_version'] == 'feature_column_input_v1', 'Column input version')
     p = compiled._plan
     for name in ('calendar_ref', 'reference_ref'):
@@ -249,14 +480,18 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     require(type(sets) is list and bool(sets), 'Source sets required')
     masks = []
     for sources in sets:
-        require(type(sources) is list and bool(sources) and len(sources) == len(set(sources)) and
+        require(type(sources) is list and len(sources) == len(set(sources)) and
                 all(type(s) is str and s in source_ids for s in sources), 'Unbound/duplicate source set')
         masks.append(sum(1 << source_ids[s] for s in sources))
     mask_table = np.array(masks, dtype='uint64')
     budget, descriptors = _Budget(max_working_bytes), {}
     shape = len(days), len(securities)
+    caller_arrays=[value for field in ('values','validity','reason_codes','available_at_utc_us','source_codes') for value in inputs[field].values()]
+    caller_arrays.extend(value for value in inputs.values() if isinstance(value,np.ndarray))
+    caller_bytes=sum(value.nbytes for value in {id(a):a for a in caller_arrays}.values())
+    budget.add(caller_bytes)
     # Reserve worst-case sequential vector/serialization scratch before allocation.
-    # Caller-owned buffers and Python object overhead are outside this array bound.
+    # Caller arrays are charged above; Python object overhead is outside this array bound.
     output_cells = len(out_days) * len(securities) * len(p['outputs'])
     budget.add(max(math.prod(shape) * 96, output_cells * 64))
     def take(name, dtype, grid=shape):
@@ -265,6 +500,12 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     cutoff = _time(np, cutoff_raw, cutoff=True)
     require(bool(np.all(cutoff[1:] >= cutoff[:-1])), 'Cutoffs must be monotonic')
     member = take('reference_member', 'bool')
+    member_known = (take('reference_member_known', 'bool') if 'reference_member_known' in inputs
+                    else np.ones(shape, dtype=bool))
+    pool_complete = (take('reference_pool_complete', 'bool') if 'reference_pool_complete' in inputs
+                     else np.ones(shape, dtype=bool))
+    require(bool(np.all(pool_complete == pool_complete[:, :1])), 'Reference pool completeness must be per session')
+    require(not bool(np.any(member & ~member_known)), 'Unknown member cannot be positive')
     ref_available_raw = take('reference_available_at_utc_us', 'int64')
     ref_available = _time(np, ref_available_raw)
     require(bool(np.all(ref_available <= cutoff[:, None])), 'Unavailable reference')
@@ -288,15 +529,24 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     names = {c['name'] for c in p['input_schema']}
     for field in ('values', 'validity', 'reason_codes', 'available_at_utc_us', 'source_codes'):
         require(type(inputs[field]) is dict and set(inputs[field]) == names, 'Input columns mismatch: ' + field)
+    field_rows=inputs.get('field_rows')
+    if field_rows is not None:
+        require(type(field_rows) is dict and set(field_rows)==names,'exact sparse field axes required')
     env = {}
     # Admission snapshots each source column once. Intermediates only cover closure rows.
     for schema in p['input_schema']:
         name = schema['name']
+        selected=list(range(len(days))) if field_rows is None else field_rows[name]
+        require(type(selected) is list and selected==sorted(set(selected)) and
+                all(type(i) is int and 0<=i<len(days) for i in selected) and needed[name]<=set(selected),'sparse field rows omit dependencies')
+        field_shape=(len(selected),len(securities))
+        row_positions={r:i for i,r in enumerate(selected)}
+        if field_rows is not None:descriptors['rows/'+name]=selected
         arrays = {}
         for field, dtype in (('values', schema['dtype']), ('validity', 'bool'),
                               ('reason_codes', 'int32'), ('available_at_utc_us', 'int64'),
                               ('source_codes', 'int32')):
-            arrays[field] = _snapshot(np, inputs[field][name], dtype, shape,
+            arrays[field] = _snapshot(np, inputs[field][name], dtype, field_shape,
                                       field + '/' + name, budget, descriptors)
         value, valid, reason, available, codes = (arrays[k] for k in
             ('values', 'validity', 'reason_codes', 'available_at_utc_us', 'source_codes'))
@@ -306,12 +556,19 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                 'Present/missing reason mismatch')
         require(schema['missing'] != 'reject' or bool(np.all(valid)), 'Missing rejected by input schema')
         require(bool(np.all((codes >= 0) & (codes < len(sets)))), 'Input source code range')
-        available_seconds = _time(np, available)
+        # Packed Core outputs may have no source or clock (constants and
+        # reference-excluded missing cells). Preserve that state when reused
+        # as facts; a sourced fact still needs a real availability clock.
+        clockless = available == _NONE_TIME
+        require(bool(np.all(~clockless | (mask_table[codes] == 0))),
+                'Clockless input carries source lineage')
+        available_seconds = np.where(clockless, _NONE_TIME,
+            _time(np, np.where(clockless, 0, available)))
         col = _Column(np, needed[name], len(securities), schema['dtype'], budget)
         if col.rows:
-            ix = list(col.rows)
+            ix = [row_positions[r] for r in col.rows]
             col.value[:] = value[ix]
-            col.issue[:] = available_seconds[ix] > cutoff[ix, None]
+            col.issue[:] = available_seconds[ix] > cutoff[list(col.rows), None]
             col.valid[:] = valid[ix] & ~col.issue
             col.available[:] = available_seconds[ix]
             col.source[:] = mask_table[codes[ix]]
@@ -351,12 +608,26 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
         else:
             out.reason[oi, s] = reason_ids[reason]
 
+    vector_workspace=len(securities)*128;budget.add(vector_workspace)
+    reference_groups={}; industry_representatives={}; cohort_cache={}; cohort_charges={}; reference_charge=0
+    families={}; family_keys={}; pending_windows={}; node_timings=[]
+    counters=dict(window_gathers=0,regression_solves=0,window_sorts=0,window_fsums=0,batch_element_cells=0,scalar_element_cells=0)
+    for node in p['nodes']:
+        if needed[node['name']] and (node['op']=='rolling' or node['op'] in WINDOW):
+            q=node['params'];key=(tuple(node['inputs']),q['window'],q['inclusive_current'])
+            families.setdefault(key,[]).append(node);family_keys[node['name']]=key
     for node_index, n in enumerate(p['nodes']):
         name, op, q, args = n['name'], n['op'], n['params'], n['inputs']
         if not needed[name]:
             continue
-        out = _Column(np, needed[name], len(securities), n['column']['dtype'], budget)
+        node_started=perf_counter_ns();family_names=[]
         parents = [env[a] for a in args]
+        if name in family_keys:
+            if name not in pending_windows:
+                family_names=[node['name'] for node in families[family_keys[name]]]
+                pending_windows.update(_window_family(np,families[family_keys[name]],parents,needed,len(securities),budget,reason_ids,counters))
+            out=pending_windows.pop(name)
+        else:out = _Column(np, needed[name], len(securities), n['column']['dtype'], budget)
         for oi, r in enumerate(out.rows):
             if op in ('shift', 'pct_change'):
                 previous = r - q['periods']
@@ -371,51 +642,104 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                         out.value[oi], out.valid[oi], out.reason[oi] = source.value[pi], source.valid[pi], source.reason[pi]
                 else:
                     merge(out, oi, [(source, source.at(r))])
-                    for s in range(len(securities)):
-                        value = kernel._divide(source.numeric(r, s),
-                            source.numeric(previous, s) if previous >= 0 else None, q['zero'])
-                        put(out, oi, s, None if value is None else value - 1)
-            elif op == 'rolling':
-                end = r + int(q['inclusive_current'])
-                rows = tuple(range(max(0, end - q['window']), end))
+                    out.reason[oi]=reason_ids['MISSING']
+                    if previous>=0:
+                        current=source.at(r);valid=source.valid[current]&source.valid[pi]
+                        zero=valid&(source.value[pi]==0)
+                        require(q['zero']=='missing' or not bool(np.any(zero)),'ZERO_DENOMINATOR')
+                        valid&=~zero;out.valid[oi]=valid
+                        with np.errstate(over='ignore',invalid='ignore',divide='ignore'):
+                            np.divide(source.value[current],source.value[pi],out=out.value[oi],where=valid)
+                            np.subtract(out.value[oi],1,out=out.value[oi],where=valid)
+            elif name in family_keys:
+                pass  # Family outputs already computed from one anchored window traversal.
+            elif op == 'rolling_industry':
+                # One value per industry/session, then broadcast at TODAY's
+                # membership. Never roll a stock's changing industry labels.
                 source = parents[0]
-                ix = [source.at(d) for d in rows]
-                out.available[oi] = np.max(source.available[ix], axis=0)
-                out.source[oi] = np.bitwise_or.reduce(source.source[ix], axis=0)
-                out.issue[oi] = np.any(source.issue[ix], axis=0)
-                window_values, window_valid = source.value[ix], source.valid[ix]
-                for s in range(len(securities)):
-                    present = window_values[:, s][window_valid[:, s]].tolist()
-                    blocked = len(present) < q['min_periods'] or q['missing'] == 'propagate' and len(present) != len(rows)
-                    value = None if blocked else kernel._rolling_value(present, source.numeric(rows[-1], s), q)
-                    put(out, oi, s, value, 'WINDOW_MISSING' if blocked else 'MISSING')
-                del window_values, window_valid
+                end = r + int(q['inclusive_current'])
+                window = range(max(0, end-q['window']), end)
+                groups = {g for g in industry[r] if g is not None}
+                representatives = {}
+                for d in window:
+                    if d not in industry_representatives:
+                        per_day = {}
+                        for j, group in enumerate(industry[d]):
+                            if member[d,j] and group is not None:per_day.setdefault(group,j)
+                        charge=128+len(per_day)*128;budget.add(charge);reference_charge+=charge
+                        industry_representatives[d]=per_day
+                    representatives[d] = industry_representatives[d]
+                for group in groups:
+                    dependencies = [(source, source.at(d), representatives[d][group])
+                                    for d in window if group in representatives[d]]
+                    vals = [source.numeric(d,representatives[d][group]) if group in representatives[d] else None for d in window]
+                    present = [v for v in vals if v is not None]
+                    blocked = len(present)<q['min_periods'] or q['missing']=='propagate' and len(present)!=len(vals)
+                    value = None if blocked else kernel.statistics.fmean(present)
+                    for j,g in enumerate(industry[r]):
+                        if g != group: continue
+                        out.available[oi,j] = max([int(ref_available[r,j])] + [int(src.available[ix,k]) for src,ix,k in dependencies])
+                        for src,ix,k in dependencies:
+                            out.source[oi,j] |= src.source[ix,k]
+                            out.issue[oi,j] |= src.issue[ix,k]
+                        out.source[oi,j] |= masks[int(ref_codes[r,j])]
+                        put(out,oi,j,value if member[r,j] else None,'REFERENCE_MISSING' if not member[r,j] else 'WINDOW_MISSING')
+                for j,g in enumerate(industry[r]):
+                    if g is None: put(out,oi,j,None,'REFERENCE_MISSING')
             elif op in CS:
                 source = parents[0]
                 pi = source.at(r)
-                groups = {}
-                for s in range(len(securities)):
-                    group = industry[r][s] if q['group'] == 'industry' else ''
-                    require(group is not None or q['unknown_group'] != 'reject', 'UNKNOWN_INDUSTRY')
-                    groups.setdefault(group, []).append(s)
+                if not pool_complete[r, 0]:
+                    # Physical facts remain usable; only reference-dependent
+                    # nodes lack the proof of a complete cross section.
+                    merge(out, oi, [(source, pi)])
+                    ref_mask = 0
+                    for code in ref_codes[r]: ref_mask |= masks[int(code)]
+                    ref_time = int(np.max(ref_available[r]))
+                    for s in range(len(securities)):
+                        out.available[oi,s] = max(int(out.available[oi,s]), ref_time)
+                        out.source[oi,s] |= ref_mask
+                        put(out,oi,s,None,'REFERENCE_MISSING')
+                    require(n['column']['missing'] != 'reject', 'Missing rejected by node schema')
+                    continue
+                group_key=(r,q['group'])
+                if group_key not in reference_groups:
+                    groups={}
+                    for s in range(len(securities)):
+                        group=industry[r][s] if q['group']=='industry' else ''
+                        groups.setdefault(group,[]).append(s)
+                    reference_groups[group_key]=groups
+                groups=reference_groups[group_key]
+                require(None not in groups or q['unknown_group']!='reject','UNKNOWN_INDUSTRY')
                 for group, group_indices in groups.items():
-                    eligible = [s for s in group_indices if member[r, s] and group is not None]
-                    eligible_set = frozenset(eligible)  # one compact cohort set, never per cell
-                    raw = [source.numeric(r, s) for s in eligible]
-                    absent = any(v is None for v in raw)
-                    require(not absent or q['missing'] != 'reject', 'MISSING_REFERENCE_VALUE')
-                    vals = [0.0 if v is None else v for v in raw] if q['missing'] == 'fill_zero' else [v for v in raw if v is not None]
-                    blocked = absent and q['missing'] == 'propagate'
+                    cohort_key=(args[0],r,q['group'],group,q['missing'])
+                    if cohort_key not in cohort_cache:
+                        eligible = [s for s in group_indices if member[r, s] and group is not None]
+                        eligible_set = frozenset(eligible)  # one compact cohort set, never per cell
+                        raw = [source.numeric(r, s) for s in eligible]
+                        absent = any(v is None for v in raw)
+                        require(not absent or q['missing'] != 'reject', 'MISSING_REFERENCE_VALUE')
+                        vals = [0.0 if v is None else v for v in raw] if q['missing'] == 'fill_zero' else [v for v in raw if v is not None]
+                        blocked = absent and q['missing'] == 'propagate'
+                        dep_time = max([int(source.available[pi, s]) for s in eligible] +
+                                       [int(ref_available[r, s]) for s in group_indices], default=_NONE_TIME)
+                        dep_source = 0
+                        for s in eligible:
+                            dep_source |= int(source.source[pi, s])
+                        for s in group_indices:
+                            dep_source |= masks[int(ref_codes[r, s])]
+                        dep_issue = any(source.issue[pi, s] for s in eligible)
+                        charge=512+len(group_indices)*64+len(eligible)*160+len(vals)*64
+                        budget.add(charge);cohort_charges[cohort_key]=charge
+                        cohort_cache[cohort_key]=(eligible_set,vals,blocked,dep_time,dep_source,dep_issue,{})
+                    eligible_set,vals,blocked,dep_time,dep_source,dep_issue,shared=cohort_cache[cohort_key]
                     std, undefined = kernel._cs_zscore_scale(vals, q) if op == 'cs_zscore' else (None, True)
-                    dep_time = max([int(source.available[pi, s]) for s in eligible] +
-                                   [int(ref_available[r, s]) for s in group_indices], default=_NONE_TIME)
-                    dep_source = 0
-                    for s in eligible:
-                        dep_source |= int(source.source[pi, s])
-                    for s in group_indices:
-                        dep_source |= masks[int(ref_codes[r, s])]
-                    dep_issue = any(source.issue[pi, s] for s in eligible)
-                    mean = None
+                    mean = kernel.statistics.fmean(vals) if op == 'cs_mean' and vals and not blocked else None
+                    ranks = kernel._group_ranks(vals) if op == 'cs_rank' and vals and not blocked else {}
+                    bounds=None
+                    if op=='cs_winsorize' and vals and not blocked:
+                        if 'sorted' not in shared:shared['sorted']=sorted(vals)
+                        bounds=(_sorted_quantile(shared['sorted'],q['lower']),_sorted_quantile(shared['sorted'],q['upper']))
                     for s in group_indices:
                         out.available[oi, s] = max(dep_time, int(source.available[pi, s]))
                         out.source[oi, s] = dep_source | int(source.source[pi, s])
@@ -424,9 +748,10 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                         if x is None and q['missing'] == 'fill_zero':
                             x = 0.0
                         value = None
-                        if s in eligible_set and vals and not blocked and x is not None:
-                            if op == 'cs_rank': value = kernel._rank(x, vals)
-                            elif op == 'cs_winsorize': value = min(max(x, kernel._quantile(vals, q['lower'])), kernel._quantile(vals, q['upper']))
+                        if s in eligible_set and vals and not blocked and (x is not None or op == 'cs_mean'):
+                            if op == 'cs_mean': value = mean
+                            elif op == 'cs_rank': value = ranks[x]
+                            elif op == 'cs_winsorize': value = min(max(x, bounds[0]), bounds[1])
                             else: value, mean = kernel._cs_zscore_value(x, vals, std, undefined, q, mean)
                         elif op == 'cs_zscore' and s in eligible_set and not blocked and undefined:
                             value, mean = kernel._cs_zscore_value(x, vals, std, undefined, q, mean)
@@ -434,13 +759,19 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
                             value = 0.0
                         if op == 'cs_zscore' and value is not None and q['clip'] is not None:
                             value = min(max(value, q['clip'][0]), q['clip'][1])
-                        put(out, oi, s, value, 'REFERENCE_MISSING')
+                        put(out, oi, s, value if member_known[r,s] else None, 'REFERENCE_MISSING')
             else:
                 merge(out, oi, [(a, a.at(r)) for a in parents])
-                for s in range(len(securities)):
-                    value = kernel._element_numeric(op, [a.numeric(r, s) for a in parents], q)
-                    reason = reasons[int(parents[0].reason[parents[0].at(r), s])] if op == 'identity' and value is None else 'MISSING'
-                    put(out, oi, s, value, reason)
+                if op in _BATCH_ELEMENT:
+                    counters['batch_element_cells']+=len(securities)
+                    _element_row(np,op,q,parents,r,out,oi,reason_ids)
+                else:
+                    # Transcendentals retain Python math's exact scalar rounding.
+                    counters['scalar_element_cells']+=len(securities)
+                    for security in range(len(securities)):
+                        value=kernel._element_numeric(op,[a.numeric(r,security) for a in parents],q)
+                        put(out,oi,security,value)
+            require(bool(np.all(np.isfinite(out.value[oi,out.valid[oi]]))),'NONFINITE_RESULT')
             out.valid[oi, out.issue[oi]] = False
             out.reason[oi, out.issue[oi]] = reason_ids['UNAVAILABLE_AT_SESSION_CUTOFF']
             out.value[oi, ~out.valid[oi]] = 0
@@ -459,9 +790,13 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
             if last_use[a] == node_index and a in env:
                 budget.drop(env[a].bytes)
                 del env[a]
-        if op in ('shift', 'pct_change', 'rolling') or op in CS:
+                for key in [key for key in cohort_cache if key[0]==a]:
+                    del cohort_cache[key];budget.drop(cohort_charges.pop(key))
+        if op in ('shift', 'pct_change', 'rolling_industry') or op in CS:
             del source
+        node_timings.append(dict(node=name,op=op,elapsed_ns=perf_counter_ns()-node_started,needed_rows=len(out.rows),window=q.get('window'),securities=len(securities),family=family_names))
         del parents, out
+    reference_groups.clear();industry_representatives.clear();budget.drop(reference_charge+vector_workspace)
     computed_ns = perf_counter_ns()
     unique, inverse = np.unique(source_masks, return_inverse=True)
     if unique[0] != 0:
@@ -491,7 +826,8 @@ def execute_feature_columns(compiled, *, inputs, output_sessions, max_working_by
     result_ref = _ref(binding)
     return {**binding, **output_arrays, 'result_ref': result_ref,
             'stats': {'peak_working_bytes': budget.peak, 'output_cells': math.prod(output_shape),
-                      'input_snapshots': len(descriptors), 'view_count': 1,
+                      'input_snapshots': len(descriptors), 'view_count': 1,'caller_array_bytes':caller_bytes,
+                      'shared_work':counters,'top_nodes':sorted(node_timings,key=lambda v:v['elapsed_ns'],reverse=True)[:12],
                       'admission_ns': admitted_ns - begin_ns,
                       'numeric_and_metadata_ns': computed_ns - admitted_ns,
                       'output_ns': perf_counter_ns() - computed_ns}}

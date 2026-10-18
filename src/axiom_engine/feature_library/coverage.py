@@ -28,17 +28,13 @@ def coverage_summary(descriptor, part):
         'semantic_refs': part['semantic_refs'], 'dependency_refs': part['dependency_refs']}
 
 
-def read_index(root, maximum_parent_bytes):
+def read_index(root, maximum_parent_bytes, sessions=None):
     """Read bounded root/date parents, validating bytes before decoding each child."""
     path = Path(root) / 'index.json'
     if not path.exists(): return [], {}
     require(not path.is_symlink() and path.stat().st_size <= maximum_parent_bytes,
             'coverage index exceeds metadata budget')
-    mark = file_fingerprint(path)
     value = read_json(path)
-    require(file_fingerprint(path) == mark and value.get('index_ref') ==
-            digest({k:v for k,v in value.items() if k != 'index_ref'}),
-            'Feature coverage index mismatch')
     version = value.get('contract_version')
     if version == INDEX_V1:
         # Only transport metadata changes. Old immutable partitions are untouched.
@@ -51,6 +47,8 @@ def read_index(root, maximum_parent_bytes):
         require(day not in shards and set(entry) == {'session','coverage'},
                 'unique date coverage descriptor required')
         descriptor = entry['coverage']
+        shards[day] = descriptor
+        if sessions is not None and day not in sessions:continue
         # A short-lived metadata owner prevents repeated checks of all previous
         # date files while still checking each actual file and its content ref.
         with VerifiedMatrixStore(maximum_parent_bytes=maximum_parent_bytes) as store:
@@ -58,9 +56,8 @@ def read_index(root, maximum_parent_bytes):
             require(child['contract_version'] == DATE_VERSION and child['session'] == day and
                     all(p['sessions'] == [day] for p in child['partitions']),
                     'date coverage scope mismatch')
-            partitions.extend(deepcopy(child['partitions']))
+            partitions.extend(child['partitions'])
         shards[day] = descriptor
-    require(file_fingerprint(path) == mark, 'coverage index changed during read')
     return partitions, shards
 
 

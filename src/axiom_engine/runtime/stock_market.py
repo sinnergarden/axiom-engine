@@ -13,15 +13,17 @@ STOCK_EVENT_FIELDS = ("implementation_announcement_date", "record_date", "ex_dat
 EVENT_KEY = ("security_id", "report_period", "announcement_date", "process_status")
 
 
-def _native_query(batch, *, domain, names, universe, calendar, time_field=None, states=False):
+def _native_query(batch, *, domain, names, universe, calendar, time_field=None, states=False, window=False):
+    from ..core.stock_rules import covers_calendar_window
     context, query = batch["context"], batch["context"]["query"]
     require(context["domain"] == ("market_state_diagnostics" if states else domain) and query["symbols"] == universe and
             query["pit_policy"] == "best_effort_vendor_v1", "stock native query domain/scope/policy mismatch")
     if time_field:
         require(set(query) == {"fields", "symbols", "start", "end", "cutoff", "pit_policy", "time_field", "purpose", "filters"} and
                 query["fields"] == list(names) and query["time_field"] == time_field and
-                query["start"] == calendar[0] and query["end"] == calendar[-1] and
-                instant(query["cutoff"]) == instant(calendar[-1] + "T20:30:00+08:00") and
+                (query["start"] <= calendar[0] <= calendar[-1] <= query["end"] if window else
+                 query["start"] == calendar[0] and query["end"] == calendar[-1]) and
+                instant(query["cutoff"]) == instant(query["end"] + "T20:30:00+08:00") and
                 query["filters"] == {}, "stock action query closure mismatch")
     else:
         require(set(query) == {"fields", "symbols", "sessions", "cutoff_by_session", "pit_policy", "purpose",
@@ -35,7 +37,8 @@ def _native_query(batch, *, domain, names, universe, calendar, time_field=None, 
         require(tuple(query["fields"]) in allowed, "stock native query fields mismatch")
         sessions = query["sessions"]
         require(sessions == sorted(set(sessions)) and
-                (set(calendar) <= set(sessions) if states else sessions == calendar) and
+                (covers_calendar_window(sessions, calendar) if window else
+                 set(calendar) <= set(sessions) if states else sessions == calendar) and
                 set(query["cutoff_by_session"]) == set(sessions), "stock native query calendar mismatch")
         require(all(instant(query["cutoff_by_session"][day]) == instant(day + "T20:30:00+08:00")
                     for day in sessions), "stock native query cutoff mismatch")

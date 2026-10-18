@@ -29,17 +29,19 @@ def _context(batch, domain):
 
 def benchmark_rows(batch, days):
     _, query = _context(batch, "benchmark_daily")
+    from ..core.stock_rules import covers_calendar_window
+    source_days = query.get("sessions")
     require(query.get("fields") == ["close"] and query.get("symbols") == ["000300.SH"] and
-            query.get("sessions") == days and query.get("price_basis") == "unadjusted" and
+            covers_calendar_window(source_days, days) and query.get("price_basis") == "unadjusted" and
             query.get("adjustment_anchor") is None and query.get("universe_id") is None and
             query.get("policy_by_session") is None and query.get("cutoff_by_session") ==
-            {d: d + "T20:30:00+08:00" for d in days}, "native benchmark query scope mismatch")
+            {d: d + "T20:30:00+08:00" for d in source_days}, "native benchmark query scope mismatch")
     metadata = batch["field_meta"]["close"]
     require(metadata["unit"] == "index points", "native index points required")
     key = lambda r: (r["session"], r["security_id"])
     records = {key(r): r for r in batch["records"]}
     meta = {key(r): r for r in metadata["by_key"]}
-    expected = {(d, "000300.SH") for d in days}
+    expected = {(d, "000300.SH") for d in source_days}
     require(len(records) == len(batch["records"]) and set(records) == expected and
             len(meta) == len(metadata["by_key"]) and set(meta) == expected, "native benchmark key coverage mismatch")
     ref = Document.from_dict(batch).identity

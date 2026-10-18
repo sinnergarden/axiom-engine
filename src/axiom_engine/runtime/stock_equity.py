@@ -109,9 +109,15 @@ def validate_facts(wire, *, universe, calendar, parent_refs):
     fields(wire, 'contract_version producer snapshot_id observed_at availability_basis universe calendar parent_native_refs supplemental_view_refs identity_policy_ref actions limitations')
     require(wire['contract_version'] == 'stock_action_facts_v1' and wire['producer'] == 'axiom-data',
             'Data-resolved stock action facts required')
+    from ..core.stock_rules import covers_calendar_window
     require(type(wire['snapshot_id']) is str and bool(wire['snapshot_id']) and
-            wire['universe'] == universe and wire['calendar'] == calendar and
+            wire['universe'] == universe and covers_calendar_window(wire['calendar'], calendar) and
             wire['parent_native_refs'] == list(parent_refs), 'equity facts scope/parent mismatch')
+    # Validate the complete original catalog against its own frozen calendar.
+    # Returning it unchanged preserves identity/aliases; ledger phases still
+    # use the requested window and enforce each action's availability clock.
+    calendar=wire['calendar']
+    for day in calendar:session(day)
     digest(wire['identity_policy_ref'])
     require(type(wire['supplemental_view_refs']) is list and bool(wire['supplemental_view_refs']) and
         len(set(wire['supplemental_view_refs']))==len(wire['supplemental_view_refs']), 'new corporate-action ViewRefs required')
