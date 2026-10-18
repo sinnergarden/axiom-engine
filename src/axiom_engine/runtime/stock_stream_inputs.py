@@ -1460,6 +1460,24 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
             for name in ("ex_session", "pay_session"):
                 require(action[name] is None or action[name] > scope["end_session"] or action[name] < calendar[0] or action[name] in calendar,
                         "Stock cash phase calendar mismatch")
+        # A covering native parent may supply both warmup and replay dates.
+        # Consume warmup first to preserve its bounded forward-only cursor.
+        warmup = manifest["market_input"]["warmup_sessions"]
+        for day in warmup:
+            for kind, names in (("market", ("open", "high", "low", "close", "volume_shares", "amount_cny")), ("factor", ("factor",))):
+                with source._memory.stage() as stage:
+                    if market_only:
+                        right, _, right_bindings = source._native("execution", kind, [day], budget, reservation=stage)
+                        _warmup_visibility(right, [day], universe, names)
+                        capture("native", (kind, (day,)), {"view": right, "bindings": right_bindings}, stage)
+                    else:
+                        left, _, left_bindings = source._native("prediction_basis", kind, [day], budget, reservation=stage)
+                        right, _, right_bindings = source._native("execution", kind, [day], budget, reservation=stage)
+                        _pair(left, right, [day], universe, names)
+                        _warmup_visibility(left, [day], universe, names)
+                        _warmup_visibility(right, [day], universe, names)
+                        del left, left_bindings
+                    del right, right_bindings
         market_rows = prediction_rows = 0
         lifecycle = {"pre_listing_null": 0, "listed_nonmember_gap": 0, "member_gap": 0, "held_gap": 0}
         previous_factor = {}
@@ -1559,22 +1577,6 @@ def _audit(source, manifest, block_sessions, budget, limits, implementation_ref,
                     reservation = block._reservation
                     block = None
                     reservation.close()
-        warmup = manifest["market_input"]["warmup_sessions"]
-        for day in warmup:
-            for kind, names in (("market", ("open", "high", "low", "close", "volume_shares", "amount_cny")), ("factor", ("factor",))):
-                with source._memory.stage() as stage:
-                    if market_only:
-                        right, _, right_bindings = source._native("execution", kind, [day], budget, reservation=stage)
-                        _warmup_visibility(right, [day], universe, names)
-                        capture("native", (kind, (day,)), {"view": right, "bindings": right_bindings}, stage)
-                    else:
-                        left, _, left_bindings = source._native("prediction_basis", kind, [day], budget, reservation=stage)
-                        right, _, right_bindings = source._native("execution", kind, [day], budget, reservation=stage)
-                        _pair(left, right, [day], universe, names)
-                        _warmup_visibility(left, [day], universe, names)
-                        _warmup_visibility(right, [day], universe, names)
-                        del left, left_bindings
-                    del right, right_bindings
         equity_facts = None
         if equity:
             action_index = source._index(manifest["action_facts_artifact"], budget)
