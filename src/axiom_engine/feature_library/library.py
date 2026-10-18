@@ -695,8 +695,8 @@ class FeatureView:
                         part = self._partition(day,column,block=selection)
                         if ref not in used:
                             if ref not in self._loaded:
-                                shape=(len(part['sessions']),len(part['security_ids']),len(part['columns']))
-                                self._loaded[ref]={name:(_read_codes(self._store,part['buffers'][name],shape)
+                                part_shape=(len(part['sessions']),len(part['security_ids']),len(part['columns']))
+                                self._loaded[ref]={name:(_read_codes(self._store,part['buffers'][name],part_shape)
                                     if name in ('reason_codes','source_codes') else self._store.buffer(part['buffers'][name]))
                                     for name in ARRAYS}
                             for path in _partition_buffer_paths(part): self._store.check_path(path)
