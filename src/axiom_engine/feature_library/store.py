@@ -67,7 +67,7 @@ class VerifiedMatrixStore:
         if path in self.descriptors:return False
         mark=file_fingerprint(self._resolve(path))
         self.metrics['source_stat_calls']+=1
-        require(self.metrics['source_bytes']+mark[2]<=self.maximum_source_bytes, 'matrix source byte budget exceeded')
+        # Cumulative distinct file bytes are telemetry, not live memory.
         self._retain_entry(self.descriptors,path,descriptor)
         self._retain_entry(self.fingerprints,path,mark)
         # These are publisher-supplied references, not newly computed hashes.

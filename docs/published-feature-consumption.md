@@ -13,3 +13,5 @@ gaps share the request's security list instead of allocating one list per column
 and date. Projection preserves requested row/column order, validity, clocks, reason
 codes and original source references. Both legacy and current view formats use the
 same reader. No new cache, trust flag or alternative execution entry is introduced.
+
+Cumulative distinct source-file bytes remain telemetry, not a memory limit. The legacy maximum_source_bytes argument stays accepted for saved configuration compatibility; it does not cap published-input traversal or streaming publication. Actual matrix/workspace, parent-document and lease/residency limits remain enforced.
